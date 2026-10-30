@@ -48,11 +48,13 @@ class LocalWorker:
         job_id = job["id"]
         self.db.update_job(job_id, status="running", attempts=job["attempts"] + 1)
         self.db.event(job_id, "info", "Single local worker started job")
-        async def progress(value):
+        async def progress(value, message=None):
             current = self.db.get_job(job_id)
             if current and current["status"] == "cancelled":
                 raise asyncio.CancelledError()
             self.db.update_job(job_id, progress=value)
+            if message:
+                self.db.event(job_id, "info", message)
         try:
             if job["kind"] == "render":
                 result = await self.remotion.render(job["payload"], progress)
