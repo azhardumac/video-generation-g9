@@ -12,6 +12,10 @@ The Scorpion & Frog project has a moonlit riverbank prompt default. Project-spec
 
 No GPU work starts during app setup or tests; generation begins only after a user submits the form. The queue has one worker. A canceled, failed, or interrupted run cannot be recorded as completed; any retained partial output has an explicit partial/canceled filename and is shown in the job details.
 
+## First successful end-to-end generation
+
+The first app-submitted Scorpion & Frog image-to-video job completed successfully on 2026-10-31 local time (job `bed2b8f2-009c-4348-9275-02707f2f3b31`). LTX-2.3 MLX Q8 produced and ffprobe verified a 49-frame, 24 fps, 448 × 768 video in 184.36 seconds with exit code 0. The VAE peak Metal memory was 7.58 GB, and the generated video preview played in the studio. This successful run is also preserved in the local SQLite job and benchmark history; the database and output video remain local and are not committed.
+
 ## Local setup
 
 1. Copy `.env.example` to `.env` and review the local paths. The settings loader reads this root `.env` file.
