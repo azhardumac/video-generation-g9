@@ -1,6 +1,13 @@
 from pydantic import BaseModel, Field, model_validator
 
 
+SCORPION_FROG_MOONLIT_RIVERBANK_PROMPT = (
+    "On a quiet moonlit riverbank, the frog and scorpion pause together at the water’s edge; "
+    "silver-blue moonlight ripples across the river, reeds and ferns sway in a gentle night breeze, "
+    "a slow cinematic camera push-in, soft blue mist, natural storybook realism, calm and contemplative mood."
+)
+
+
 class Preset(BaseModel):
     name: str
     frames: int = Field(ge=9, le=193)

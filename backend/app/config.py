@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +22,11 @@ class Settings(BaseSettings):
     ffprobe_executable: str = "ffprobe"
     output_root: str = "~/AI-Video-Studio/outputs"
     allowed_path_roots: str = "~/AI-Video-Studio"
+    preflight_max_swap_gb: float = Field(default=24.0, ge=0)
+    preflight_min_disk_gb: float = Field(default=10.0, ge=0)
+    preflight_pressure_free_percent_max: int = Field(default=15, ge=0, le=100)
+    preflight_pressure_consecutive_samples: int = Field(default=3, ge=1, le=20)
+    preflight_pressure_sample_interval_seconds: float = Field(default=10.0, ge=0)
 
     def expanded(self, value: str) -> Path:
         return Path(value).expanduser().resolve()

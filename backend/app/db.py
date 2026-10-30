@@ -25,6 +25,8 @@ class Database:
                     id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
                     progress INTEGER NOT NULL DEFAULT 0, payload TEXT NOT NULL,
                     result_path TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                    exit_code INTEGER, elapsed_seconds REAL, verification_metadata TEXT,
+                    partial_output_path TEXT,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS events (
@@ -49,6 +51,15 @@ class Database:
                     modified_at REAL NOT NULL, mime_type TEXT NOT NULL
                 );
             """)
+            existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+            for column, declaration in (
+                ("exit_code", "INTEGER"),
+                ("elapsed_seconds", "REAL"),
+                ("verification_metadata", "TEXT"),
+                ("partial_output_path", "TEXT"),
+            ):
+                if column not in existing:
+                    db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {declaration}")
             db.execute("UPDATE jobs SET status='queued', updated_at=? WHERE status='running'", (now_iso(),))
 
     @contextmanager
@@ -80,6 +91,8 @@ class Database:
             return None
         item = dict(row)
         item["payload"] = json.loads(item["payload"])
+        if item.get("verification_metadata"):
+            item["verification_metadata"] = json.loads(item["verification_metadata"])
         return item
 
     def get_job(self, job_id: str):
@@ -93,10 +106,58 @@ class Database:
     def update_job(self, job_id: str, **values):
         values["updated_at"] = now_iso()
         keys = list(values)
-        encoded = [json.dumps(values[k]) if k == "payload" else values[k] for k in keys]
+        json_columns = {"payload", "verification_metadata"}
+        encoded = [json.dumps(values[k]) if k in json_columns and values[k] is not None else values[k] for k in keys]
         with self.lock, self.connect() as db:
             db.execute(f"UPDATE jobs SET {', '.join(k+'=?' for k in keys)} WHERE id=?", (*encoded, job_id))
         return self.get_job(job_id)
+
+    def claim_job(self, job_id: str) -> bool:
+        """Atomically transition queued -> running so a cancel cannot be overwritten."""
+        with self.lock, self.connect() as db:
+            cursor = db.execute(
+                "UPDATE jobs SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status='queued'",
+                (now_iso(), job_id),
+            )
+            return cursor.rowcount == 1
+
+    def complete_job(self, job_id: str, **values) -> bool:
+        """Complete only a currently running job; cancellation has precedence if it won first."""
+        values["status"] = "completed"
+        values["updated_at"] = now_iso()
+        keys = list(values)
+        json_columns = {"payload", "verification_metadata"}
+        encoded = [json.dumps(values[k]) if k in json_columns and values[k] is not None else values[k] for k in keys]
+        with self.lock, self.connect() as db:
+            cursor = db.execute(
+                f"UPDATE jobs SET {', '.join(k+'=?' for k in keys)} WHERE id=? AND status='running'",
+                (*encoded, job_id),
+            )
+            return cursor.rowcount == 1
+
+    def cancel_job(self, job_id: str):
+        """Atomically cancel queued/running work without overwriting a completed state."""
+        with self.lock, self.connect() as db:
+            cursor = db.execute(
+                "UPDATE jobs SET status='cancelled', updated_at=? WHERE id=? AND status IN ('queued','running')",
+                (now_iso(), job_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return self.get_job(job_id)
+
+    def fail_job(self, job_id: str, **values) -> bool:
+        values["status"] = "failed"
+        values["updated_at"] = now_iso()
+        keys = list(values)
+        json_columns = {"payload", "verification_metadata"}
+        encoded = [json.dumps(values[k]) if k in json_columns and values[k] is not None else values[k] for k in keys]
+        with self.lock, self.connect() as db:
+            cursor = db.execute(
+                f"UPDATE jobs SET {', '.join(k+'=?' for k in keys)} WHERE id=? AND status='running'",
+                (*encoded, job_id),
+            )
+            return cursor.rowcount == 1
 
     def event(self, job_id: str, level: str, message: str):
         with self.lock, self.connect() as db:
