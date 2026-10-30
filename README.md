@@ -4,7 +4,7 @@ Private, local-first AI video studio for generating portrait video with **LTX-2.
 
 ## Current status (31 October 2026)
 
-**Phases 1, 2 and 2.5 implemented and integrated.** The studio includes:
+**Phases 1, 2 and 2.5 are integrated on `main`; Phase 3 is implemented on this feature branch.** The studio includes:
 
 - Responsive dark dashboard; local integration health for LTX, the offline Q8 model cache, Remotion, the story project, and ffprobe.
 - Short / Standard / Extended / Experimental generation presets; project-scoped prompt/settings; reference-image selection, seed, and output location.
@@ -12,10 +12,15 @@ Private, local-first AI video studio for generating portrait video with **LTX-2.
 - Project importer (read-only), asset references, local video previews, benchmark history, elapsed-time and resource metrics.
 - Offline Hugging Face inference. Output is first written as `.partial.mp4`; ffprobe checks dimensions, frame rate and counted frames before it is finalized.
 - Advisory resource warnings (not hard generation blocks). The 193-frame option warns of observed visual drift.
+- Revisioned SQLite storyboards with scene groups, editable/reorderable shots, local reference paths, per-shot presets/seeds/captions, job links, logs, retries, and cancellation. The Scorpion & Frog importer indexes its current assets in place and seeds a riverbank opening shot.
+- Deterministic Remotion manifest generation from only completed, ffprobe-verified portrait 24 fps outputs. The timeline preview plays verified clips in storyboard order; the app-owned Remotion composition applies crossfades and optional captions.
+- Remotion rendering is queued only after the user confirms in the storyboard UI. Render output is ffprobe-checked for the timeline's portrait dimensions, 24 fps, and exact frame count.
 
 **Verified end-to-end:** A Scorpion & Frog image-to-video job completed in the application on 2026-10-31: **49 frames, 24 fps, 448 × 768, 184.36 seconds, exit code 0**, ffprobe-verified and playable in the frontend. Reported VAE peak Metal memory: **7.58 GB**. The SQLite job record and video remain on the local workstation, not in Git.
 
 **Tests reported from local runs:** 23 backend tests passed and the frontend production build passed after Phase 2.5 responsive-dashboard fixes. The repository does not run GPU generation in CI or during installation.
+
+**Phase 3 validation on this branch:** 30 backend tests passed, including isolated API and temporary-media workflow tests; the frontend TypeScript/production build passed; and the packaged Remotion entrypoint type-checked against the installed local Remotion/React types. Tests do not start a worker, generate model output, or render a video.
 
 ## Hardware and software requirements
 
@@ -91,6 +96,17 @@ Open **http://127.0.0.1:5173**. The API runs at **http://127.0.0.1:8000** by def
 
 The LTX adapter calls the installed CLI with `--width`, `--height`, `--frames`, `--frame-rate`, `--output`, and image conditioning via `--image <reference-path> 0 1.0`, along with `--distilled --low-ram --no-audio` for the tested preset. The Hugging Face and Transformers offline environment flags are set for local jobs.
 
+## Planning a multi-shot storyboard
+
+1. Start FastAPI and Vite as described above, then open **Storyboard** in the left navigation.
+2. Choose **Import Scorpion & Frog**. The importer reads the configured `STORY_PROJECT` and creates a saved SQLite storyboard with the existing riverbank reference. It does not move or copy images or videos.
+3. Edit the scene name, shot title and prompt. Choose a local reference image and one of Short, Standard, Extended or Experimental; optionally set a seed and caption. Use the up/down controls to order shots. Add shots for new scenes by changing the scene name, then select **Save storyboard**. Each save creates an ordered revision; stale revisions are rejected instead of overwriting newer edits.
+4. Select **Queue shot** on each shot you intend to generate. This is the explicit action that submits one shot to the existing single-worker LTX queue. Generation does not run during import, editing, tests, manifest preview, or app startup. Follow progress, logs, cancellation, retry and the verified video preview on each shot card.
+5. After every shot is completed and ffprobe-verified, select **Preview verified timeline**. The app produces a deterministic manifest under `OUTPUT_ROOT/storyboards/<storyboard-id>/composition-manifest.json` and plays the clips in order for review. Clips must remain under `OUTPUT_ROOT`, use matching portrait dimensions, and be 24 fps; missing, unverified, mismatched, or moved files block assembly.
+6. Review the timeline, crossfade markers, captions and total duration. **Confirm & queue Remotion render** asks for confirmation before adding a render job. The packaged `remotion/` composition uses the existing local Remotion CLI and its installed packages without editing the existing Remotion project. The rendered MP4 is stored under `OUTPUT_ROOT/storyboards/<storyboard-id>/` and verified before completion.
+
+Shot deletion is a soft delete and preserves revision snapshots and job/video history. The app blocks removing or archiving shots with queued/running jobs; cancel those jobs first. Archiving a storyboard also retains its database history and media files. The initial importer seeds one shot; additional scene structure and prompts are user-edited. Crossfades default to eight frames, and captions are optional text overlays. The storyboard timeline preview is a local playback preview; final transitions/caption compositing are applied by Remotion when its render is explicitly confirmed.
+
 ## Tests
 
 ```bash
@@ -116,7 +132,7 @@ Tests and builds do not require a GPU generation run.
 
 ## Roadmap
 
-**Phase 3 (next):** persistent storyboards and shot plans, queued generation for each scene, editable shot order, and automatic assembly of verified clips in a Remotion composition. Work in a new feature branch and open PRs against `main`. Preserve all local project media and model caches.
+**Phase 3 follow-up:** richer storyboard templates, scene-level narrative tools, and expanded transition/caption styling. Persistent storyboards, editable per-shot plans, individual LTX queue actions, and verified Remotion composition assembly are implemented in this phase. Preserve all local project media and model caches.
 
 ## Repository workflow
 

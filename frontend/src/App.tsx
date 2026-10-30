@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Aperture, ArrowDownRight, ArrowUpRight, Bell, BookOpen, Check, ChevronDown, CircleHelp, Clapperboard, Command, Film, FolderOpen, Gauge, HardDrive, History, Image, LayoutDashboard, ListVideo, LoaderCircle, Plus, Search, Settings, SlidersHorizontal, Sparkles, WandSparkles, X, AlertTriangle } from 'lucide-react'
+import StoryboardPage from './StoryboardPage'
 
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
 type Asset = { id: string; category: string; relative_path: string; path: string; name: string; size_bytes: number; mime_type: string }
@@ -109,7 +110,8 @@ export default function App() {
         {active === 'History & logs' && <JobsPage title="Generation history" jobs={jobs.filter(j=>j.status==='completed'||j.status==='failed'||j.status==='cancelled')} onChanged={refresh} onMessage={setNotice}/>}
         {active === 'Projects' && <ProjectLibraryPage assets={assets} imported={projectImported} onImport={importStoryProject} onUseReference={path=>{setReferenceImage(path);setActive('Generate video')}}/>}
         {active === 'References' && <ProjectLibraryPage assets={assets.filter(asset=>asset.mime_type.startsWith('image/'))} imported={projectImported} onImport={importStoryProject} onUseReference={path=>{setReferenceImage(path);setActive('Generate video')}} referencesOnly/>}
-        {['Storyboard','Remotion render'].includes(active) && <WorkspacePage active={active} onGenerate={()=>setActive('Generate video')} onMessage={setNotice} onJobsChanged={refresh}/>}
+        {active === 'Storyboard' && <StoryboardPage assets={assets} imported={projectImported} onImportProject={importStoryProject} onMessage={setNotice}/>}
+        {active === 'Remotion render' && <WorkspacePage active={active} onGenerate={()=>setActive('Generate video')} onMessage={setNotice} onJobsChanged={refresh}/>}
         <div hidden={active !== 'Overview' && active !== 'Generate video'}>
         <section className="stats-grid"><Stat icon={<Film size={16}/>} label="TOTAL GENERATIONS" value={String(jobs.length).padStart(2,'0')} delta="All time"/><Stat icon={<LoaderCircle size={16}/>} label="IN THE QUEUE" value={String(jobs.filter(j=>j.status==='queued'||j.status==='running').length).padStart(2,'0')} delta={running ? `${running} running now` : 'Ready when you are'} accent/><Stat icon={<Check size={16}/>} label="COMPLETED" value={String(jobs.filter(j=>j.status==='completed').length).padStart(2,'0')} delta="This workspace"/><Stat icon={<HardDrive size={16}/>} label="OUTPUT STORAGE" value="Local" delta="On this machine"/></section>
         <div className="content-grid">
