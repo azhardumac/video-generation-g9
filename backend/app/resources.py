@@ -2,6 +2,9 @@ import shutil
 import subprocess
 import sys
 import re
+import time
+from collections import deque
+from threading import Lock
 
 
 def resource_snapshot(path: str) -> dict:
@@ -45,3 +48,50 @@ def resource_snapshot(path: str) -> dict:
         "swap": swap,
         "memory_pressure": pressure,
     }
+
+
+class ResourcePreflight:
+    """Configurable advisory safeguards based on recent local resource samples."""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self._pressure_samples = deque(maxlen=max(1, settings.preflight_pressure_consecutive_samples))
+        self._lock = Lock()
+        self._last_pressure_sample_at = None
+
+    def assess(self, snapshot: dict, *, observed_at: float | None = None) -> list[str]:
+        warnings = []
+        swap_used = snapshot.get("swap", {}).get("used_bytes")
+        max_swap = self.settings.preflight_max_swap_gb * 1024**3
+        if swap_used is not None and swap_used > max_swap:
+            warnings.append(
+                f"Swap use is {swap_used / 1024**3:.1f} GB, above the configured "
+                f"{self.settings.preflight_max_swap_gb:g} GB advisory threshold."
+            )
+        disk_free = snapshot.get("disk_free_bytes")
+        min_disk = self.settings.preflight_min_disk_gb * 1024**3
+        if disk_free is not None and disk_free < min_disk:
+            warnings.append(
+                f"Free disk space is {disk_free / 1024**3:.1f} GB, below the configured "
+                f"{self.settings.preflight_min_disk_gb:g} GB advisory threshold."
+            )
+
+        pressure = snapshot.get("memory_pressure")
+        free_percent = pressure.get("free_percent") if pressure else None
+        with self._lock:
+            if free_percent is None:
+                self._pressure_samples.clear()
+                self._last_pressure_sample_at = None
+            else:
+                sample_time = time.monotonic() if observed_at is None else observed_at
+                interval = self.settings.preflight_pressure_sample_interval_seconds
+                if self._last_pressure_sample_at is None or sample_time - self._last_pressure_sample_at >= interval:
+                    self._pressure_samples.append(free_percent <= self.settings.preflight_pressure_free_percent_max)
+                    self._last_pressure_sample_at = sample_time
+            required = max(1, self.settings.preflight_pressure_consecutive_samples)
+            if len(self._pressure_samples) >= required and all(list(self._pressure_samples)[-required:]):
+                warnings.append(
+                    f"Memory pressure has remained above the configured safeguard for "
+                    f"{required} consecutive samples ({self.settings.preflight_pressure_free_percent_max}% free or less)."
+                )
+        return warnings

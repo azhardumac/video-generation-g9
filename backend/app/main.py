@@ -14,13 +14,15 @@ from .integrations import detect_integrations
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, GenerationSettings, Preset
 from .projects import VIDEO_TYPES, scan_project
-from .resources import resource_snapshot
+from .presets import SCORPION_FROG_MOONLIT_RIVERBANK_PROMPT
+from .resources import ResourcePreflight, resource_snapshot
 from .worker import LocalWorker
 
 
 settings = get_settings()
 db = Database(settings)
 worker = LocalWorker(db, settings)
+resource_preflight = ResourcePreflight(settings)
 
 
 @asynccontextmanager
@@ -133,13 +135,28 @@ def add_preset(preset: Preset):
     return custom[-1]
 
 
+def _generation_settings_key(project_id: str | None) -> str:
+    if project_id is None:
+        return "generation"
+    if not project_id.replace("-", "").isalnum() or len(project_id) > 80:
+        raise HTTPException(400, "Invalid project id")
+    return f"generation:{project_id}"
+
+
 @app.get("/api/settings")
-def read_settings():
-    return db.get_setting("generation") or GenerationSettings().model_dump()
+def read_settings(project_id: str | None = None):
+    key = _generation_settings_key(project_id)
+    specific = db.get_setting(key)
+    if specific is not None:
+        return specific
+    value = db.get_setting("generation") or GenerationSettings().model_dump()
+    if project_id == "scorpion-frog":
+        value["prompt"] = SCORPION_FROG_MOONLIT_RIVERBANK_PROMPT
+    return value
 
 
 @app.patch("/api/settings")
-def update_settings(payload: GenerationSettings):
+def update_settings(payload: GenerationSettings, project_id: str | None = None):
     value = payload.model_dump()
     if value.get("reference_image"):
         try:
@@ -151,7 +168,7 @@ def update_settings(payload: GenerationSettings):
             safe_local_path(value["output_location"], settings)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-    db.put_setting("generation", value)
+    db.put_setting(_generation_settings_key(project_id), value)
     return value
 
 
@@ -175,7 +192,12 @@ def create_job(request: CreateJob):
         reference = safe_local_path(config.reference_image, settings, must_exist=True) if config.reference_image else None
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(400, str(exc)) from exc
-    payload = config.model_dump() | {"frames": frames, "fps": fps, "output_location": str(output), "reference_image": str(reference) if reference else None}
+    root = str(settings.expanded(settings.output_root))
+    metrics = resource_snapshot(root if settings.expanded(settings.output_root).exists() else str(settings.allowed_roots[0]))
+    warnings = resource_preflight.assess(metrics)
+    payload = config.model_dump() | {"frames": frames, "fps": fps, "output_location": str(output),
+                                     "reference_image": str(reference) if reference else None,
+                                     "preflight_warnings": warnings}
     return db.create_job(request.kind, payload)
 
 
@@ -209,7 +231,9 @@ async def cancel_job(job_id: str):
         raise HTTPException(404, "Job not found")
     if job["status"] not in ("queued", "running"):
         raise HTTPException(409, "Only queued or running jobs can be cancelled")
-    updated = db.update_job(job_id, status="cancelled")
+    updated = db.cancel_job(job_id)
+    if updated is None:
+        raise HTTPException(409, "Job state changed before cancellation could be applied")
     worker.cancel_job(job_id)
     db.event(job_id, "warning", "Cancellation requested")
     return updated
@@ -222,7 +246,9 @@ def retry_job(job_id: str):
         raise HTTPException(404, "Job not found")
     if job["status"] != "failed":
         raise HTTPException(409, "Only failed jobs can be retried")
-    updated = db.update_job(job_id, status="queued", progress=0, error=None, result_path=None)
+    updated = db.update_job(job_id, status="queued", progress=0, error=None, result_path=None,
+                            exit_code=None, elapsed_seconds=None, verification_metadata=None,
+                            partial_output_path=None)
     db.event(job_id, "info", "Retry queued")
     return updated
 
@@ -230,7 +256,9 @@ def retry_job(job_id: str):
 @app.get("/api/resources")
 def resources():
     root = str(settings.expanded(settings.output_root))
-    return resource_snapshot(root if settings.expanded(settings.output_root).exists() else str(settings.allowed_roots[0]))
+    snapshot = resource_snapshot(root if settings.expanded(settings.output_root).exists() else str(settings.allowed_roots[0]))
+    snapshot["warnings"] = resource_preflight.assess(snapshot)
+    return snapshot
 
 
 @app.get("/api/benchmarks")
@@ -241,7 +269,8 @@ def benchmarks():
 @app.post("/api/verify-output")
 async def verify_output(path: str):
     try:
-        return await verify_video(path, settings)
+        result = await verify_video(path, settings)
+        return {"verified": True, "format": result.get("format", {}), "streams": result.get("streams", [])}
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(400, str(exc)) from exc
 

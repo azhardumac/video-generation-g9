@@ -6,7 +6,11 @@ A local-first workspace for planning, generating, and rendering video with LTX-2
 
 The studio includes a dark dashboard, benchmarked generation presets, a persistent SQLite job queue, local LTX-2.3 MLX and Remotion adapters, integration status, resource metrics, and a read-only importer for the Scorpion & Frog project. Imported images and videos stay in their original folders and are served locally for reference selection, preview, and ffprobe verification. Job output is streamed into the history log panel.
 
-LTX runs with Hugging Face offline mode enabled. If the configured Q8 weights are not already cached, the API blocks a generation job rather than downloading model files. No GPU work starts during app setup or tests; generation begins only after a user submits the form. The queue has one worker.
+LTX runs with Hugging Face offline mode enabled. If the configured Q8 weights are not already cached, the API blocks a generation job rather than downloading model files. The LTX adapter uses the installed long-form CLI (`--width`, `--height`, `--frames`, `--output`); image-to-video conditioning anchors the reference with `--image <path> 0 1.0`. Every invocation runs in its own process group, so cancellation stops its Python launcher and descendants without targeting unrelated Python or Remotion processes. Outputs are written as `.partial.mp4`, checked with ffprobe for expected dimensions, frame rate, and frame count, then atomically renamed on success.
+
+The Scorpion & Frog project has a moonlit riverbank prompt default. Project-specific generation settings are stored under a project key and take precedence; changing the project default does not overwrite those settings. Preflight shows advisory warnings for high swap use, sustained memory pressure, or low disk space. Thresholds and sample cadence are adjustable with `PREFLIGHT_MAX_SWAP_GB`, `PREFLIGHT_MIN_DISK_GB`, `PREFLIGHT_PRESSURE_FREE_PERCENT_MAX`, `PREFLIGHT_PRESSURE_CONSECUTIVE_SAMPLES`, and `PREFLIGHT_PRESSURE_SAMPLE_INTERVAL_SECONDS` in `.env`.
+
+No GPU work starts during app setup or tests; generation begins only after a user submits the form. The queue has one worker. A canceled, failed, or interrupted run cannot be recorded as completed; any retained partial output has an explicit partial/canceled filename and is shown in the job details.
 
 ## Local setup
 
@@ -34,7 +38,7 @@ Open the frontend at `http://127.0.0.1:5173`. To run backend checks, use `cd bac
 
 ## Safety and storage
 
-Outputs, reference images, caches, credentials, and the SQLite database are ignored by Git. The API validates configured paths against allowed local roots before using them. Jobs persist across restarts; interrupted jobs are returned to the queue as pending.
+Outputs, reference images, caches, credentials, local databases, and common video/model-weight files are ignored by Git. The API validates configured paths against allowed local roots before using them. Jobs persist across restarts; interrupted jobs are returned to the queue as pending.
 
 ## Planned areas
 
