@@ -50,7 +50,41 @@ class Database:
                     relative_path TEXT NOT NULL, size_bytes INTEGER NOT NULL,
                     modified_at REAL NOT NULL, mime_type TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS storyboards (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1, archived_at TEXT,
+                    manifest_json TEXT, manifest_path TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS storyboard_shots (
+                    id TEXT PRIMARY KEY, storyboard_id TEXT NOT NULL,
+                    scene_id TEXT, position INTEGER NOT NULL, title TEXT NOT NULL,
+                    prompt TEXT NOT NULL, reference_image TEXT,
+                    preset TEXT NOT NULL, seed INTEGER, caption TEXT NOT NULL DEFAULT '',
+                    deleted_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS storyboard_scenes (
+                    id TEXT PRIMARY KEY, storyboard_id TEXT NOT NULL,
+                    title TEXT NOT NULL, position INTEGER NOT NULL,
+                    deleted_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(storyboard_id,title)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_storyboard_shot_order_active
+                    ON storyboard_shots(storyboard_id,position) WHERE deleted_at IS NULL;
+                CREATE TABLE IF NOT EXISTS storyboard_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, storyboard_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL, title TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE(storyboard_id, revision)
+                );
+                CREATE TABLE IF NOT EXISTS shot_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, shot_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+                );
             """)
+            shot_columns = {row[1] for row in db.execute("PRAGMA table_info(storyboard_shots)")}
+            if "scene_id" not in shot_columns:
+                db.execute("ALTER TABLE storyboard_shots ADD COLUMN scene_id TEXT")
             existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             for column, declaration in (
                 ("exit_code", "INTEGER"),
@@ -213,3 +247,192 @@ class Database:
         with self.connect() as db:
             row = db.execute("SELECT * FROM project_assets WHERE project_id=? AND id=?", (project_id, asset_id)).fetchone()
             return dict(row) if row else None
+
+    @staticmethod
+    def _story_snapshot(db, storyboard_id: str, revision: int, title: str, timestamp: str):
+        scenes = [dict(row) for row in db.execute(
+            "SELECT id,title,position FROM storyboard_scenes WHERE storyboard_id=? AND deleted_at IS NULL ORDER BY position,id", (storyboard_id,))]
+        shots = [dict(row) for row in db.execute(
+            "SELECT s.id,s.scene_id,c.title AS scene_title,s.position,s.title,s.prompt,s.reference_image,s.preset,s.seed,s.caption "
+            "FROM storyboard_shots s LEFT JOIN storyboard_scenes c ON c.id=s.scene_id "
+            "WHERE s.storyboard_id=? AND s.deleted_at IS NULL ORDER BY s.position,s.id", (storyboard_id,))]
+        db.execute("INSERT INTO storyboard_revisions(storyboard_id,revision,title,snapshot_json,created_at) VALUES(?,?,?,?,?)",
+                   (storyboard_id, revision, title, json.dumps({"scenes": scenes, "shots": shots}, ensure_ascii=False, sort_keys=True), timestamp))
+
+    def create_storyboard(self, project_id: str, title: str, shots: list[dict]) -> dict:
+        storyboard_id, timestamp = str(uuid4()), now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("INSERT INTO storyboards(id,project_id,title,revision,created_at,updated_at) VALUES(?,?,?,1,?,?)",
+                       (storyboard_id, project_id, title, timestamp, timestamp))
+            scene_ids = {}
+            for position, shot in enumerate(shots):
+                scene_title = (shot.get("scene_title") or "Scene 1").strip()
+                if scene_title not in scene_ids:
+                    scene_ids[scene_title] = str(uuid4())
+                    db.execute("INSERT INTO storyboard_scenes(id,storyboard_id,title,position,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                               (scene_ids[scene_title], storyboard_id, scene_title, len(scene_ids)-1, timestamp, timestamp))
+                db.execute("INSERT INTO storyboard_shots(id,storyboard_id,scene_id,position,title,prompt,reference_image,preset,seed,caption,created_at,updated_at) "
+                           "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (shot.get("id") or str(uuid4()), storyboard_id, scene_ids[scene_title], position, shot["title"], shot["prompt"],
+                            shot.get("reference_image"), shot.get("preset", "Short"), shot.get("seed"),
+                            shot.get("caption", ""), timestamp, timestamp))
+            self._story_snapshot(db, storyboard_id, 1, title, timestamp)
+        return self.get_storyboard(storyboard_id)
+
+    def list_storyboards(self):
+        with self.connect() as db:
+            ids = [row[0] for row in db.execute("SELECT id FROM storyboards WHERE archived_at IS NULL ORDER BY updated_at DESC,id")]
+        return [self.get_storyboard(storyboard_id, include_events=False) for storyboard_id in ids]
+
+    def get_storyboard(self, storyboard_id: str, *, include_events: bool = True):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM storyboards WHERE id=? AND archived_at IS NULL", (storyboard_id,)).fetchone()
+            if row is None:
+                return None
+            story = dict(row)
+            story["manifest"] = json.loads(story.pop("manifest_json")) if story.get("manifest_json") else None
+            story["scenes"] = [dict(scene) for scene in db.execute(
+                "SELECT id,title,position FROM storyboard_scenes WHERE storyboard_id=? AND deleted_at IS NULL ORDER BY position,id", (storyboard_id,))]
+            rows = db.execute("SELECT s.*,c.title AS scene_title FROM storyboard_shots s LEFT JOIN storyboard_scenes c ON c.id=s.scene_id "
+                              "WHERE s.storyboard_id=? AND s.deleted_at IS NULL ORDER BY s.position,s.id",
+                              (storyboard_id,)).fetchall()
+            shots = []
+            for item in rows:
+                shot = dict(item)
+                linked = db.execute("SELECT j.* FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? ORDER BY sj.id DESC LIMIT 1",
+                                    (shot["id"],)).fetchone()
+                shot["job"] = self._job(linked)
+                if include_events and linked:
+                    shot["job"]["events"] = [dict(event) for event in db.execute(
+                        "SELECT * FROM events WHERE job_id=? ORDER BY id", (linked["id"],))]
+                shot["status"] = shot["job"]["status"] if shot["job"] else "planned"
+                shots.append(shot)
+            story["shots"] = shots
+            story["shot_count"] = len(shots)
+            return story
+
+    def update_storyboard(self, storyboard_id: str, expected_revision: int, title: str, shots: list[dict]):
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            story = db.execute("SELECT revision,title FROM storyboards WHERE id=? AND archived_at IS NULL", (storyboard_id,)).fetchone()
+            if story is None:
+                raise KeyError("Storyboard not found")
+            if story["revision"] != expected_revision:
+                raise RuntimeError("Storyboard changed since it was loaded; refresh before saving")
+            current = {row["id"]: dict(row) for row in db.execute(
+                "SELECT * FROM storyboard_shots WHERE storyboard_id=? AND deleted_at IS NULL", (storyboard_id,))}
+            existing_scenes = {row["title"]: dict(row) for row in db.execute(
+                "SELECT * FROM storyboard_scenes WHERE storyboard_id=?", (storyboard_id,))}
+            incoming_ids = {shot["id"] for shot in shots if shot.get("id")}
+            if not incoming_ids.issubset(current):
+                raise ValueError("Shot id does not belong to this storyboard")
+            removed_ids = set(current) - incoming_ids
+            if removed_ids:
+                marks = ",".join("?" for _ in removed_ids)
+                active = db.execute(f"SELECT 1 FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id IN ({marks}) AND j.status IN ('queued','running') LIMIT 1", tuple(removed_ids)).fetchone()
+                if active:
+                    raise RuntimeError("Cancel active shot jobs before removing those shots")
+                db.executemany("UPDATE storyboard_shots SET deleted_at=?,updated_at=? WHERE id=?",
+                               [(timestamp, timestamp, shot_id) for shot_id in removed_ids])
+            # Move positions to a unique temporary range before assigning the new order.
+            db.execute("UPDATE storyboard_shots SET position=position+1000 WHERE storyboard_id=? AND deleted_at IS NULL", (storyboard_id,))
+            scene_ids = {}
+            for shot in shots:
+                scene_title = (shot.get("scene_title") or "Scene 1").strip()
+                if not scene_title:
+                    scene_title = "Scene 1"
+                if scene_title in scene_ids:
+                    continue
+                saved_scene = existing_scenes.get(scene_title)
+                if saved_scene:
+                    scene_id = saved_scene["id"]
+                    db.execute("UPDATE storyboard_scenes SET position=?,deleted_at=NULL,updated_at=? WHERE id=?",
+                               (len(scene_ids), timestamp, scene_id))
+                else:
+                    scene_id = str(uuid4())
+                    db.execute("INSERT INTO storyboard_scenes(id,storyboard_id,title,position,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                               (scene_id, storyboard_id, scene_title, len(scene_ids), timestamp, timestamp))
+                scene_ids[scene_title] = scene_id
+            active_scene_ids = tuple(scene_ids.values())
+            if active_scene_ids:
+                marks = ",".join("?" for _ in active_scene_ids)
+                db.execute(f"UPDATE storyboard_scenes SET deleted_at=? WHERE storyboard_id=? AND id NOT IN ({marks}) AND deleted_at IS NULL",
+                           (timestamp, storyboard_id, *active_scene_ids))
+            else:
+                db.execute("UPDATE storyboard_scenes SET deleted_at=? WHERE storyboard_id=? AND deleted_at IS NULL", (timestamp, storyboard_id))
+            for position, shot in enumerate(shots):
+                scene_title = (shot.get("scene_title") or "Scene 1").strip() or "Scene 1"
+                scene_id = scene_ids[scene_title]
+                if shot.get("id"):
+                    db.execute("UPDATE storyboard_shots SET scene_id=?,position=?,title=?,prompt=?,reference_image=?,preset=?,seed=?,caption=?,updated_at=? WHERE id=?",
+                               (scene_id, position, shot["title"], shot["prompt"], shot.get("reference_image"), shot["preset"], shot.get("seed"), shot.get("caption", ""), timestamp, shot["id"]))
+                else:
+                    db.execute("INSERT INTO storyboard_shots(id,storyboard_id,scene_id,position,title,prompt,reference_image,preset,seed,caption,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                               (str(uuid4()), storyboard_id, scene_id, position, shot["title"], shot["prompt"], shot.get("reference_image"), shot["preset"], shot.get("seed"), shot.get("caption", ""), timestamp, timestamp))
+            revision = expected_revision + 1
+            db.execute("UPDATE storyboards SET title=?,revision=?,manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?",
+                       (title, revision, timestamp, storyboard_id))
+            self._story_snapshot(db, storyboard_id, revision, title, timestamp)
+        return self.get_storyboard(storyboard_id)
+
+    def delete_storyboard_shot(self, storyboard_id: str, shot_id: str, expected_revision: int):
+        story = self.get_storyboard(storyboard_id, include_events=False)
+        if story is None:
+            raise KeyError("Storyboard not found")
+        if story["revision"] != expected_revision:
+            raise RuntimeError("Storyboard changed since it was loaded; refresh before saving")
+        shots = [shot for shot in story["shots"] if shot["id"] != shot_id]
+        if len(shots) == len(story["shots"]):
+            raise KeyError("Shot not found")
+        return self.update_storyboard(storyboard_id, expected_revision, story["title"], shots)
+
+    def archive_storyboard(self, storyboard_id: str):
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            active = db.execute("SELECT 1 FROM storyboard_shots s JOIN shot_jobs sj ON sj.shot_id=s.id JOIN jobs j ON j.id=sj.job_id "
+                                "WHERE s.storyboard_id=? AND j.status IN ('queued','running') LIMIT 1", (storyboard_id,)).fetchone()
+            if active:
+                raise RuntimeError("Cancel active shot jobs before archiving this storyboard")
+            cursor = db.execute("UPDATE storyboards SET archived_at=?,updated_at=? WHERE id=? AND archived_at IS NULL", (timestamp, timestamp, storyboard_id))
+            if cursor.rowcount != 1:
+                raise KeyError("Storyboard not found")
+
+    def storyboard_revisions(self, storyboard_id: str):
+        with self.connect() as db:
+            if not db.execute("SELECT 1 FROM storyboards WHERE id=?", (storyboard_id,)).fetchone():
+                return None
+            return [dict(row) | {"snapshot": json.loads(row["snapshot_json"])} for row in db.execute(
+                "SELECT * FROM storyboard_revisions WHERE storyboard_id=? ORDER BY revision", (storyboard_id,))]
+
+    def store_storyboard_manifest(self, storyboard_id: str, manifest: dict, manifest_path: str):
+        with self.lock, self.connect() as db:
+            cursor = db.execute("UPDATE storyboards SET manifest_json=?,manifest_path=?,updated_at=? WHERE id=? AND archived_at IS NULL",
+                                (json.dumps(manifest, ensure_ascii=False, sort_keys=True), manifest_path, now_iso(), storyboard_id))
+            if cursor.rowcount != 1:
+                raise KeyError("Storyboard not found")
+        return self.get_storyboard(storyboard_id, include_events=False)
+
+    def invalidate_storyboard_manifest(self, job_id: str):
+        with self.lock, self.connect() as db:
+            db.execute("UPDATE storyboards SET manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id IN "
+                       "(SELECT s.storyboard_id FROM storyboard_shots s JOIN shot_jobs sj ON sj.shot_id=s.id WHERE sj.job_id=?)",
+                       (now_iso(), job_id))
+
+    def create_shot_job(self, storyboard_id: str, shot_id: str, payload: dict):
+        job_id, timestamp = str(uuid4()), now_iso()
+        payload["job_id"] = job_id
+        with self.lock, self.connect() as db:
+            shot = db.execute("SELECT 1 FROM storyboard_shots s JOIN storyboards b ON b.id=s.storyboard_id "
+                              "WHERE s.id=? AND s.storyboard_id=? AND s.deleted_at IS NULL AND b.archived_at IS NULL",
+                              (shot_id, storyboard_id)).fetchone()
+            if not shot:
+                raise KeyError("Shot not found")
+            active = db.execute("SELECT 1 FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? AND j.status IN ('queued','running') LIMIT 1", (shot_id,)).fetchone()
+            if active:
+                raise RuntimeError("This shot already has a queued or running job")
+            db.execute("INSERT INTO jobs(id,kind,status,progress,payload,created_at,updated_at) VALUES(?, 'generation','queued',0,?,?,?)",
+                       (job_id, json.dumps(payload), timestamp, timestamp))
+            db.execute("INSERT INTO events(job_id,time,level,message) VALUES(?,?,?,?)", (job_id, timestamp, "info", "Shot generation added to local queue"))
+            db.execute("INSERT INTO shot_jobs(shot_id,job_id,created_at) VALUES(?,?,?)", (shot_id, job_id, timestamp))
+            db.execute("UPDATE storyboards SET manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?", (timestamp, storyboard_id))
+        return self.get_job(job_id)
