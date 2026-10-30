@@ -1,15 +1,19 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .adapters import verify_video
 from .config import get_settings
 from .db import Database
+from .integrations import detect_integrations
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, GenerationSettings, Preset
+from .projects import VIDEO_TYPES, scan_project
 from .resources import resource_snapshot
 from .worker import LocalWorker
 
@@ -46,6 +50,71 @@ class RenderRequest(BaseModel):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "mode": "local", "worker": "single"}
+
+
+@app.get("/api/integrations")
+def integrations():
+    return detect_integrations(settings)
+
+
+@app.get("/api/projects")
+def list_projects():
+    return db.list_projects()
+
+
+@app.post("/api/projects/import", status_code=200)
+def import_story_project():
+    try:
+        root = safe_local_path(settings.story_project, settings, must_exist=True)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    assets = scan_project(root)
+    db.import_project("scorpion-frog", "Scorpion & Frog", str(root), assets)
+    project = db.get_project("scorpion-frog")
+    return project | {"asset_count": len(assets), "assets": assets}
+
+
+@app.get("/api/projects/{project_id}/assets")
+def project_assets(project_id: str):
+    project = db.get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project has not been imported")
+    root = safe_local_path(project["root"], settings, must_exist=True)
+    return [asset | {"path": str(root / asset["relative_path"]), "name": Path(asset["relative_path"]).name}
+            for asset in db.project_assets(project_id)]
+
+
+def _asset_file(project_id: str, asset_id: str):
+    project = db.get_project(project_id)
+    asset = db.get_project_asset(project_id, asset_id)
+    if not project or not asset:
+        raise HTTPException(404, "Project asset not found")
+    try:
+        root = safe_local_path(project["root"], settings, must_exist=True)
+        path = safe_local_path(str(root / asset["relative_path"]), settings, must_exist=True)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(404, "Imported asset is no longer available") from exc
+    if root not in path.parents or path.suffix.lower() not in (VIDEO_TYPES if asset["category"].endswith("video") else {".png":"image/png",".jpg":"image/jpeg",".jpeg":"image/jpeg",".webp":"image/webp",".gif":"image/gif"}):
+        raise HTTPException(400, "Unsupported project asset")
+    return asset, path
+
+
+@app.get("/api/projects/{project_id}/assets/{asset_id}/file")
+def project_asset_file(project_id: str, asset_id: str):
+    asset, path = _asset_file(project_id, asset_id)
+    return FileResponse(path, media_type=asset["mime_type"], headers={"Content-Disposition": "inline"})
+
+
+@app.get("/api/projects/{project_id}/assets/{asset_id}/verify")
+async def verify_project_asset(project_id: str, asset_id: str):
+    asset, path = _asset_file(project_id, asset_id)
+    if asset["mime_type"] not in VIDEO_TYPES.values():
+        raise HTTPException(400, "Only video assets can be verified")
+    try:
+        result = await verify_video(str(path), settings)
+        return {"verified": True, "format": result.get("format", {}), "streams": result.get("streams", [])}
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        return {"verified": False, "error": str(exc)}
 
 
 @app.get("/api/presets")
@@ -89,6 +158,9 @@ def update_settings(payload: GenerationSettings):
 @app.post("/api/jobs", status_code=201)
 def create_job(request: CreateJob):
     config = request.settings
+    status = detect_integrations(settings)
+    if not status["ltx"]["ready"]:
+        raise HTTPException(409, "LTX runner or cached Q8 model weights are unavailable. The app will not download model files.")
     preset = next((p for p in BUILTIN_PRESETS if p.name == config.preset), None)
     if preset is None:
         custom = db.get_setting("custom_presets") or []
@@ -172,3 +244,15 @@ async def verify_output(path: str):
         return await verify_video(path, settings)
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/media/file")
+def media_file(path: str):
+    try:
+        video = safe_local_path(path, settings, must_exist=True)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    media_type = VIDEO_TYPES.get(video.suffix.lower())
+    if media_type is None or not video.is_file():
+        raise HTTPException(400, "Only local video files can be previewed")
+    return FileResponse(video, media_type=media_type, headers={"Content-Disposition": "inline"})

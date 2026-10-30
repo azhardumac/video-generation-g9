@@ -39,7 +39,8 @@ class LTXAdapter:
             args += ["--image", str(reference)]
         env = os.environ.copy()
         env["HF_HOME"] = str(self.settings.expanded(self.settings.hf_cache))
-        env["HF_HUB_CACHE"] = env["HF_HOME"]
+        hf_home = Path(env["HF_HOME"])
+        env["HF_HUB_CACHE"] = str(hf_home / "hub") if (hf_home / "hub").is_dir() else str(hf_home)
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         await on_progress(5)
@@ -51,8 +52,9 @@ class LTXAdapter:
                 line = await process.stdout.readline()
                 if not line:
                     break
-                output_text.append(line.decode(errors="replace")[:1000])
-                await on_progress(min(90, 10 + len(output_text)))
+                decoded = line.decode(errors="replace").strip()
+                output_text.append(decoded[:1000])
+                await on_progress(min(90, 10 + len(output_text)), decoded)
             code = await process.wait()
         except asyncio.CancelledError:
             process.terminate()
@@ -89,8 +91,8 @@ class RemotionAdapter:
         process = await asyncio.create_subprocess_exec(*args, cwd=str(working_dir), stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT)
         try:
-            while await process.stdout.readline():
-                await on_progress(35)
+            while line := await process.stdout.readline():
+                await on_progress(35, line.decode(errors="replace").strip())
             code = await process.wait()
         except asyncio.CancelledError:
             process.terminate()

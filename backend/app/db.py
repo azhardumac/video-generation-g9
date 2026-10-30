@@ -39,6 +39,15 @@ class Database:
                     frames INTEGER NOT NULL, fps INTEGER NOT NULL, duration REAL NOT NULL,
                     elapsed_seconds REAL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL,
+                    created_at TEXT NOT NULL, imported_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS project_assets (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, category TEXT NOT NULL,
+                    relative_path TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+                    modified_at REAL NOT NULL, mime_type TEXT NOT NULL
+                );
             """)
             db.execute("UPDATE jobs SET status='queued', updated_at=? WHERE status='running'", (now_iso(),))
 
@@ -115,3 +124,31 @@ class Database:
     def benchmarks(self):
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM benchmark_history ORDER BY id DESC LIMIT 200")]
+
+    def import_project(self, project_id: str, name: str, root: str, assets: list[dict]):
+        now = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("INSERT INTO projects(id,name,root,created_at,imported_at) VALUES(?,?,?,?,?) "
+                       "ON CONFLICT(id) DO UPDATE SET name=excluded.name,root=excluded.root,imported_at=excluded.imported_at",
+                       (project_id, name, root, now, now))
+            db.execute("DELETE FROM project_assets WHERE project_id=?", (project_id,))
+            db.executemany("INSERT INTO project_assets(id,project_id,category,relative_path,size_bytes,modified_at,mime_type) VALUES(?,?,?,?,?,?,?)",
+                           [(a["id"], project_id, a["category"], a["relative_path"], a["size_bytes"], a["modified_at"], a["mime_type"]) for a in assets])
+
+    def list_projects(self):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM projects ORDER BY imported_at DESC")]
+
+    def get_project(self, project_id: str):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+            return dict(row) if row else None
+
+    def project_assets(self, project_id: str):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM project_assets WHERE project_id=? ORDER BY category,relative_path", (project_id,))]
+
+    def get_project_asset(self, project_id: str, asset_id: str):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM project_assets WHERE project_id=? AND id=?", (project_id, asset_id)).fetchone()
+            return dict(row) if row else None
