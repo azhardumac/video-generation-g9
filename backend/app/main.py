@@ -227,12 +227,13 @@ def update_storyboard(storyboard_id: str, payload: StoryboardUpdate):
     values = []
     for shot in payload.shots:
         _preset_frames(shot.preset)
+        shot_value = shot.model_dump()
         if shot.reference_image:
             try:
-                safe_local_path(shot.reference_image, settings, must_exist=True)
+                shot_value["reference_image"] = str(safe_local_path(shot.reference_image, settings, must_exist=True))
             except (ValueError, FileNotFoundError) as exc:
                 raise HTTPException(400, str(exc)) from exc
-        values.append(shot.model_dump())
+        values.append(shot_value)
     try:
         return db.update_storyboard(storyboard_id, payload.revision, payload.title, values)
     except KeyError as exc:
@@ -283,6 +284,44 @@ def queue_storyboard_shot(storyboard_id: str, shot_id: str):
         raise HTTPException(404, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/storyboards/{storyboard_id}/shots/{shot_id}/link-existing/{job_id}")
+async def link_existing_storyboard_job(storyboard_id: str, shot_id: str, job_id: str):
+    story = db.get_storyboard(storyboard_id)
+    if not story:
+        raise HTTPException(404, "Storyboard not found")
+    shot = next((item for item in story["shots"] if item["id"] == shot_id), None)
+    if not shot:
+        raise HTTPException(404, "Shot not found")
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Generation job not found")
+    if job["kind"] != "generation" or job["status"] != "completed":
+        raise HTTPException(409, "Only completed generation jobs can be attached")
+    if db.generation_settings_snapshot(job["payload"]) != db.generation_settings_snapshot(shot):
+        raise HTTPException(409, "Existing output settings do not match this shot; copy the job settings into the shot and save first")
+    recorded = (job.get("verification_metadata") or {}).get("verified_output")
+    if not recorded or not job.get("result_path"):
+        raise HTTPException(409, "This job has no ffprobe-verified output")
+    payload = job["payload"]
+    expected = {"width": payload.get("width"), "height": payload.get("height"),
+                "fps": payload.get("fps"), "frames": payload.get("frames")}
+    if any(value is None for value in expected.values()):
+        raise HTTPException(409, "The job does not contain expected output dimensions and frame count")
+    try:
+        output = safe_local_path(job["result_path"], settings, must_exist=True)
+        output_root = settings.expanded(settings.output_root)
+        if not output.is_file() or output_root not in output.parents:
+            raise ValueError("Existing output must be a file inside OUTPUT_ROOT")
+        actual = await verify_video(str(output), settings, expected=expected)
+        if actual.get("verified_output") != recorded:
+            raise ValueError("Current ffprobe metadata differs from the job's recorded verification")
+        return db.link_existing_shot_job(storyboard_id, shot_id, job_id)
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/api/storyboards/{storyboard_id}/manifest")

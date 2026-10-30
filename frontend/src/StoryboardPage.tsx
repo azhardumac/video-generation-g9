@@ -3,7 +3,8 @@ import { ArrowDown, ArrowUp, Check, Clapperboard, Film, LoaderCircle, Plus, Refr
 
 type Asset = { path: string; relative_path: string; mime_type: string }
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
-type ShotJob = { id: string; status: string; progress: number; error?: string | null; result_path?: string | null; verification_metadata?: { verified_output?: {width:number;height:number;fps:number;frames:number} } | null; events?: {id:number;time:string;level:string;message:string}[] }
+type ExistingJob = { id:string; kind?:string; status:string; created_at:string; result_path?:string|null; payload:{prompt:string;preset:string;seed?:number|null;reference_image?:string|null}; verification_metadata?:{verified_output?:{width:number;height:number;fps:number;frames:number}}|null }
+type ShotJob = ExistingJob & { progress: number; error?: string | null; settings_match?:boolean; settings_snapshot?:{prompt:string;preset:string;seed?:number|null;reference_image?:string|null}; events?: {id:number;time:string;level:string;message:string}[] }
 type Shot = { id?: string; position: number; scene_id?: string; scene_title: string; title: string; prompt: string; reference_image: string | null; preset: string; seed: number | null; caption: string; status?: string; job?: ShotJob | null }
 type ManifestShot = { shot_id: string; scene_title: string; title: string; frames: number; start_frame: number; transition_in_frames: number; transition_out_frames: number; caption: string }
 type Manifest = { title: string; revision: number; width: number; height: number; fps: number; duration_in_frames: number; shots: ManifestShot[] }
@@ -11,7 +12,7 @@ type Storyboard = { id: string; project_id: string; title: string; revision: num
 
 const emptyShot = (sceneTitle='New scene'): Shot => ({position:0,scene_title:sceneTitle,title:'New shot',prompt:'',reference_image:null,preset:'Short',seed:null,caption:''})
 
-export default function StoryboardPage({assets,imported,onImportProject,onMessage}:{assets:Asset[];imported:boolean;onImportProject:()=>Promise<void>;onMessage:(message:string)=>void}) {
+export default function StoryboardPage({assets,jobs,imported,onImportProject,onMessage}:{assets:Asset[];jobs:ExistingJob[];imported:boolean;onImportProject:()=>Promise<void>;onMessage:(message:string)=>void}) {
   const [story,setStory]=useState<Storyboard|null>(null)
   const [draft,setDraft]=useState<Shot[]>([])
   const [title,setTitle]=useState('Scorpion & Frog')
@@ -22,6 +23,7 @@ export default function StoryboardPage({assets,imported,onImportProject,onMessag
   const [manifest,setManifest]=useState<Manifest|null>(null)
   const [timelineIndex,setTimelineIndex]=useState(0)
   const [timelinePlaying,setTimelinePlaying]=useState(false)
+  const [selectedExisting,setSelectedExisting]=useState<Record<string,string>>({})
   const timelineVideo=useRef<HTMLVideoElement|null>(null)
 
   const loadStory=useCallback(async(id:string,loadDraft=false)=>{
@@ -115,6 +117,27 @@ export default function StoryboardPage({assets,imported,onImportProject,onMessag
     if(story)await loadStory(story.id,false)
   }
 
+  async function attachExisting(shot:Shot){
+    if(!story||!shot.id)return
+    const jobId=selectedExisting[shot.id]
+    if(!jobId)return
+    setBusy(`attach:${shot.id}`);setError('')
+    try{
+      const response=await fetch(`/api/storyboards/${story.id}/shots/${shot.id}/link-existing/${jobId}`,{method:'POST'})
+      const data=await response.json();if(!response.ok)throw new Error(data.detail??'Could not attach existing verified clip')
+      setStory(data);setDraft(data.shots.map((item:Shot)=>({...item})));setDirty(false);setManifest(null)
+      onMessage('Existing verified clip attached; no generation was started')
+    }catch(e){setError(e instanceof Error?e.message:'Could not attach existing clip')}
+    finally{setBusy('')}
+  }
+
+  function useExistingSettings(index:number,job:ExistingJob){
+    changeShot(index,'prompt',job.payload.prompt)
+    changeShot(index,'reference_image',job.payload.reference_image??null)
+    changeShot(index,'seed',job.payload.seed??null)
+    changeShot(index,'preset',job.payload.preset)
+  }
+
   async function buildManifest(){
     if(!story)return
     setBusy('manifest');setError('')
@@ -160,10 +183,16 @@ export default function StoryboardPage({assets,imported,onImportProject,onMessag
     <div className="shot-plan-list">{draft.map((shot,index)=>{
       const live=story.shots.find(item=>item.id===shot.id);const job=live?.job;const verified=job?.verification_metadata?.verified_output
       const presetInfo=presets.find(item=>item.name===shot.preset)
+      const savedJobSettings=job?.settings_snapshot
+      const outputIsStale=Boolean(job?.result_path&&(job.settings_match===false||(savedJobSettings&&(savedJobSettings.prompt!==shot.prompt||savedJobSettings.reference_image!==(shot.reference_image||null)||savedJobSettings.seed!==(shot.seed??null)||savedJobSettings.preset!==shot.preset))))
+      const reusable=jobs.filter(item=>item.kind==='generation'&&item.status==='completed'&&Boolean(item.result_path)&&Boolean(item.verification_metadata?.verified_output))
+      const selectedJob=reusable.find(item=>item.id===selectedExisting[shot.id??''])
+      const matchesSelected=selectedJob&&selectedJob.payload.prompt===shot.prompt&&selectedJob.payload.reference_image===shot.reference_image&&selectedJob.payload.seed===(shot.seed??null)&&selectedJob.payload.preset===shot.preset
       return <article className="shot-plan-card" key={shot.id??`new-${index}`}>
         <div className="shot-plan-head"><div className="shot-index">{String(index+1).padStart(2,'0')}</div><div className="shot-plan-summary"><b>{shot.title||`Shot ${index+1}`}</b><span>{shot.scene_title} · {presetInfo?`${shot.preset} · ${presetInfo.frames} frames · ${presetInfo.duration.toFixed(2)} s at ${presetInfo.fps} fps`:shot.preset}</span></div><span className={`job-status ${job?.status??'planned'}`}>{job?.status??'planned'}{job?.status==='running'?` · ${job.progress}%`:''}</span><div className="shot-order-buttons"><button aria-label="Move shot up" disabled={index===0} onClick={()=>reorder(index,-1)}><ArrowUp size={14}/></button><button aria-label="Move shot down" disabled={index===draft.length-1} onClick={()=>reorder(index,1)}><ArrowDown size={14}/></button><button aria-label="Remove shot" disabled={draft.length<2} onClick={()=>removeShot(index)}><Trash2 size={14}/></button></div></div>
         <div className="settings-form-grid shot-fields"><label className="setting-field">SCENE<input value={shot.scene_title} maxLength={120} onChange={e=>changeShot(index,'scene_title',e.target.value)}/></label><label className="setting-field">SHOT TITLE<input value={shot.title} maxLength={120} onChange={e=>changeShot(index,'title',e.target.value)}/></label><label className="setting-field">GENERATION PRESET<select value={shot.preset} onChange={e=>changeShot(index,'preset',e.target.value)}>{presets.map(p=><option value={p.name} key={p.name}>{p.name} · {p.frames} frames · {p.fps} fps</option>)}</select></label><label className="setting-field wide">PROMPT<textarea value={shot.prompt} maxLength={4000} onChange={e=>changeShot(index,'prompt',e.target.value)} placeholder="Describe this shot"/></label><label className="setting-field">REFERENCE IMAGE<select value={shot.reference_image??''} onChange={e=>changeShot(index,'reference_image',e.target.value||null)}><option value="">No reference · text to video</option>{assets.filter(asset=>asset.mime_type.startsWith('image/')).map(asset=><option value={asset.path} key={asset.path}>{asset.relative_path}</option>)}</select></label><label className="setting-field">SEED<input type="number" min="0" value={shot.seed??''} placeholder="Random seed" onChange={e=>changeShot(index,'seed',e.target.value===''?null:Number(e.target.value))}/></label><label className="setting-field wide">OPTIONAL CAPTION<input value={shot.caption} maxLength={240} onChange={e=>changeShot(index,'caption',e.target.value)}/></label></div>
-        <div className="shot-plan-footer"><span>{verified?`Verified · ${verified.width} × ${verified.height} · ${verified.fps} fps · ${verified.frames} frames`:job?.error??'No generation job queued'}</span><div className="shot-job-actions">{job&&(job.status==='queued'||job.status==='running')&&<button className="button secondary mini" onClick={()=>void jobAction(job.id,'cancel')}>Cancel job</button>}{job?.status==='failed'&&<button className="button secondary mini" onClick={()=>void jobAction(job.id,'retry')}>Retry</button>}<button className="button primary mini" disabled={!shot.id||dirty||busy!==''||job?.status==='queued'||job?.status==='running'} onClick={()=>void queueShot(shot)}><WandSparkles size={12}/> {job?.status==='completed'?'Generate again':'Queue shot'}</button></div></div>
+        <div className="existing-clip-tools"><label className="setting-field">REUSE VERIFIED GENERATION<select value={selectedExisting[shot.id??'']??''} onChange={e=>setSelectedExisting(current=>({...current,[shot.id??'']:e.target.value}))}><option value="">Select a completed verified clip</option>{reusable.map(item=><option value={item.id} key={item.id}>{new Date(item.created_at).toLocaleString()} · {item.payload.preset} · {item.verification_metadata?.verified_output?.frames} frames · {item.id.slice(0,8)}</option>)}</select></label><button className="button secondary mini" disabled={!selectedJob||busy!==''} onClick={()=>selectedJob&&useExistingSettings(index,selectedJob)}>Use selected job settings</button><button className="button secondary mini" disabled={!shot.id||!matchesSelected||dirty||busy!==''} onClick={()=>void attachExisting(shot)}>Attach existing clip</button><span>Attaching adds a storyboard link only; it does not copy or modify the video.</span></div>
+        <div className="shot-plan-footer"><span>{outputIsStale?'STALE OUTPUT · prior generation settings; retained as history':verified?`Verified · ${verified.width} × ${verified.height} · ${verified.fps} fps · ${verified.frames} frames`:job?.error??'No generation job queued'}</span><div className="shot-job-actions">{job&&(job.status==='queued'||job.status==='running')&&<button className="button secondary mini" onClick={()=>void jobAction(job.id,'cancel')}>Cancel job</button>}{job?.status==='failed'&&<button className="button secondary mini" onClick={()=>void jobAction(job.id,'retry')}>Retry</button>}<button className="button primary mini" disabled={!shot.id||dirty||busy!==''||job?.status==='queued'||job?.status==='running'} onClick={()=>void queueShot(shot)}><WandSparkles size={12}/> {job?.status==='completed'?'Generate again':'Queue shot'}</button></div></div>
         {job?.result_path&&<div className="shot-video-preview"><video controls preload="metadata" src={`/api/media/file?path=${encodeURIComponent(job.result_path)}`}/></div>}
         {Boolean(job?.events?.length)&&<details className="shot-log"><summary>Latest generation log</summary><div>{job?.events?.slice(-8).map(event=><p key={event.id}><time>{new Date(event.time).toLocaleTimeString()}</time>{event.message}</p>)}</div></details>}
       </article>

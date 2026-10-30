@@ -35,6 +35,8 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
     canvas = None
     for shot in sorted(storyboard["shots"], key=lambda item: (item["position"], item["id"])):
         job = shot.get("job")
+        if job and (job.get("settings_match") is False or shot.get("settings_match") is False):
+            raise ValueError(f"Shot '{shot['title']}' output is stale because generation settings changed")
         verified = (job.get("verification_metadata") or {}).get("verified_output") if job else None
         output = Path(job["result_path"]).expanduser().resolve() if job and job.get("result_path") else None
         if not job or job.get("status") != "completed" or not verified or output is None or not output.is_file():
@@ -57,7 +59,13 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
             "shot_id": shot["id"], "scene_title": shot.get("scene_title", "Scene 1"),
             "title": shot["title"], "src": relative,
             "frames": frames, "fps": fps, "caption": shot.get("caption", ""),
-            "prompt": shot["prompt"],
+            "prompt": shot["prompt"], "job_id": job.get("id"),
+            "settings_snapshot": job.get("settings_snapshot") or {
+                "prompt": job.get("payload", {}).get("prompt", ""),
+                "reference_image": job.get("payload", {}).get("reference_image") or None,
+                "seed": job.get("payload", {}).get("seed"),
+                "preset": job.get("payload", {}).get("preset", "Short"),
+            },
         })
     if missing:
         raise ValueError("Verified output is missing for: " + ", ".join(missing))
