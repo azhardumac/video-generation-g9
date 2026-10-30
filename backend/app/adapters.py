@@ -159,17 +159,32 @@ class RemotionAdapter:
         executable = Path(self.settings.remotion_executable).expanduser().resolve()
         safe_local_path(str(executable), self.settings, must_exist=True)
         working_dir = safe_local_path(self.settings.remotion_studio, self.settings, must_exist=True)
-        entrypoint = safe_local_path(payload["entrypoint"], self.settings, must_exist=True)
+        requested_entrypoint = Path(payload["entrypoint"]).expanduser().resolve(strict=True)
+        packaged_entrypoint = Path(__file__).resolve().parents[2] / "remotion" / "index.ts"
+        entrypoint = requested_entrypoint if requested_entrypoint == packaged_entrypoint else safe_local_path(
+            str(requested_entrypoint), self.settings, must_exist=True)
         output = safe_local_path(payload["output_path"], self.settings)
         output.parent.mkdir(parents=True, exist_ok=True)
         partial = output.with_name(output.stem + ".partial" + output.suffix)
-        args = [str(executable), "render", str(entrypoint), payload["composition_id"], str(partial)]
+        args = [str(executable), "render", str(entrypoint), payload["composition_id"], str(partial), "--overwrite"]
+        if payload.get("width"):
+            args += ["--width", str(payload["width"])]
+        if payload.get("height"):
+            args += ["--height", str(payload["height"])]
+        if payload.get("fps"):
+            args += ["--fps", str(payload["fps"])]
+        if payload.get("public_dir"):
+            public_dir = safe_local_path(payload["public_dir"], self.settings, must_exist=True)
+            args += ["--public-dir", str(public_dir)]
         if payload.get("props"):
             args += ["--props", json.dumps(payload["props"], separators=(",", ":"))]
         await on_progress(2)
+        env = os.environ.copy()
+        remotion_modules = str(working_dir / "node_modules")
+        env["NODE_PATH"] = os.pathsep.join(filter(None, (remotion_modules, env.get("NODE_PATH", ""))))
         process = await asyncio.create_subprocess_exec(
             *args, cwd=str(working_dir), stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT, start_new_session=(os.name == "posix"),
+            stderr=asyncio.subprocess.STDOUT, start_new_session=(os.name == "posix"), env=env,
         )
         try:
             while line := await process.stdout.readline():
@@ -184,7 +199,7 @@ class RemotionAdapter:
                 partial_output=str(partial) if partial.exists() else None,
             )
         await on_progress(90)
-        metadata = await verify_video(str(partial), self.settings)
+        metadata = await verify_video(str(partial), self.settings, expected=payload.get("expected_output"))
         os.replace(partial, output)
         return {"output_path": str(output), "metadata": metadata, "exit_code": 0}
 
