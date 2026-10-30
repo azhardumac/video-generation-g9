@@ -70,6 +70,49 @@ def test_shot_jobs_are_linked_to_single_worker_and_history_survives_edit_delete(
     assert db.get_job(job["id"])["id"] == job["id"]
 
 
+def test_queued_job_finishing_after_settings_edit_is_historical_and_manifest_rejects_it(tmp_path):
+    db = _db(tmp_path)
+    story = db.create_storyboard("scorpion-frog", "Scorpion & Frog", [_shot(reference=str(tmp_path / "river.png"))])
+    shot = story["shots"][0]
+    payload = {"prompt": shot["prompt"], "reference_image": shot["reference_image"], "seed": shot["seed"],
+               "preset": shot["preset"], "width": 448, "height": 768, "fps": 24, "frames": 49}
+    job = db.create_shot_job(story["id"], shot["id"], payload)
+    assert db.claim_job(job["id"])
+    changed = db.update_storyboard(story["id"], story["revision"], story["title"], [shot | {"prompt": "Edited while LTX was running"}])
+    clip = tmp_path / "outputs" / "old-clip.mp4"
+    clip.parent.mkdir(parents=True)
+    clip.write_bytes(b"preserved historical clip")
+    assert db.complete_job(job["id"], progress=100, result_path=str(clip), exit_code=0,
+                           verification_metadata={"verified_output": {"width": 448, "height": 768, "fps": 24, "frames": 49}})
+    loaded = db.get_storyboard(story["id"])
+    assert loaded["shots"][0]["job"]["status"] == "completed"
+    assert loaded["shots"][0]["job"]["settings_match"] is False
+    assert loaded["shots"][0]["job"]["result_path"] == str(clip)
+    assert clip.read_bytes() == b"preserved historical clip"
+    with pytest.raises(ValueError, match="output is stale"):
+        build_composition_manifest(loaded, tmp_path / "outputs")
+
+
+def test_manifest_single_verified_clip_has_no_transition_and_keeps_job_snapshot(tmp_path):
+    root = tmp_path / "outputs"
+    root.mkdir()
+    clip = root / "one-shot.mp4"
+    clip.write_bytes(b"verified fixture")
+    settings_snapshot = {"prompt": "A river at night", "reference_image": None, "seed": 7, "preset": "Short"}
+    story = {"id": "one-shot", "revision": 1, "title": "One Shot", "shots": [{
+        "id": "shot-1", "position": 0, "title": "Opening", "prompt": "A river at night",
+        "job": {"id": "job-1", "status": "completed", "result_path": str(clip),
+                "settings_match": True, "settings_snapshot": settings_snapshot,
+                "verification_metadata": {"verified_output": {"width": 448, "height": 768, "fps": 24, "frames": 49}}},
+    }]}
+    manifest = build_composition_manifest(story, root)
+    assert manifest["duration_in_frames"] == 49
+    assert manifest["shots"][0]["start_frame"] == 0
+    assert manifest["shots"][0]["transition_in_frames"] == 0
+    assert manifest["shots"][0]["transition_out_frames"] == 0
+    assert manifest["shots"][0]["settings_snapshot"] == settings_snapshot
+
+
 def test_storyboard_revision_conflicts_are_rejected_without_overwriting_edits(tmp_path):
     db = _db(tmp_path)
     story = db.create_storyboard("scorpion-frog", "Scorpion & Frog", [_shot()])

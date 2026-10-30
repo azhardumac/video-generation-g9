@@ -79,12 +79,16 @@ class Database:
                 );
                 CREATE TABLE IF NOT EXISTS shot_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, shot_id TEXT NOT NULL,
-                    job_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+                    job_id TEXT NOT NULL UNIQUE, settings_snapshot TEXT,
+                    created_at TEXT NOT NULL
                 );
             """)
             shot_columns = {row[1] for row in db.execute("PRAGMA table_info(storyboard_shots)")}
             if "scene_id" not in shot_columns:
                 db.execute("ALTER TABLE storyboard_shots ADD COLUMN scene_id TEXT")
+            shot_job_columns = {row[1] for row in db.execute("PRAGMA table_info(shot_jobs)")}
+            if "settings_snapshot" not in shot_job_columns:
+                db.execute("ALTER TABLE shot_jobs ADD COLUMN settings_snapshot TEXT")
             existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             for column, declaration in (
                 ("exit_code", "INTEGER"),
@@ -128,6 +132,15 @@ class Database:
         if item.get("verification_metadata"):
             item["verification_metadata"] = json.loads(item["verification_metadata"])
         return item
+
+    @staticmethod
+    def generation_settings_snapshot(payload: dict) -> dict:
+        return {
+            "prompt": payload.get("prompt", ""),
+            "reference_image": payload.get("reference_image") or None,
+            "seed": payload.get("seed"),
+            "preset": payload.get("preset", "Short"),
+        }
 
     def get_job(self, job_id: str):
         with self.connect() as db:
@@ -299,9 +312,16 @@ class Database:
             shots = []
             for item in rows:
                 shot = dict(item)
-                linked = db.execute("SELECT j.* FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? ORDER BY sj.id DESC LIMIT 1",
+                linked = db.execute("SELECT j.*,sj.settings_snapshot AS linked_settings_snapshot FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? ORDER BY sj.id DESC LIMIT 1",
                                     (shot["id"],)).fetchone()
                 shot["job"] = self._job(linked)
+                if shot["job"]:
+                    linked_snapshot = shot["job"].pop("linked_settings_snapshot", None)
+                    snapshot = json.loads(linked_snapshot) if linked_snapshot else self.generation_settings_snapshot(shot["job"]["payload"])
+                    current_settings = self.generation_settings_snapshot(shot)
+                    shot["job"]["settings_snapshot"] = snapshot
+                    shot["job"]["settings_match"] = snapshot == current_settings
+                    shot["settings_match"] = snapshot == current_settings
                 if include_events and linked:
                     shot["job"]["events"] = [dict(event) for event in db.execute(
                         "SELECT * FROM events WHERE job_id=? ORDER BY id", (linked["id"],))]
@@ -433,6 +453,33 @@ class Database:
             db.execute("INSERT INTO jobs(id,kind,status,progress,payload,created_at,updated_at) VALUES(?, 'generation','queued',0,?,?,?)",
                        (job_id, json.dumps(payload), timestamp, timestamp))
             db.execute("INSERT INTO events(job_id,time,level,message) VALUES(?,?,?,?)", (job_id, timestamp, "info", "Shot generation added to local queue"))
-            db.execute("INSERT INTO shot_jobs(shot_id,job_id,created_at) VALUES(?,?,?)", (shot_id, job_id, timestamp))
+            snapshot = self.generation_settings_snapshot(payload)
+            db.execute("INSERT INTO shot_jobs(shot_id,job_id,settings_snapshot,created_at) VALUES(?,?,?,?)",
+                       (shot_id, job_id, json.dumps(snapshot, ensure_ascii=False, sort_keys=True), timestamp))
             db.execute("UPDATE storyboards SET manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?", (timestamp, storyboard_id))
         return self.get_job(job_id)
+
+    def link_existing_shot_job(self, storyboard_id: str, shot_id: str, job_id: str):
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            shot = db.execute("SELECT s.* FROM storyboard_shots s JOIN storyboards b ON b.id=s.storyboard_id "
+                              "WHERE s.id=? AND s.storyboard_id=? AND s.deleted_at IS NULL AND b.archived_at IS NULL",
+                              (shot_id, storyboard_id)).fetchone()
+            if not shot:
+                raise KeyError("Shot not found")
+            job_row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job_row:
+                raise KeyError("Generation job not found")
+            job = self._job(job_row)
+            if job["kind"] != "generation" or job["status"] != "completed":
+                raise RuntimeError("Only a completed generation job can be linked as an existing shot output")
+            if db.execute("SELECT 1 FROM shot_jobs WHERE job_id=?", (job_id,)).fetchone():
+                raise RuntimeError("This generation job is already linked to a storyboard shot")
+            snapshot = self.generation_settings_snapshot(job["payload"])
+            if snapshot != self.generation_settings_snapshot(dict(shot)):
+                raise RuntimeError("Existing output settings do not match this shot; copy the job settings into the shot and save first")
+            db.execute("INSERT INTO shot_jobs(shot_id,job_id,settings_snapshot,created_at) VALUES(?,?,?,?)",
+                       (shot_id, job_id, json.dumps(snapshot, ensure_ascii=False, sort_keys=True), timestamp))
+            db.execute("UPDATE storyboards SET manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?",
+                       (timestamp, storyboard_id))
+        return self.get_storyboard(storyboard_id, include_events=False)

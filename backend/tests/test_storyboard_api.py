@@ -98,3 +98,43 @@ def test_import_edit_queue_and_safe_delete_api_workflow(monkeypatch):
     assert render_job["payload"]["composition_id"] == "StoryboardAssembly"
     assert render_job["payload"]["expected_output"] == {"width": 448, "height": 768, "fps": 24, "frames": 186}
     assert Path(shot["reference_image"]).read_bytes() == reference_before
+
+
+def test_link_existing_clip_requires_matching_settings_and_ffprobe_reverification(monkeypatch):
+    reference = str(_PROJECT / "references" / "scenes" / "riverbank-master.png")
+    story = api.db.create_storyboard("scorpion-frog", "Safe clip reuse", [{
+        "scene_title": "Riverbank", "title": "Opening", "prompt": "Original generation prompt",
+        "reference_image": reference, "preset": "Short", "seed": 7,
+    }])
+    shot = story["shots"][0]
+    payload = {"prompt": "Original generation prompt", "reference_image": reference,
+               "preset": "Short", "seed": 7, "width": 448, "height": 768, "fps": 24, "frames": 49}
+    job = api.db.create_job("generation", payload)
+    assert api.db.claim_job(job["id"])
+    output = api.settings.expanded(api.settings.output_root) / "existing-safe-fixture.mp4"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(b"previously verified clip fixture")
+    verified = {"width": 448, "height": 768, "fps": 24, "frames": 49}
+    assert api.db.complete_job(job["id"], progress=100, result_path=str(output), exit_code=0,
+                               verification_metadata={"verified_output": verified})
+    calls = []
+    async def fake_verify(path, _settings, expected=None):
+        calls.append((path, expected))
+        return {"verified_output": verified}
+    monkeypatch.setattr(api, "verify_video", fake_verify)
+    payload["prompt"] = "Edited settings must not match"
+    mismatch = api.db.update_storyboard(story["id"], story["revision"], story["title"], [shot | {"prompt": payload["prompt"]}])
+    with pytest.raises(HTTPException) as stale_error:
+        import asyncio
+        asyncio.run(api.link_existing_storyboard_job(story["id"], shot["id"], job["id"]))
+    assert stale_error.value.status_code == 409
+    assert "settings do not match" in stale_error.value.detail
+    updated = api.db.update_storyboard(story["id"], mismatch["revision"], story["title"], [mismatch["shots"][0] | {"prompt": "Original generation prompt"}])
+    linked = asyncio.run(api.link_existing_storyboard_job(story["id"], shot["id"], job["id"]))
+    assert calls == [(str(output), {"width": 448, "height": 768, "fps": 24, "frames": 49})]
+    assert linked["shots"][0]["job"]["settings_match"] is True
+    assert api.db.get_job(job["id"])["result_path"] == str(output)
+    assert output.read_bytes() == b"previously verified clip fixture"
+    manifest = api.create_storyboard_manifest(story["id"])
+    assert manifest["manifest"]["duration_in_frames"] == 49
+    assert manifest["manifest"]["shots"][0]["transition_out_frames"] == 0
