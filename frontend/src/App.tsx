@@ -77,6 +77,13 @@ export default function App() {
     setPreset(typeof data.preset==='string'?data.preset:'Standard')
     setGenerationProfile({model:data.model??'dgrauet/ltx-2.3-mlx-q8',width:data.width??448,height:data.height??768,fps:data.fps??24,distilled_two_stage:data.distilled_two_stage??true,low_ram:data.low_ram??true,audio:data.audio??false})
   }
+  async function recheckLocalStatus() {
+    const [healthResponse, integrationResponse, resourceResponse] = await Promise.all([
+      fetch('/api/health'), fetch('/api/integrations'), fetch('/api/resources'),
+    ])
+    if(!healthResponse.ok||!integrationResponse.ok||!resourceResponse.ok)throw new Error('The local API could not complete all checks')
+    setConnected(true);setIntegrations(await integrationResponse.json());setResources(await resourceResponse.json())
+  }
   useEffect(() => {
     setPrompt(''); setReferenceImage(''); setSeed('');setOutputPath('')
     if(activeProject) void loadProjectSettings(activeProject.id).catch(()=>{})
@@ -130,7 +137,7 @@ export default function App() {
       <div className="page-scroll"><div className="page-container">
         <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> {dateLabel}</div><h1>{active === 'Overview' ? activeProject?.name??'Local video studio' : active}</h1><p className="subtitle">{active === 'Overview' ? activeProject?.description||'Create or select a project to start planning.' : 'A local-first production workspace.'}</p></div>{activeProject&&<button className="button primary" onClick={() => navigate('Generate video')}><Plus size={16}/> New generation</button>}</div>
         {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={14}/></button></div>}
-        {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onSaved={()=>activeProject?loadProjectSettings(activeProject.id):Promise.resolve()} onMessage={setNotice} integrations={integrations} resources={resources} projectId={activeProject?.id??null}/>}
+        {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onSaved={()=>activeProject?loadProjectSettings(activeProject.id):Promise.resolve()} onRecheck={recheckLocalStatus} onMessage={setNotice} integrations={integrations} resources={resources} projectId={activeProject?.id??null}/>}
         {active === 'Job queue' && <JobsPage title="Local job queue" jobs={jobs.filter(j=>j.status==='queued'||j.status==='running'||j.status==='failed')} onChanged={refresh} onMessage={setNotice}/>}
         {active === 'History & logs' && <JobsPage title="Generation history" jobs={jobs.filter(j=>j.status==='completed'||j.status==='failed'||j.status==='cancelled')} onChanged={refresh} onMessage={setNotice}/>}
         {active === 'Projects' && <ProjectsPage projects={projects} activeId={activeProject?.id??null} onChanged={refreshProjects} onSelect={selectProject} onMessage={setNotice}/>}
@@ -173,9 +180,10 @@ function IntegrationCard({ title, ready, detail, path, secondaryPath, warning=fa
   return <div className="integration-card"><div className="integration-head"><span className={`status-dot ${ready?'online':''}`}/><b>{title}</b><small className={warning?'warn-text':''}>{ready?'Connected':warning?'Needs attention':'Unavailable'}</small></div><div className="integration-detail">{detail}</div><code title={path}>{path}</code>{secondaryPath&&<code title={secondaryPath}>HF_HOME · {secondaryPath}</code>}{action&&<div className="integration-action">{action}</div>}</div>
 }
 
-function SettingsPage({ presets, selected, onSelect, onPresetsChanged, onSaved, onMessage, integrations, resources, projectId }: { presets: Preset[]; selected: string; onSelect: (name: string, warning?: boolean) => void; onPresetsChanged: () => Promise<void>; onSaved:()=>Promise<void>; onMessage: (message: string) => void; integrations: Integration | null; resources: Resources | null; projectId:string|null }) {
+function SettingsPage({ presets, selected, onSelect, onPresetsChanged, onSaved, onRecheck, onMessage, integrations, resources, projectId }: { presets: Preset[]; selected: string; onSelect: (name: string, warning?: boolean) => void; onPresetsChanged: () => Promise<void>; onSaved:()=>Promise<void>; onRecheck:()=>Promise<void>; onMessage: (message: string) => void; integrations: Integration | null; resources: Resources | null; projectId:string|null }) {
   const [values, setValues] = useState({ model: 'dgrauet/ltx-2.3-mlx-q8', width: 448, height: 768, distilled_two_stage: true, low_ram: true, audio: false, seed: null as number | null, reference_image: '', output_location: '', preset: 'Standard', prompt: '' })
   const [name, setName] = useState(''); const [frames, setFrames] = useState(97); const [fps, setFps] = useState(24)
+  const [rechecking,setRechecking]=useState(false)
   useEffect(() => { setValues(v=>({...v,prompt:'',reference_image:'',seed:null}));if(projectId)fetch(`/api/settings?project_id=${encodeURIComponent(projectId)}`).then(r=>r.ok?r.json():null).then(data=>{if(data)setValues(v=>({...v,...data,prompt:data.prompt??'',reference_image:data.reference_image??'',output_location:data.output_location??''}))}).catch(()=>{}) }, [projectId])
   const update = (key: string, value: string | number | boolean | null) => setValues(v=>({...v,[key]:value}))
   async function save() {
@@ -194,12 +202,13 @@ function SettingsPage({ presets, selected, onSelect, onPresetsChanged, onSaved, 
       setName(''); onMessage('Custom preset saved'); await onPresetsChanged()
     } catch { onMessage('Could not add preset: the local API is unavailable') }
   }
-  return <section className="panel settings-page"><div className="section-kicker">LOCAL CONNECTIONS</div><h2>Integration status</h2><p className="settings-intro">Detected local installations. The model cache is checked read-only; setup never downloads weights.</p>
+  async function recheck(){setRechecking(true);try{await onRecheck();onMessage('Local integrations and resource safeguards rechecked')}catch(error){onMessage(error instanceof Error?error.message:'Could not recheck local integrations')}finally{setRechecking(false)}}
+  return <section className="panel settings-page"><div className="settings-presets-heading"><div><div className="section-kicker">LOCAL CONNECTIONS</div><h2>Integration status</h2></div><button className="button secondary" onClick={()=>void recheck()} disabled={rechecking}>{rechecking?'Checking…':'Recheck local status'}</button></div><p className="settings-intro">Checks local installations, cache presence, ffprobe, and resource safeguards. Checks are read-only; no model is downloaded and no generation starts.</p>
     <div className="integration-grid">
-      <IntegrationCard title="LTX-2.3 MLX · Q8" ready={Boolean(integrations?.ltx.ready)} detail={integrations?.ltx.weights_cached ? 'Runner and cached Q8 weights available' : integrations?.ltx.cache_available ? 'Hugging Face cache exists; expected Q8 weights missing' : 'Hugging Face cache missing'} path={integrations?.ltx.root ?? 'Checking…'} secondaryPath={integrations?.ltx.hf_home} warning={Boolean(integrations && !integrations.ltx.weights_cached)}/>
-      <IntegrationCard title="Remotion Studio" ready={Boolean(integrations?.remotion.ready)} detail={integrations?.remotion.version ? `CLI ${integrations.remotion.version}` : integrations?.remotion.cli_available ? 'CLI available' : 'CLI missing'} path={integrations?.remotion.root ?? 'Checking…'}/>
+      <IntegrationCard title="LTX-2.3 MLX · Q8" ready={Boolean(integrations?.ltx.ready)} detail={integrations?.ltx.weights_cached ? 'Runner and cached Q8 weights available' : integrations?.ltx.cache_available ? 'Hugging Face cache exists; expected Q8 weights missing. Check LTX_EXECUTABLE and HF_CACHE in .env.' : 'Hugging Face cache missing. Check HF_CACHE in .env; the app will not download weights.'} path={integrations?.ltx.root ?? 'Checking…'} secondaryPath={integrations?.ltx.hf_home} warning={Boolean(integrations && !integrations.ltx.weights_cached)}/>
+      <IntegrationCard title="Remotion Studio" ready={Boolean(integrations?.remotion.ready)} detail={integrations?.remotion.version ? `CLI ${integrations.remotion.version}` : integrations?.remotion.cli_available ? 'CLI available' : 'CLI missing. Check REMOTION_STUDIO and REMOTION_EXECUTABLE in .env.'} path={integrations?.remotion.root ?? 'Checking…'}/>
       <IntegrationCard title="Active project" ready={Boolean(projectId)} detail={projectId?'Project selected':'Select or create a project'} path={projectId??'No active project'}/>
-      <IntegrationCard title="ffprobe" ready={Boolean(integrations?.ffprobe.available)} detail={integrations?.ffprobe.available ? 'Video verification available' : 'ffprobe not found'} path={integrations?.ffprobe.path ?? 'Not detected'}/>
+      <IntegrationCard title="ffprobe" ready={Boolean(integrations?.ffprobe.available)} detail={integrations?.ffprobe.available ? 'Video verification available' : 'ffprobe not found. Install FFmpeg locally or set FFPROBE_EXECUTABLE in .env.'} path={integrations?.ffprobe.path ?? 'Not detected'}/>
     </div>
     <div className="metric-strip"><div><span>MEMORY AVAILABLE</span><b>{formatBytes(resources?.memory.available_bytes)}</b></div><div><span>SWAP IN USE</span><b>{formatBytes(resources?.swap.used_bytes)}</b></div><div><span>DISK FREE</span><b>{formatBytes(resources?.disk_free_bytes)}</b></div><div><span>MEMORY PRESSURE</span><b className={resources?.memory_pressure?.level==='high'?'warn-text':''}>{resources?.memory_pressure ? `${resources.memory_pressure.level} · ${resources.memory_pressure.free_percent}% free` : 'Unavailable'}</b></div></div>
     {Boolean(resources?.warnings?.length)&&<div className="model-caution preflight-warning"><AlertTriangle size={13}/><span>{resources?.warnings.join(' ')}</span></div>}
