@@ -19,6 +19,9 @@ html,body,#root{width:100%;min-width:0;min-height:100%;overflow-x:hidden}
 body{min-width:0}
 button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,video:focus-visible{outline:2px solid var(--purple);outline-offset:2px}
 .nav-item{min-width:0}
+.project-inline-edit,.project-archive-confirm{display:flex;align-items:center;gap:6px;flex-wrap:wrap;max-width:100%}
+.project-inline-edit input{height:26px;min-width:140px;max-width:min(100%,260px);border:1px solid #303139;border-radius:5px;background:#101115;color:#dedfe5;padding:0 8px;font:9px 'DM Sans'}
+.project-archive-confirm span{font-size:9px;color:#b7b8c1}
 .app-shell{width:100%;min-width:0;overflow:hidden}
 .main-content{width:calc(100% - 248px);min-width:0;overflow:hidden}
 .page-scroll{width:100%;min-width:0;overflow-x:hidden}
@@ -76,6 +79,8 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
   .project-library{padding:14px}
   .asset-grid{grid-template-columns:minmax(0,1fr)}
   .integration-grid{grid-template-columns:minmax(0,1fr)}
+  .project-inline-edit,.project-archive-confirm{width:100%}
+  .project-inline-edit input{max-width:100%;flex:1 1 100%}
 }
 
 /* Phase 3 persistent storyboard and Remotion assembly */

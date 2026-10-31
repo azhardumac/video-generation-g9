@@ -204,7 +204,9 @@ def _default_dimensions(aspect_ratio: str | None) -> tuple[int, int]:
 def _validate_image_path(raw: str) -> tuple[Path, str, int, str]:
     try:
         path = safe_local_path(raw, settings, must_exist=True)
-    except (ValueError, FileNotFoundError) as exc:
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Reference image not found. Check that the path exists and is readable, then select an existing image file.") from exc
+    except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not path.is_file() or path.suffix.lower() not in IMAGE_TYPES:
         raise HTTPException(400, "Choose a readable PNG, JPEG, WebP, or GIF image")
