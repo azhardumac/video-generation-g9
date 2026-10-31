@@ -122,11 +122,14 @@ def make_approved_fable_plan(*, frog: dict, scorpion: dict, style_context: str,
                 "output_location": output_location, "audio": False,
                 "reference_conditioning": "one-image", "reference_id": reference["id"],
             }
+            presence_text = (beat + " " + visual).casefold()
+            characters = [name for name in ("frog", "scorpion") if re.search(r"\b" + name + r"\b", presence_text)]
             shots.append({
                 "scene_title": scene_title, "title": title, "prompt": prompt,
                 "visual_description": visual, "reference_image": reference["path"],
-                "reference_ids": [reference["id"]], "characters": ["frog", "scorpion"] if "two-character" in framing or "both" in visual.lower() else [reference_character],
+                "reference_ids": [reference["id"]],
                 "framing": framing, "preset": preset, "seed": seed, "caption": dialogue,
+                "characters": characters or [reference_character],
                 "dialogue": dialogue, "width": width, "height": height, "fps": fps,
                 "output_location": output_location, "estimated_seconds": round(shot_seconds, 2),
                 "transition_after": scenes[-1]["transition_after"] if row_index == len(rows)-1 else transition,

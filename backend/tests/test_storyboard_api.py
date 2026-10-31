@@ -299,6 +299,9 @@ def test_story_to_film_builds_persistent_approved_fable_plan_without_queueing_or
     assert result["film_plan"]["metadata"]["estimated_seconds"] == 24.5
     assert "no planning model is configured" in result["film_plan"]["metadata"]["planner_disclosure"].lower()
     assert result["film_plan"]["metadata"]["approved_reference_ids"] == [frog_ref["id"], scorpion_ref["id"]]
+    assert result["shots"][0]["characters"] == ["frog"]
+    assert result["shots"][7]["characters"] == ["frog", "scorpion"]
+    assert result["shots"][-1]["characters"] == ["frog", "scorpion"]
     assert "style-bible revision 2" in result["film_plan"]["metadata"]["style_bible_notice"]
     assert "Do not use riverbank or water imagery" not in result["style_bible"]["negative_constraints"]
     assert "riverbank-master.png" in result["style_bible"]["negative_constraints"]
