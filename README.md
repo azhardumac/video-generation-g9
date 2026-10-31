@@ -4,7 +4,7 @@ Private, local-first AI video studio for generating portrait video with **LTX-2.
 
 ## Current status (31 October 2026)
 
-**Phases 1, 2, 2.5, 3, and 3.2 are on `main`. Issue #11 Milestones A, B, and C are implemented on stacked feature branches and are not yet integrated.** Milestone A adds:
+**Phases 1, 2, 2.5, 3, 3.1, 3.2, and Issue #11 Milestones A, B, and C are integrated on `main`.** The project lifecycle and production workspace provide:
 
 - Real local projects with create, open/switch, rename, archive/restore, and read-only import for allowed directories.
 - Project-scoped local reference links and uploads. References are explicitly selected, categorized, validated, editable, and removable without deleting source files.
@@ -14,7 +14,7 @@ Milestone B adds project-specific story text and a revisioned visual style/chara
 
 Milestone C removes the legacy standalone Remotion form with hardcoded Scorpion & Frog composition/output defaults; rendering remains available from the reviewed storyboard assembly flow. Generation summaries now reflect active project settings and preset, controls have visible keyboard focus and accessible mobile navigation labels, and a clean-production regression verifies empty initial data plus only the two explicitly selected approved character references. No LTX generation or Remotion render was executed during Issue #11 work.
 
-Issue #11 is **not yet declared complete**. The full acceptance checklist must still be reviewed against the integrated branches and exercised in a fresh application session; no claim of end-to-end production readiness is made from subprocess-free tests.
+The application is not declared fully operational based on code tests alone. Real generation and Remotion rendering require explicit user action, and this Story-to-Film flow has not been run on the GPU or rendered as part of implementation.
 
 The `main` foundation includes:
 
@@ -124,6 +124,22 @@ The LTX adapter calls the installed CLI with `--width`, `--height`, `--frames`, 
 
 Shot deletion is a soft delete and preserves revision snapshots and job/video history. The app blocks removing or archiving shots with queued/running jobs; cancel those jobs first. Archiving a storyboard also retains its database history and media files. Crossfades default to eight frames, and captions are optional text overlays. The storyboard timeline preview is a local playback preview; final transitions/caption compositing are applied by Remotion when its render is explicitly confirmed.
 
+## Story-to-Film: Scorpion & Frog claymation
+
+This workflow creates a new storyboard and keeps any existing woodland draft or historical media untouched.
+
+1. In the project switcher, open **Scorpion & Frog — Claymation**, then choose **Story to Film**.
+2. Select the linked original frog and scorpion character images. The page displays both previews and linked paths. If a file is missing, restore it or relink the original under **References**, then choose **Recheck project data**.
+3. Enter or select the story. **Load the approved river-crossing fable** inserts the exact requested plot into the form; it does not save until you choose **Build Film Plan**. Choose target format, LTX preset, and optional seed.
+4. **Build Film Plan** creates a separate six-scene, twelve-shot storyboard with saved shot prompts, scene order, visual descriptions, framing, dialogue/captions, timing estimates, transitions, references, and validated local generation settings. No jobs are queued. The planner is deterministic because this installation has no configured local planning model; it accepts only the approved frog/scorpion river-crossing fable and rejects other story text rather than inventing plot events.
+5. LTX accepts one conditioning image per shot. Each shot therefore attaches one selected character image, while the plan records both characters when they share a scene. The app does not create or imply a two-image composite. River and water are required by this story; if the existing style bible forbids them, **Build Film Plan** creates a new style-bible revision that permits the river while retaining the previous revision and continuing to forbid reuse of `riverbank-master.png`, old videos, benchmark media, and old storyboard material.
+6. Review all scene and shot cards. Edit prompts or dialogue/captions and choose **Save plan edits**; saving creates a new storyboard revision and invalidates approval. Tick the review statement and choose **Approve Film Plan** to record approval for the exact storyboard and style-bible revisions. Approval alone does not queue work.
+7. **Generate Film** explicitly queues all incomplete shots in order. The existing local worker runs one job at a time. The page shows persisted status, actual job logs, resource warnings, verified output previews, and ffprobe width, height, frame rate, and frame count. Pause prevents the next batch shot from starting (a running shot may finish); cancel stops queued work and requests cancellation of the active child process. Resume continues a paused batch. Selective retry queues only checked failed/cancelled shots; verified completed shots are never duplicated.
+8. When every required shot has a current, verified output, the worker writes a deterministic Remotion composition manifest in `OUTPUT_ROOT/storyboards/<storyboard-id>/composition-manifest.json`. Shot order, crossfades, and available text captions are included. There is no configured voice/audio capability, so the composition has no audio track or placeholder sound.
+9. Choose **Render final film** and confirm the explicit Remotion render prompt. The normal local worker renders the saved manifest and ffprobe verifies the expected canvas, frame rate, and total frame count. A verified final MP4 is playable in the page and **Reveal final MP4 in Finder** opens its output location. No generation or render starts on page load, plan build, approval, or manifest creation.
+
+Generation model, local output location, seed defaults, distilled mode, and low-RAM mode remain project-scoped. The story's content supplies each shot prompt; an unrelated saved prompt is not appended to or substituted for the approved fable. The `Experimental` 193-frame preset retains its visual-drift warning. All created media remains under configured local output paths and outside Git.
+
 ## Tests
 
 ```bash
@@ -133,9 +149,10 @@ python -m pytest -q
 
 cd ../frontend
 npm run build
+npm run typecheck:remotion
 ```
 
-Tests and builds do not require a GPU generation run.
+The Remotion check type-checks only this repository's `remotion/` composition against the existing installation named by `REMOTION_STUDIO` (or `~/AI-Video-Studio/remotion-studio`). It does not edit that installation or render a video. Tests and builds do not require a GPU generation run.
 
 ## Data handling and safeguards
 
@@ -150,7 +167,7 @@ Tests and builds do not require a GPU generation run.
 
 ## Roadmap
 
-**Issue #11 integration follow-up:** merge the stacked Milestone A/B/C pull requests in order, then review the full acceptance checklist in a fresh application session. Preserve all local project media and model caches.
+**Next production milestone:** exercise the Story-to-Film workflow with a user-approved local LTX batch and, after clip verification, one separately approved Remotion render. Fix any machine-specific issues without replacing existing project assets or history.
 
 ## Repository workflow
 

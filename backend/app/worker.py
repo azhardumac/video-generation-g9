@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
@@ -6,6 +7,8 @@ from pathlib import Path
 from .adapters import LTXAdapter, RemotionAdapter
 from .config import Settings
 from .db import Database
+from .storyboards import build_composition_manifest
+from .paths import safe_local_path
 
 
 class LocalWorker:
@@ -35,7 +38,7 @@ class LocalWorker:
 
     async def run(self):
         while not self.stop_event.is_set():
-            pending = next((j for j in reversed(self.db.list_jobs()) if j["status"] == "queued"), None)
+            pending = self.db.next_queued_job()
             if pending:
                 self.active_job_id = pending["id"]
                 self.active_task = asyncio.create_task(self.execute(pending))
@@ -85,6 +88,8 @@ class LocalWorker:
                 except Exception as exc:
                     self.db.event(job_id, "warning", "Video completed, but benchmark history could not be updated: " + str(exc))
             self.db.event(job_id, "info", "Job completed; verified output: " + result_path)
+            if job.get("payload", {}).get("film_batch_id"):
+                self._assemble_completed_film(job)
         except asyncio.CancelledError:
             partial = self._partial_path(job)
             current = self.db.get_job(job_id)
@@ -129,3 +134,24 @@ class LocalWorker:
         if output.exists():
             os.replace(output, cancelled)
             self.db.update_job(job["id"], partial_output_path=str(cancelled))
+
+    def _assemble_completed_film(self, job: dict) -> None:
+        for batch in self.db.list_film_batches_for_job(job["id"]):
+            if batch["status"] != "completed":
+                continue
+            try:
+                storyboard = self.db.get_storyboard(batch["storyboard_id"], include_events=False)
+                if not storyboard:
+                    raise ValueError("Storyboard was archived before composition assembly")
+                output_root = safe_local_path(self.settings.output_root, self.settings)
+                manifest = build_composition_manifest(storyboard, output_root)
+                directory = safe_local_path(str(output_root / "storyboards" / storyboard["id"]), self.settings)
+                directory.mkdir(parents=True, exist_ok=True)
+                manifest_path = directory / "composition-manifest.json"
+                temporary = manifest_path.with_suffix(".json.tmp")
+                temporary.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+                temporary.replace(manifest_path)
+                self.db.store_storyboard_manifest(storyboard["id"], manifest, str(manifest_path))
+                self.db.event(job["id"], "info", "All film shots are verified; deterministic Remotion composition manifest is ready")
+            except Exception as exc:
+                self.db.event(job["id"], "warning", "All shots completed, but automatic composition assembly needs attention: " + str(exc))

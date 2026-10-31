@@ -19,7 +19,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration(target_version=2)
+        self._backup_before_migration(target_version=3)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -103,6 +103,31 @@ class Database:
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS film_plans (
+                    storyboard_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                    source_story TEXT NOT NULL, planner_mode TEXT NOT NULL,
+                    target_format TEXT NOT NULL, preset TEXT NOT NULL,
+                    plan_metadata_json TEXT NOT NULL, approved_revision INTEGER,
+                    approved_style_revision INTEGER, approved_at TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS project_style_bible_revisions (
+                    project_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                    style_bible_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id,revision)
+                );
+                CREATE TABLE IF NOT EXISTS film_batches (
+                    id TEXT PRIMARY KEY, storyboard_id TEXT NOT NULL, project_id TEXT NOT NULL,
+                    storyboard_revision INTEGER NOT NULL, style_bible_revision INTEGER NOT NULL,
+                    status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS film_batch_shots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL,
+                    shot_id TEXT NOT NULL, position INTEGER NOT NULL, status TEXT NOT NULL,
+                    job_id TEXT, skip_reason TEXT NOT NULL DEFAULT '',
+                    UNIQUE(batch_id,shot_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_film_batch_jobs_job ON film_batch_shots(job_id);
             """)
             shot_columns = {row[1] for row in db.execute("PRAGMA table_info(storyboard_shots)")}
             if "scene_id" not in shot_columns:
@@ -132,9 +157,24 @@ class Database:
                 ("output_location", "TEXT"), ("framing", "TEXT NOT NULL DEFAULT ''"),
                 ("prompt_reviewed", "INTEGER NOT NULL DEFAULT 0"),
                 ("reviewed_style_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("visual_description", "TEXT NOT NULL DEFAULT ''"),
+                ("characters_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("reference_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("estimated_seconds", "REAL NOT NULL DEFAULT 0"),
+                ("dialogue", "TEXT NOT NULL DEFAULT ''"),
+                ("transition_after", "TEXT NOT NULL DEFAULT 'dissolve'"),
+                ("generation_payload_json", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 if column not in shot_columns:
                     db.execute(f"ALTER TABLE storyboard_shots ADD COLUMN {column} {declaration}")
+            scene_columns = {row[1] for row in db.execute("PRAGMA table_info(storyboard_scenes)")}
+            for column, declaration in (
+                ("visual_description", "TEXT NOT NULL DEFAULT ''"),
+                ("estimated_seconds", "REAL NOT NULL DEFAULT 0"),
+                ("transition_after", "TEXT NOT NULL DEFAULT 'cut'"),
+            ):
+                if column not in scene_columns:
+                    db.execute(f"ALTER TABLE storyboard_scenes ADD COLUMN {column} {declaration}")
             existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             for column, declaration in (
                 ("exit_code", "INTEGER"),
@@ -172,6 +212,12 @@ class Database:
                            (job["id"], now_iso(), "warning", message))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO project_style_bible_revisions(project_id,revision,style_bible_json,created_at) "
+                       "SELECT id,style_bible_revision,style_bible_json,? FROM projects", (now_iso(),))
+            db.execute("UPDATE film_batches SET status='paused',updated_at=? WHERE status='running' AND EXISTS "
+                       "(SELECT 1 FROM film_batch_shots bs JOIN jobs j ON j.id=bs.job_id WHERE bs.batch_id=film_batches.id AND j.status='failed')",
+                       (now_iso(),))
 
     @staticmethod
     def _execute_schema_script(db: sqlite3.Connection, script: str):
@@ -431,6 +477,11 @@ class Database:
 
     def update_project_style_bible(self, project_id: str, style_bible: dict):
         with self.lock, self.connect() as db:
+            current = db.execute("SELECT style_bible_revision,style_bible_json FROM projects WHERE id=? AND archived_at IS NULL", (project_id,)).fetchone()
+            if not current:
+                raise KeyError("Project not found")
+            db.execute("INSERT OR IGNORE INTO project_style_bible_revisions(project_id,revision,style_bible_json,created_at) VALUES(?,?,?,?)",
+                       (project_id, current["style_bible_revision"], current["style_bible_json"], now_iso()))
             cursor = db.execute("UPDATE projects SET style_bible_json=?,style_bible_revision=style_bible_revision+1 WHERE id=? AND archived_at IS NULL",
                                 (json.dumps(style_bible, ensure_ascii=False), project_id))
             if cursor.rowcount != 1:
@@ -493,7 +544,8 @@ class Database:
             "SELECT id,title,position FROM storyboard_scenes WHERE storyboard_id=? AND deleted_at IS NULL ORDER BY position,id", (storyboard_id,))]
         shots = [dict(row) for row in db.execute(
             "SELECT s.id,s.scene_id,c.title AS scene_title,s.position,s.title,s.prompt,s.reference_image,s.preset,s.seed,s.caption,"
-            "s.width,s.height,s.fps,s.output_location,s.framing,s.prompt_reviewed,s.reviewed_style_revision "
+            "s.width,s.height,s.fps,s.output_location,s.framing,s.prompt_reviewed,s.reviewed_style_revision,"
+            "s.visual_description,s.characters_json,s.reference_ids_json,s.estimated_seconds,s.dialogue,s.transition_after,s.generation_payload_json "
             "FROM storyboard_shots s LEFT JOIN storyboard_scenes c ON c.id=s.scene_id "
             "WHERE s.storyboard_id=? AND s.deleted_at IS NULL ORDER BY s.position,s.id", (storyboard_id,))]
         db.execute("INSERT INTO storyboard_revisions(storyboard_id,revision,title,snapshot_json,created_at) VALUES(?,?,?,?,?)",
@@ -511,13 +563,225 @@ class Database:
                     scene_ids[scene_title] = str(uuid4())
                     db.execute("INSERT INTO storyboard_scenes(id,storyboard_id,title,position,created_at,updated_at) VALUES(?,?,?,?,?,?)",
                                (scene_ids[scene_title], storyboard_id, scene_title, len(scene_ids)-1, timestamp, timestamp))
-                db.execute("INSERT INTO storyboard_shots(id,storyboard_id,scene_id,position,title,prompt,reference_image,preset,seed,caption,created_at,updated_at) "
-                           "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                db.execute("INSERT INTO storyboard_shots(id,storyboard_id,scene_id,position,title,prompt,reference_image,preset,seed,caption,"
+                           "visual_description,characters_json,reference_ids_json,estimated_seconds,dialogue,transition_after,generation_payload_json,"
+                           "width,height,fps,output_location,framing,created_at,updated_at) "
+                           "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (shot.get("id") or str(uuid4()), storyboard_id, scene_ids[scene_title], position, shot["title"], shot["prompt"],
                             shot.get("reference_image"), shot.get("preset", "Short"), shot.get("seed"),
-                            shot.get("caption", ""), timestamp, timestamp))
+                            shot.get("caption", ""), shot.get("visual_description", ""), json.dumps(shot.get("characters", [])),
+                            json.dumps(shot.get("reference_ids", [])), shot.get("estimated_seconds", 0), shot.get("dialogue", ""),
+                            shot.get("transition_after", "dissolve"), json.dumps(shot.get("generation_payload", {}), ensure_ascii=False),
+                            shot.get("width"), shot.get("height"), shot.get("fps"), shot.get("output_location"), shot.get("framing", ""), timestamp, timestamp))
             self._story_snapshot(db, storyboard_id, 1, title, timestamp)
         return self.get_storyboard(storyboard_id)
+
+    def create_film_plan(self, project_id: str, title: str, source_story: str, shots: list[dict],
+                         target_format: str, preset: str, metadata: dict) -> dict:
+        storyboard = self.create_storyboard(project_id, title, shots, source_story)
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("INSERT INTO film_plans(storyboard_id,project_id,source_story,planner_mode,target_format,preset,plan_metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (storyboard["id"], project_id, source_story, "deterministic-approved-fable", target_format,
+                        preset, json.dumps(metadata, ensure_ascii=False, sort_keys=True), timestamp, timestamp))
+        return self.get_storyboard(storyboard["id"])
+
+    def approve_film_plan(self, storyboard_id: str, expected_revision: int, style_revision: int):
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            current = db.execute("SELECT b.revision,p.style_bible_revision,fp.plan_metadata_json FROM storyboards b JOIN projects p ON p.id=b.project_id JOIN film_plans fp ON fp.storyboard_id=b.id WHERE b.id=? AND b.archived_at IS NULL", (storyboard_id,)).fetchone()
+            if not current:
+                raise KeyError("Film plan not found")
+            if current["revision"] != expected_revision or current["style_bible_revision"] != style_revision:
+                raise RuntimeError("The storyboard or style bible changed; refresh and review the saved plan before approving")
+            metadata = json.loads(current["plan_metadata_json"])
+            if metadata.get("style_bible_revision") != style_revision:
+                raise RuntimeError("The style bible changed after this plan was built; build a new plan before approving")
+            cursor = db.execute("UPDATE film_plans SET approved_revision=?,approved_style_revision=?,approved_at=?,updated_at=? WHERE storyboard_id=?",
+                                (expected_revision, style_revision, timestamp, timestamp, storyboard_id))
+            if cursor.rowcount != 1:
+                raise KeyError("Film plan not found")
+            db.execute("UPDATE storyboard_shots SET prompt_reviewed=1,reviewed_style_revision=?,updated_at=? WHERE storyboard_id=? AND deleted_at IS NULL",
+                       (style_revision, timestamp, storyboard_id))
+        return self.get_storyboard(storyboard_id)
+
+    @staticmethod
+    def _insert_film_job(db, project_id: str, shot: dict, payload: dict, timestamp: str,
+                         storyboard_title: str, batch_id: str, position: int) -> str:
+        job_id = str(uuid4())
+        job_payload = payload | {"job_id": job_id, "storyboard_id": shot["storyboard_id"],
+            "shot_id": shot["id"], "film_batch_id": batch_id,
+            "job_label": f"LTX shot {position + 1:02d} · {shot['scene_title']} / {shot['title']}",
+            "storyboard_title": storyboard_title, "shot_order": position + 1}
+        db.execute("INSERT INTO jobs(id,kind,status,progress,payload,project_id,created_at,updated_at) VALUES(?, 'generation','queued',0,?,?,?,?)",
+                   (job_id, json.dumps(job_payload, ensure_ascii=False), project_id, timestamp, timestamp))
+        db.execute("INSERT INTO events(job_id,time,level,message) VALUES(?,?,?,?)",
+                   (job_id, timestamp, "info", "Approved film shot added to the sequential local queue"))
+        snapshot = Database.generation_settings_snapshot(job_payload)
+        db.execute("INSERT INTO shot_jobs(shot_id,job_id,settings_snapshot,created_at) VALUES(?,?,?,?)",
+                   (shot["id"], job_id, json.dumps(snapshot, ensure_ascii=False, sort_keys=True), timestamp))
+        return job_id
+
+    def create_film_batch(self, storyboard_id: str, expected_revision: int, style_revision: int):
+        loaded = self.get_storyboard(storyboard_id, include_events=False)
+        if not loaded or not loaded.get("film_plan"):
+            raise KeyError("Film plan not found")
+        if loaded["revision"] != expected_revision or loaded["style_bible_revision"] != style_revision:
+            raise RuntimeError("The saved film plan changed; refresh and review it before generating")
+        if not loaded["film_plan"]["approved"]:
+            raise RuntimeError("Approve this exact saved plan revision before generating")
+        timestamp, batch_id = now_iso(), str(uuid4())
+        with self.lock, self.connect() as db:
+            current = db.execute("SELECT revision,project_id FROM storyboards WHERE id=? AND archived_at IS NULL", (storyboard_id,)).fetchone()
+            plan = db.execute("SELECT approved_revision,approved_style_revision FROM film_plans WHERE storyboard_id=?", (storyboard_id,)).fetchone()
+            if not current or not plan:
+                raise KeyError("Film plan not found")
+            if current["revision"] != expected_revision or plan["approved_revision"] != expected_revision or plan["approved_style_revision"] != style_revision:
+                raise RuntimeError("The saved film plan changed or its approval is stale")
+            db.execute("INSERT INTO film_batches(id,storyboard_id,project_id,storyboard_revision,style_bible_revision,status,created_at,updated_at) VALUES(?,?,?,?,?,'running',?,?)",
+                       (batch_id, storyboard_id, current["project_id"], expected_revision, style_revision, timestamp, timestamp))
+            new_jobs = 0
+            for position, shot in enumerate(loaded["shots"]):
+                existing = shot.get("job")
+                if shot.get("status") in ("queued", "running"):
+                    raise RuntimeError(f"Shot '{shot['title']}' already has active generation work")
+                output_is_current = bool(existing and existing.get("status") == "completed" and
+                    existing.get("settings_match") and (existing.get("verification_metadata") or {}).get("verified_output") and
+                    existing.get("result_path") and Path(existing["result_path"]).is_file())
+                if output_is_current:
+                    db.execute("INSERT INTO film_batch_shots(batch_id,shot_id,position,status,job_id,skip_reason) VALUES(?,?,?,'completed',?,?)",
+                               (batch_id, shot["id"], position, existing["id"], "Current output is already verified; no duplicate job queued"))
+                    continue
+                raw = db.execute("SELECT * FROM storyboard_shots WHERE id=? AND storyboard_id=? AND deleted_at IS NULL", (shot["id"], storyboard_id)).fetchone()
+                payload = json.loads(raw["generation_payload_json"] or "{}")
+                if not payload.get("prompt") or not payload.get("reference_image") or not payload.get("frames"):
+                    raise RuntimeError(f"Shot '{shot['title']}' is missing its validated generation payload")
+                active = db.execute("SELECT 1 FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? AND j.status IN ('queued','running') LIMIT 1", (shot["id"],)).fetchone()
+                if active:
+                    raise RuntimeError(f"Shot '{shot['title']}' already has active generation work")
+                shot_row = dict(raw) | {"storyboard_id": storyboard_id, "scene_title": shot["scene_title"]}
+                job_id = self._insert_film_job(db, current["project_id"], shot_row, payload, timestamp,
+                                               loaded["title"], batch_id, position)
+                db.execute("INSERT INTO film_batch_shots(batch_id,shot_id,position,status,job_id) VALUES(?,?,?,'queued',?)",
+                           (batch_id, shot["id"], position, job_id))
+                new_jobs += 1
+            if new_jobs == 0:
+                db.execute("UPDATE film_batches SET status='completed',updated_at=? WHERE id=?", (timestamp, batch_id))
+            db.execute("UPDATE storyboards SET manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?", (timestamp, storyboard_id))
+        return self.get_film_batch(batch_id)
+
+    def list_film_batches(self, storyboard_id: str):
+        with self.connect() as db:
+            ids = [row[0] for row in db.execute("SELECT id FROM film_batches WHERE storyboard_id=? ORDER BY created_at DESC,id DESC", (storyboard_id,))]
+        return [self.get_film_batch(batch_id) for batch_id in ids]
+
+    def list_film_batches_for_job(self, job_id: str):
+        with self.connect() as db:
+            ids = [row[0] for row in db.execute("SELECT DISTINCT batch_id FROM film_batch_shots WHERE job_id=?", (job_id,))]
+        return [self.get_film_batch(batch_id) for batch_id in ids]
+
+    def get_film_batch(self, batch_id: str):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM film_batches WHERE id=?", (batch_id,)).fetchone()
+            if not row:
+                return None
+            batch = dict(row)
+            shots = []
+            for item in db.execute("SELECT bs.*,s.title,s.scene_id,c.title AS scene_title FROM film_batch_shots bs JOIN storyboard_shots s ON s.id=bs.shot_id LEFT JOIN storyboard_scenes c ON c.id=s.scene_id WHERE bs.batch_id=? ORDER BY bs.position", (batch_id,)):
+                shot = dict(item)
+                job_row = db.execute("SELECT * FROM jobs WHERE id=?", (shot["job_id"],)).fetchone() if shot.get("job_id") else None
+                if job_row:
+                    job = self._job(job_row)
+                    shot["status"] = job["status"]
+                    shot["progress"] = job["progress"]
+                    shot["job"] = job | {"events": [dict(event) for event in db.execute("SELECT * FROM events WHERE job_id=? ORDER BY id", (job["id"],))]}
+                else:
+                    shot["job"] = None
+                shots.append(shot)
+            batch["shots"] = shots
+            batch["total_shots"] = len(shots)
+            batch["completed_shots"] = sum(1 for shot in shots if shot["status"] == "completed" and
+                                             (not shot.get("job") or (shot["job"].get("verification_metadata") or {}).get("verified_output")))
+            batch["failed_shots"] = sum(shot["status"] == "failed" for shot in shots)
+            running = sum(shot["status"] == "running" for shot in shots)
+            queued = sum(shot["status"] == "queued" for shot in shots)
+            partial = sum((shot.get("job") or {}).get("progress", 0) for shot in shots if shot["status"] == "running") / 100
+            batch["progress"] = round(100 * (batch["completed_shots"] + partial) / max(1, batch["total_shots"]))
+            if batch["status"] == "running" and not running and not queued:
+                new_status = "completed" if batch["completed_shots"] == batch["total_shots"] else "failed"
+                db.execute("UPDATE film_batches SET status=?,updated_at=? WHERE id=?", (new_status, now_iso(), batch_id))
+                batch["status"] = new_status
+            batch["running_shots"] = running
+            batch["queued_shots"] = queued
+            return batch
+
+    def set_film_batch_status(self, batch_id: str, expected: set[str], status: str):
+        with self.lock, self.connect() as db:
+            marks = ",".join("?" for _ in expected)
+            cursor = db.execute(f"UPDATE film_batches SET status=?,updated_at=? WHERE id=? AND status IN ({marks})",
+                                (status, now_iso(), batch_id, *sorted(expected)))
+            if cursor.rowcount != 1:
+                raise RuntimeError("Film batch is no longer in a state that supports this action")
+        return self.get_film_batch(batch_id)
+
+    def cancel_film_batch(self, batch_id: str):
+        with self.lock, self.connect() as db:
+            row = db.execute("SELECT status FROM film_batches WHERE id=?", (batch_id,)).fetchone()
+            if not row:
+                raise KeyError("Film batch not found")
+            if row["status"] not in ("running", "paused", "failed"):
+                raise RuntimeError("Film batch cannot be cancelled in its current state")
+            timestamp = now_iso()
+            job_ids = [item[0] for item in db.execute("SELECT job_id FROM film_batch_shots WHERE batch_id=? AND job_id IS NOT NULL", (batch_id,))]
+            for job_id in job_ids:
+                db.execute("UPDATE jobs SET status='cancelled',updated_at=? WHERE id=? AND status IN ('queued','running')", (timestamp, job_id))
+            db.execute("UPDATE film_batches SET status='cancelled',updated_at=? WHERE id=?", (timestamp, batch_id))
+        return self.get_film_batch(batch_id), job_ids
+
+    def retry_film_batch_shots(self, batch_id: str, shot_ids: list[str]):
+        if not shot_ids or len(shot_ids) != len(set(shot_ids)):
+            raise ValueError("Select one or more distinct failed or cancelled shots")
+        batch = self.get_film_batch(batch_id)
+        if not batch:
+            raise KeyError("Film batch not found")
+        if batch["status"] not in ("failed", "cancelled", "paused"):
+            raise RuntimeError("Pause or finish the current batch before retrying shots")
+        loaded = self.get_storyboard(batch["storyboard_id"], include_events=False)
+        if not loaded or not loaded.get("film_plan", {}).get("approved") or loaded["revision"] != batch["storyboard_revision"]:
+            raise RuntimeError("The approved storyboard revision changed; review and approve it again before retrying")
+        selected = {shot["id"]: shot for shot in loaded["shots"]}
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            batch_rows = {row["shot_id"]: dict(row) for row in db.execute("SELECT * FROM film_batch_shots WHERE batch_id=?", (batch_id,))}
+            if any(shot_id not in batch_rows or shot_id not in selected for shot_id in shot_ids):
+                raise ValueError("A selected shot does not belong to this film batch")
+            for shot_id in shot_ids:
+                row = batch_rows[shot_id]
+                old_status = row["status"]
+                if row.get("job_id"):
+                    old = db.execute("SELECT status FROM jobs WHERE id=?", (row["job_id"],)).fetchone()
+                    old_status = old["status"] if old else old_status
+                if old_status not in ("failed", "cancelled"):
+                    raise RuntimeError(f"Shot '{selected[shot_id]['title']}' is not failed or cancelled; completed shots are never duplicated")
+                shot = selected[shot_id]
+                payload = shot.get("generation_payload") or {}
+                if not payload.get("prompt") or not payload.get("reference_image"):
+                    raise RuntimeError(f"Shot '{shot['title']}' is missing its saved generation payload")
+                active = db.execute("SELECT 1 FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? AND j.status IN ('queued','running') LIMIT 1", (shot_id,)).fetchone()
+                if active:
+                    raise RuntimeError(f"Shot '{shot['title']}' already has active generation work")
+                row_shot = {"id": shot_id, "storyboard_id": batch["storyboard_id"], "scene_title": shot["scene_title"], "title": shot["title"]}
+                job_id = self._insert_film_job(db, batch["project_id"], row_shot, payload, timestamp, loaded["title"], batch_id, row["position"])
+                db.execute("UPDATE film_batch_shots SET job_id=?,status='queued',skip_reason='' WHERE batch_id=? AND shot_id=?", (job_id, batch_id, shot_id))
+            db.execute("UPDATE film_batches SET status='running',updated_at=? WHERE id=?", (timestamp, batch_id))
+        return self.get_film_batch(batch_id)
+
+    def next_queued_job(self):
+        with self.connect() as db:
+            row = db.execute("SELECT j.* FROM jobs j WHERE j.status='queued' AND NOT EXISTS "
+                "(SELECT 1 FROM film_batch_shots bs JOIN film_batches b ON b.id=bs.batch_id WHERE bs.job_id=j.id AND b.status IN ('paused','cancelled')) "
+                "ORDER BY j.created_at ASC,j.rowid ASC LIMIT 1").fetchone()
+            return self._job(row)
 
     def list_storyboards(self, project_id: str | None = None):
         with self.connect() as db:
@@ -579,6 +843,20 @@ class Database:
                     shot["status"] = shot["job"]["status"]
                 shots.append(shot)
             story["shots"] = shots
+            for shot in story["shots"]:
+                for field, default in (("characters_json", []), ("reference_ids_json", []), ("generation_payload_json", {})):
+                    raw = shot.pop(field, None)
+                    try:
+                        shot[field.removesuffix("_json")] = json.loads(raw) if raw else default
+                    except (TypeError, json.JSONDecodeError):
+                        shot[field.removesuffix("_json")] = default
+            plan = db.execute("SELECT * FROM film_plans WHERE storyboard_id=?", (storyboard_id,)).fetchone()
+            story["film_plan"] = None
+            if plan:
+                story["film_plan"] = dict(plan) | {"metadata": json.loads(plan["plan_metadata_json"])}
+                story["film_plan"].pop("plan_metadata_json", None)
+                story["film_plan"]["approved"] = (plan["approved_revision"] == story["revision"] and
+                    plan["approved_style_revision"] == story["style_bible_revision"])
             story["shot_count"] = len(shots)
             return story
 
@@ -635,13 +913,15 @@ class Database:
                 scene_title = (shot.get("scene_title") or "Scene 1").strip() or "Scene 1"
                 scene_id = scene_ids[scene_title]
                 if shot.get("id"):
-                    db.execute("UPDATE storyboard_shots SET scene_id=?,position=?,title=?,prompt=?,reference_image=?,preset=?,seed=?,caption=?,width=?,height=?,fps=?,output_location=?,framing=?,prompt_reviewed=?,reviewed_style_revision=?,updated_at=? WHERE id=?",
+                    db.execute("UPDATE storyboard_shots SET scene_id=?,position=?,title=?,prompt=?,reference_image=?,preset=?,seed=?,caption=?,width=?,height=?,fps=?,output_location=?,framing=?,prompt_reviewed=?,reviewed_style_revision=?,visual_description=?,characters_json=?,reference_ids_json=?,estimated_seconds=?,dialogue=?,transition_after=?,generation_payload_json=?,updated_at=? WHERE id=?",
                                (scene_id, position, shot["title"], shot["prompt"], shot.get("reference_image"), shot["preset"], shot.get("seed"), shot.get("caption", ""),
-                                shot.get("width"), shot.get("height"), shot.get("fps"), shot.get("output_location"), shot.get("framing", ""), int(shot.get("prompt_reviewed", False)), shot.get("reviewed_style_revision", 0), timestamp, shot["id"]))
+                                shot.get("width"), shot.get("height"), shot.get("fps"), shot.get("output_location"), shot.get("framing", ""), int(shot.get("prompt_reviewed", False)), shot.get("reviewed_style_revision", 0),
+                                shot.get("visual_description", ""), json.dumps(shot.get("characters", [])), json.dumps(shot.get("reference_ids", [])), shot.get("estimated_seconds", 0), shot.get("dialogue", ""), shot.get("transition_after", "dissolve"), json.dumps(shot.get("generation_payload", {}), ensure_ascii=False), timestamp, shot["id"]))
                 else:
-                    db.execute("INSERT INTO storyboard_shots(id,storyboard_id,scene_id,position,title,prompt,reference_image,preset,seed,caption,width,height,fps,output_location,framing,prompt_reviewed,reviewed_style_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    db.execute("INSERT INTO storyboard_shots(id,storyboard_id,scene_id,position,title,prompt,reference_image,preset,seed,caption,width,height,fps,output_location,framing,prompt_reviewed,reviewed_style_revision,visual_description,characters_json,reference_ids_json,estimated_seconds,dialogue,transition_after,generation_payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                (str(uuid4()), storyboard_id, scene_id, position, shot["title"], shot["prompt"], shot.get("reference_image"), shot["preset"], shot.get("seed"), shot.get("caption", ""),
-                                shot.get("width"), shot.get("height"), shot.get("fps"), shot.get("output_location"), shot.get("framing", ""), int(shot.get("prompt_reviewed", False)), shot.get("reviewed_style_revision", 0), timestamp, timestamp))
+                                shot.get("width"), shot.get("height"), shot.get("fps"), shot.get("output_location"), shot.get("framing", ""), int(shot.get("prompt_reviewed", False)), shot.get("reviewed_style_revision", 0),
+                                shot.get("visual_description", ""), json.dumps(shot.get("characters", [])), json.dumps(shot.get("reference_ids", [])), shot.get("estimated_seconds", 0), shot.get("dialogue", ""), shot.get("transition_after", "dissolve"), json.dumps(shot.get("generation_payload", {}), ensure_ascii=False), timestamp, timestamp))
             revision = expected_revision + 1
             db.execute("UPDATE storyboards SET title=?,story_text=?,revision=?,manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?",
                        (title, story_text, revision, timestamp, storyboard_id))

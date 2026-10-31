@@ -114,6 +114,25 @@ def test_manifest_single_verified_clip_has_no_transition_and_keeps_job_snapshot(
     assert manifest["shots"][0]["settings_snapshot"] == settings_snapshot
 
 
+def test_manifest_applies_approved_cut_and_final_fade_transitions(tmp_path):
+    first, second = tmp_path / "first.mp4", tmp_path / "second.mp4"
+    first.write_bytes(b"test-only verified fixture")
+    second.write_bytes(b"test-only verified fixture")
+    shots = []
+    for index, (path, transition) in enumerate(((first, "cut"), (second, "fade"))):
+        shots.append({"id": f"shot-{index}", "position": index, "title": f"Shot {index}",
+            "prompt": "Reviewed prompt", "transition_after": transition,
+            "job": {"id": f"job-{index}", "status": "completed", "result_path": str(path),
+                "settings_match": True, "verification_metadata": {"verified_output": {
+                    "width": 448, "height": 768, "fps": 24, "frames": 49}}}})
+    manifest = build_composition_manifest({"id": "transitions", "revision": 1, "title": "Transitions", "shots": shots}, tmp_path)
+    assert manifest["duration_in_frames"] == 98
+    assert manifest["shots"][0]["transition_after"] == "cut"
+    assert manifest["shots"][0]["transition_out_frames"] == 0
+    assert manifest["shots"][1]["transition_after"] == "fade"
+    assert manifest["shots"][1]["transition_out_frames"] == 8
+
+
 def test_manifest_accepts_configured_landscape_aspect_and_frame_rate(tmp_path):
     clip=tmp_path/"landscape.mp4"
     clip.write_bytes(b"test-only fixture")
@@ -346,3 +365,36 @@ def test_remotion_nonzero_exit_includes_underlying_cli_output(tmp_path, monkeypa
         assert "renderer port" in str(error.value)
 
     asyncio.run(run())
+
+
+def test_film_batch_running_job_recovers_as_failed_after_database_restart(tmp_path):
+    output = tmp_path / "outputs"
+    output.mkdir()
+    reference = tmp_path / "frog.png"
+    reference.write_bytes(b"test reference")
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "recovery.sqlite3"),
+                        output_root=str(output), allowed_path_roots=str(tmp_path))
+    db = Database(settings)
+    db.import_project("recovery", "Recovery", str(tmp_path), [])
+    prompt = "A handmade clay frog crosses the river under moonlight."
+    plan = db.create_film_plan("recovery", "Recovery plan", "Approved river fable", [{
+        "scene_title": "Crossing", "title": "Opening", "prompt": prompt,
+        "reference_image": str(reference), "reference_ids": ["frog-ref"],
+        "preset": "Short", "seed": 7, "width": 448, "height": 768, "fps": 24,
+        "output_location": str(output), "framing": "wide",
+        "generation_payload": {"prompt": prompt, "shot_prompt": prompt, "model": "local",
+            "reference_image": str(reference), "reference_id": "frog-ref", "reference_conditioning": "one-image",
+            "preset": "Short", "seed": 7, "frames": 49, "fps": 24, "width": 448, "height": 768,
+            "output_location": str(output), "audio": False, "shot_settings": {"width": 448, "height": 768, "fps": 24,
+                "output_location": str(output), "framing": "wide", "style_bible_revision": 0}},
+    }], target_format="9:16", preset="Short", metadata={"style_bible_revision": 0})
+    db.approve_film_plan(plan["id"], plan["revision"], 0)
+    batch = db.create_film_batch(plan["id"], plan["revision"], 0)
+    job_id = batch["shots"][0]["job"]["id"]
+    assert db.claim_job(job_id)
+
+    restarted = Database(settings)
+    assert restarted.get_job(job_id)["status"] == "failed"
+    recovered = restarted.get_film_batch(batch["id"])
+    assert recovered["status"] == "paused"
+    assert recovered["shots"][0]["status"] == "failed"
