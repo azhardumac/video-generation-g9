@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import shutil
+import socket
 import signal
 from fractions import Fraction
 from pathlib import Path
@@ -15,6 +16,22 @@ class AdapterError(RuntimeError):
         super().__init__(message)
         self.exit_code = exit_code
         self.partial_output = partial_output
+
+
+def select_remotion_render_port(configured_port: int = 0) -> int:
+    """Return a free loopback port; zero means ask the OS for an ephemeral port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if configured_port:
+            try:
+                probe.bind(("127.0.0.1", configured_port))
+            except OSError as exc:
+                raise AdapterError(
+                    f"Configured Remotion render port {configured_port} is unavailable: {exc}. "
+                    "Choose another REMOTION_RENDER_PORT or set it to 0 for a dynamic port."
+                ) from exc
+            return configured_port
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 def build_ltx_command(executable: str, payload: dict, output_path: str, reference_image: str | None = None) -> list[str]:
@@ -166,7 +183,9 @@ class RemotionAdapter:
         output = safe_local_path(payload["output_path"], self.settings)
         output.parent.mkdir(parents=True, exist_ok=True)
         partial = output.with_name(output.stem + ".partial" + output.suffix)
+        render_port = select_remotion_render_port(self.settings.remotion_render_port)
         args = [str(executable), "render", str(entrypoint), payload["composition_id"], str(partial), "--overwrite"]
+        args += ["--port", str(render_port)]
         if payload.get("width"):
             args += ["--width", str(payload["width"])]
         if payload.get("height"):
@@ -182,20 +201,31 @@ class RemotionAdapter:
         env = os.environ.copy()
         remotion_modules = str(working_dir / "node_modules")
         env["NODE_PATH"] = os.pathsep.join(filter(None, (remotion_modules, env.get("NODE_PATH", ""))))
-        process = await asyncio.create_subprocess_exec(
-            *args, cwd=str(working_dir), stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT, start_new_session=(os.name == "posix"), env=env,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *args, cwd=str(working_dir), stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT, start_new_session=(os.name == "posix"), env=env,
+            )
+        except OSError as exc:
+            raise AdapterError(f"Could not start Remotion render on port {render_port}: {exc}") from exc
+        output_text = []
         try:
             while line := await process.stdout.readline():
-                await on_progress(35, line.decode(errors="replace").strip())
+                decoded = line.decode(errors="replace").strip()
+                if decoded:
+                    output_text.append(decoded[:1000])
+                    if len(output_text) > 100:
+                        del output_text[0]
+                await on_progress(35, decoded)
             code = await process.wait()
         except asyncio.CancelledError:
             await terminate_process_group(process)
             raise
         if code:
+            details = "\n".join(output_text)[-8000:]
+            suffix = f"\nFinal Remotion output:\n{details}" if details else "\nRemotion produced no stdout/stderr output."
             raise AdapterError(
-                f"Remotion exited with code {code}", exit_code=code,
+                f"Remotion exited with code {code} on renderer port {render_port}.{suffix}", exit_code=code,
                 partial_output=str(partial) if partial.exists() else None,
             )
         await on_progress(90)

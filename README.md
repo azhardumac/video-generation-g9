@@ -22,6 +22,10 @@ Private, local-first AI video studio for generating portrait video with **LTX-2.
 
 **Phase 3.1 validation:** 33 backend tests passed and the frontend production build passed. Tests cover settings-snapshot staleness, jobs edited while queued/running, safe attachment of an existing ffprobe-verified clip, and the one-shot manifest edge case. On the reference Mac, the existing Scorpion & Frog 49-frame clip was explicitly attached to its storyboard shot, re-probed at 448 × 768/24 fps/49 frames, and resolved into a one-shot manifest. The packaged Remotion composition was discovered with the installed local CLI and configured `--public-dir` on a separate port. No video was rendered; the first real Remotion render still requires explicit user confirmation in the app.
 
+**Phase 3.2 finding:** the Remotion renderer previously defaulted to port 3000, which was occupied by the unrelated `npx remotion studio` process. The app now selects an ephemeral loopback port by default; set `REMOTION_RENDER_PORT` to a free fixed port to override it. Failed render jobs retain final CLI output for diagnosis and identify render type/duration in the UI.
+
+The Phase 3.2 adapter regressions pass with the backend suite; the frontend production build and packaged Remotion type-check also pass. Dynamic-port composition discovery succeeded on the reference Mac. The existing failed render was not retried.
+
 ## Hardware and software requirements
 
 ### Validated reference system (not a universal minimum)
@@ -64,7 +68,7 @@ Default project checkout path: `~/AI-Video-Studio/apps/ai-video-studio`.
    cp .env.example .env
    ```
 
-   Set the paths for `LTX_ROOT`, `LTX_EXECUTABLE`, `HF_CACHE`, `REMOTION_STUDIO`, `REMOTION_EXECUTABLE`, `STORY_PROJECT`, `OUTPUT_ROOT`, and `ALLOWED_PATH_ROOTS` to your existing installations. The configuration points to existing files and does not copy or redownload them.
+   Set the paths for `LTX_ROOT`, `LTX_EXECUTABLE`, `HF_CACHE`, `REMOTION_STUDIO`, `REMOTION_EXECUTABLE`, `STORY_PROJECT`, `OUTPUT_ROOT`, and `ALLOWED_PATH_ROOTS` to your existing installations. The configuration points to existing files and does not copy or redownload them. `REMOTION_RENDER_PORT=0` chooses an available dynamic port; set it to a specific free port if needed. The renderer passes that port to Remotion and does not assume port 3000 is available.
 
 2. Start FastAPI in terminal 1:
 

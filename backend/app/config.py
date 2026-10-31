@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     ltx_root: str = "~/AI-Video-Studio/src/ltx-2-mlx"
     hf_cache: str = "~/AI-Video-Studio/models/ltx/huggingface"
     remotion_studio: str = "~/AI-Video-Studio/remotion-studio"
+    remotion_render_port: int = Field(default=0, ge=0, le=65535)
     story_project: str = "~/AI-Video-Studio/projects/scorpion-frog"
     ltx_executable: str = "~/AI-Video-Studio/src/ltx-2-mlx/.venv/bin/ltx-2-mlx"
     remotion_executable: str = "~/AI-Video-Studio/remotion-studio/node_modules/.bin/remotion"
