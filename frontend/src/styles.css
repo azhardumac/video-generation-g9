@@ -10,7 +10,7 @@
 .job-telemetry>div{display:flex;flex-direction:column;gap:5px;min-width:0}
 .job-telemetry span{font:8px 'DM Mono',monospace;letter-spacing:.6px;color:#898b95}
 .job-telemetry b{font-size:10px;color:#d9d9df;font-weight:500}
-.job-telemetry code{font-size:9px;color:#bbb;overflow-wrap:anywhere}
+.job-telemetry code{font-size:9px;color:#bbb;white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto}
 .job-telemetry .telemetry-wide{grid-column:1/-1}
 .job-telemetry .warning-text code{color:#f0c77d}
 

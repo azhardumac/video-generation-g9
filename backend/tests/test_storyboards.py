@@ -1,10 +1,11 @@
 import asyncio
 import json
+import socket
 from pathlib import Path
 
 import pytest
 
-from app.adapters import RemotionAdapter
+from app.adapters import AdapterError, RemotionAdapter, select_remotion_render_port
 from app.config import Settings
 from app.db import Database
 from app.storyboards import build_composition_manifest
@@ -208,11 +209,127 @@ def test_remotion_adapter_passes_public_media_and_verifies_expected_output(tmp_p
             "width": 448, "height": 768, "fps": 24, "expected_output": expected,
         }, lambda *_: asyncio.sleep(0))
         argv = captured["args"]
+        assert argv[argv.index("--port") + 1].isdigit()
+        assert 1 <= int(argv[argv.index("--port") + 1]) <= 65535
         assert argv[argv.index("--public-dir") + 1] == str(output_root)
         assert argv[argv.index("--width") + 1] == "448"
         assert json.loads(argv[argv.index("--props") + 1])["manifest"]["duration_in_frames"] == 90
         assert captured["expected"] == expected
         assert result["output_path"] == str(output)
         assert output.read_bytes() == b"rendered"
+
+    asyncio.run(run())
+
+
+def test_remotion_render_port_can_be_configured_or_dynamically_allocated():
+    port = select_remotion_render_port(0)
+    assert 1 <= port <= 65535
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as free_socket:
+        free_socket.bind(("127.0.0.1", 0))
+        configured_candidate = free_socket.getsockname()[1]
+    configured = select_remotion_render_port(configured_candidate)
+    assert configured == configured_candidate
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        blocked_port = occupied.getsockname()[1]
+        with pytest.raises(AdapterError, match=f"Configured Remotion render port {blocked_port} is unavailable"):
+            select_remotion_render_port(blocked_port)
+
+
+def test_remotion_adapter_rejects_configured_port_collision_before_starting_process(tmp_path, monkeypatch):
+    async def run():
+        studio = tmp_path / "remotion"
+        studio.mkdir()
+        runner = studio / "remotion"
+        runner.write_text("fixture")
+        runner.chmod(0o755)
+        output_root = tmp_path / "outputs"
+        output_root.mkdir()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            port = occupied.getsockname()[1]
+            settings = Settings(_env_file=None, remotion_studio=str(studio), remotion_executable=str(runner),
+                                remotion_render_port=port, output_root=str(output_root),
+                                allowed_path_roots=str(tmp_path))
+            entrypoint = tmp_path / "storyboard-entry.ts"
+            entrypoint.write_text("fixture")
+
+            async def unexpected_start(*_args, **_kwargs):
+                pytest.fail("Remotion subprocess must not start if the configured port is occupied")
+
+            from app import adapters
+            monkeypatch.setattr(adapters.asyncio, "create_subprocess_exec", unexpected_start)
+            with pytest.raises(AdapterError, match=f"Configured Remotion render port {port} is unavailable"):
+                await RemotionAdapter(settings).render({
+                    "entrypoint": str(entrypoint), "composition_id": "StoryboardAssembly",
+                    "output_path": str(output_root / "story.mp4"),
+                }, lambda *_: asyncio.sleep(0))
+
+    asyncio.run(run())
+
+
+def test_remotion_startup_failure_has_actionable_port_context(tmp_path, monkeypatch):
+    async def run():
+        studio = tmp_path / "remotion"
+        studio.mkdir()
+        runner = studio / "remotion"
+        runner.write_text("fixture")
+        runner.chmod(0o755)
+        output_root = tmp_path / "outputs"
+        output_root.mkdir()
+        settings = Settings(_env_file=None, remotion_studio=str(studio), remotion_executable=str(runner),
+                            output_root=str(output_root), allowed_path_roots=str(tmp_path))
+        entrypoint = tmp_path / "storyboard-entry.ts"
+        entrypoint.write_text("fixture")
+
+        async def fail_start(*_args, **_kwargs):
+            raise OSError("simulated executable startup failure")
+
+        from app import adapters
+        monkeypatch.setattr(adapters.asyncio, "create_subprocess_exec", fail_start)
+        with pytest.raises(AdapterError, match=r"Could not start Remotion render on port \d+: simulated executable startup failure"):
+            await RemotionAdapter(settings).render({
+                "entrypoint": str(entrypoint), "composition_id": "StoryboardAssembly",
+                "output_path": str(output_root / "story.mp4"),
+            }, lambda *_: asyncio.sleep(0))
+
+    asyncio.run(run())
+
+
+def test_remotion_nonzero_exit_includes_underlying_cli_output(tmp_path, monkeypatch):
+    async def run():
+        studio = tmp_path / "remotion"
+        studio.mkdir()
+        runner = studio / "remotion"
+        runner.write_text("fixture")
+        runner.chmod(0o755)
+        output_root = tmp_path / "outputs"
+        output_root.mkdir()
+        settings = Settings(_env_file=None, remotion_studio=str(studio), remotion_executable=str(runner),
+                            output_root=str(output_root), allowed_path_roots=str(tmp_path))
+        entrypoint = tmp_path / "storyboard-entry.ts"
+        entrypoint.write_text("fixture")
+
+        class Stream:
+            lines = [b"Tried to go to http://localhost:3000/index.html\n", b"window.getStaticCompositions is undefined\n", b""]
+            async def readline(self): return self.lines.pop(0)
+
+        class Process:
+            stdout = Stream()
+            returncode = 1
+            async def wait(self): return 1
+
+        async def fail_render(*_args, **_kwargs): return Process()
+        from app import adapters
+        monkeypatch.setattr(adapters.asyncio, "create_subprocess_exec", fail_render)
+        with pytest.raises(AdapterError) as error:
+            await RemotionAdapter(settings).render({
+                "entrypoint": str(entrypoint), "composition_id": "StoryboardAssembly",
+                "output_path": str(output_root / "story.mp4"),
+            }, lambda *_: asyncio.sleep(0))
+        assert error.value.exit_code == 1
+        assert "window.getStaticCompositions is undefined" in str(error.value)
+        assert "Final Remotion output" in str(error.value)
+        assert "renderer port" in str(error.value)
 
     asyncio.run(run())

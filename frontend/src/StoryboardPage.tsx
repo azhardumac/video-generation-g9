@@ -3,7 +3,7 @@ import { ArrowDown, ArrowUp, Check, Clapperboard, Film, LoaderCircle, Plus, Refr
 
 type Asset = { path: string; relative_path: string; mime_type: string }
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
-type ExistingJob = { id:string; kind?:string; status:string; created_at:string; result_path?:string|null; payload:{prompt:string;preset:string;seed?:number|null;reference_image?:string|null}; verification_metadata?:{verified_output?:{width:number;height:number;fps:number;frames:number}}|null }
+type ExistingJob = { id:string; kind?:string; status:string; created_at:string; result_path?:string|null; payload:{prompt?:string;preset?:string;seed?:number|null;reference_image?:string|null}; verification_metadata?:{verified_output?:{width:number;height:number;fps:number;frames:number}}|null }
 type ShotJob = ExistingJob & { progress: number; error?: string | null; settings_match?:boolean; settings_snapshot?:{prompt:string;preset:string;seed?:number|null;reference_image?:string|null}; events?: {id:number;time:string;level:string;message:string}[] }
 type Shot = { id?: string; position: number; scene_id?: string; scene_title: string; title: string; prompt: string; reference_image: string | null; preset: string; seed: number | null; caption: string; status?: string; job?: ShotJob | null }
 type ManifestShot = { shot_id: string; scene_title: string; title: string; frames: number; start_frame: number; transition_in_frames: number; transition_out_frames: number; caption: string }
@@ -132,10 +132,10 @@ export default function StoryboardPage({assets,jobs,imported,onImportProject,onM
   }
 
   function useExistingSettings(index:number,job:ExistingJob){
-    changeShot(index,'prompt',job.payload.prompt)
+    changeShot(index,'prompt',job.payload.prompt??'')
     changeShot(index,'reference_image',job.payload.reference_image??null)
     changeShot(index,'seed',job.payload.seed??null)
-    changeShot(index,'preset',job.payload.preset)
+    changeShot(index,'preset',job.payload.preset??'Short')
   }
 
   async function buildManifest(){
@@ -185,7 +185,7 @@ export default function StoryboardPage({assets,jobs,imported,onImportProject,onM
       const presetInfo=presets.find(item=>item.name===shot.preset)
       const savedJobSettings=job?.settings_snapshot
       const outputIsStale=Boolean(job?.result_path&&(job.settings_match===false||(savedJobSettings&&(savedJobSettings.prompt!==shot.prompt||savedJobSettings.reference_image!==(shot.reference_image||null)||savedJobSettings.seed!==(shot.seed??null)||savedJobSettings.preset!==shot.preset))))
-      const reusable=jobs.filter(item=>item.kind==='generation'&&item.status==='completed'&&Boolean(item.result_path)&&Boolean(item.verification_metadata?.verified_output))
+      const reusable=jobs.filter(item=>item.kind==='generation'&&item.status==='completed'&&typeof item.payload.prompt==='string'&&Boolean(item.result_path)&&Boolean(item.verification_metadata?.verified_output))
       const selectedJob=reusable.find(item=>item.id===selectedExisting[shot.id??''])
       const matchesSelected=selectedJob&&selectedJob.payload.prompt===shot.prompt&&selectedJob.payload.reference_image===shot.reference_image&&selectedJob.payload.seed===(shot.seed??null)&&selectedJob.payload.preset===shot.preset
       return <article className="shot-plan-card" key={shot.id??`new-${index}`}>

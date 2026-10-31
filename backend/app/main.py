@@ -368,6 +368,7 @@ def queue_storyboard_render(storyboard_id: str):
     output_path = output_root / "storyboards" / storyboard_id / f"storyboard-r{story['revision']}.mp4"
     entrypoint = Path(__file__).resolve().parents[2] / "remotion" / "index.ts"
     payload = {"entrypoint": str(entrypoint), "composition_id": "StoryboardAssembly",
+               "job_label": f"Remotion storyboard render · {story['title']}",
                "output_path": str(output_path), "public_dir": str(output_root),
                "props": {"manifest": manifest}, "width": manifest["width"], "height": manifest["height"],
                "fps": manifest["fps"], "expected_output": {"width": manifest["width"], "height": manifest["height"],

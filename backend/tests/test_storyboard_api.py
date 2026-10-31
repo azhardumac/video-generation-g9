@@ -95,6 +95,7 @@ def test_import_edit_queue_and_safe_delete_api_workflow(monkeypatch):
     assert Path(assembled["manifest_path"]).is_file()
     render_job = api.queue_storyboard_render(story["id"])
     assert render_job["kind"] == "render"
+    assert render_job["payload"]["job_label"] == "Remotion storyboard render · Scorpion & Frog — River Crossing"
     assert render_job["payload"]["composition_id"] == "StoryboardAssembly"
     assert render_job["payload"]["expected_output"] == {"width": 448, "height": 768, "fps": 24, "frames": 186}
     assert Path(shot["reference_image"]).read_bytes() == reference_before
