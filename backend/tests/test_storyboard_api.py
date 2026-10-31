@@ -238,6 +238,194 @@ def test_fresh_scorpion_frog_production_uses_only_explicit_character_selections(
     assert prior_video.read_bytes() == b"legacy video fixture"
 
 
+def test_story_to_film_builds_persistent_approved_fable_plan_without_queueing_or_reusing_media():
+    from uuid import uuid4
+    source = _ROOT / f"film-plan-inputs-{uuid4().hex[:8]}"
+    source.mkdir()
+    frog = source / "frog-original.png"
+    scorpion = source / "scorpion-original.png"
+    unused_riverbank = source / "riverbank-master.png"
+    old_video = source / "benchmark.mp4"
+    for index, image in enumerate((frog, scorpion, unused_riverbank)):
+        image.write_bytes(b"\x89PNG\r\n\x1a\nreference fixture " + bytes([index]))
+    old_video.write_bytes(b"historical output fixture")
+    project = api.create_project(api.ProjectCreateRequest(
+        name=f"Story-to-Film {uuid4().hex[:6]}", workspace_path=str(_ROOT / f"film-workspace-{uuid4().hex[:8]}"),
+        description="Handmade cinematic claymation", aspect_ratio="9:16", frame_rate=24,
+        production_type="handmade cinematic claymation",
+    ))
+    api.update_project_style_bible(project["id"], api.StyleBibleRequest(
+        material="Handmade cinematic claymation with tactile sculpted clay and miniature sets.",
+        silhouettes="Preserve the original frog and scorpion silhouettes.",
+        proportions="Consistent expressive clay characters.", composition="Cinematic close and wide framing.",
+        negative_constraints="Do not use riverbank or water imagery, riverbank-master.png, any prior video, or benchmark media.",
+    ))
+    frog_ref = api.add_existing_project_reference(project["id"], api.ProjectReferenceCreate(
+        path=str(frog), name="Original frog character", category="character"))
+    scorpion_ref = api.add_existing_project_reference(project["id"], api.ProjectReferenceCreate(
+        path=str(scorpion), name="Original scorpion character", category="character"))
+    woodland = api.db.create_storyboard(project["id"], "Existing woodland draft", [{
+        "scene_title": "Woodland path", "title": "Existing draft shot", "prompt": "Preserved woodland path draft.",
+    }], "A different woodland path story.")
+    api.db.put_setting(f"generation:{project['id']}", {"model": "dgrauet/ltx-2.3-mlx-q8", "seed": 81,
+                                                        "width": 448, "height": 768, "distilled_two_stage": True,
+                                                        "low_ram": True, "audio": False, "preset": "Standard"})
+    isolated_project = api.create_project(api.ProjectCreateRequest(
+        name=f"Reference isolation {uuid4().hex[:6]}", workspace_path=str(_ROOT / f"isolated-{uuid4().hex[:8]}"),
+        aspect_ratio="9:16", frame_rate=24, production_type="handmade cinematic claymation",
+    ))
+    with pytest.raises(HTTPException) as cross_project_reference:
+        api.build_film_plan(isolated_project["id"], api.BuildFilmPlanRequest(
+            story_text="A frog searches the river for a crossing. A scorpion asks the frog for a ride. The frog fears being stung. The scorpion says both would die if he stung the frog, so the frog agrees. They cross the river. Halfway across the scorpion stings the frog. The frog asks why; the scorpion says it is his nature. Both face a tragic end.",
+            frog_reference_id=frog_ref["id"], scorpion_reference_id=scorpion_ref["id"],
+        ))
+    assert cross_project_reference.value.status_code == 400
+    assert api.list_project_storyboards(isolated_project["id"]) == []
+    source_story = ("A frog searches for a crossing at a river. A scorpion requests a ride. The frog fears being stung. "
+                    "The scorpion reasons that both would die if he stung the frog, so the frog agrees. They cross the river. "
+                    "Halfway across the scorpion stings the frog. The frog asks why. The scorpion answers that it is in his nature. "
+                    "Both face a tragic end.")
+    result = api.build_film_plan(project["id"], api.BuildFilmPlanRequest(
+        story_text=source_story, frog_reference_id=frog_ref["id"], scorpion_reference_id=scorpion_ref["id"],
+        target_format="9:16", preset="Short", seed=81,
+    ))
+    assert result["id"] != woodland["id"]
+    assert result["story_text"] == source_story
+    assert result["revision"] == 1
+    assert [scene["title"] for scene in result["scenes"]] == [item["title"] for item in result["film_plan"]["metadata"]["scenes"]]
+    assert len(result["scenes"]) == 6
+    assert len(result["shots"]) == 12
+    assert result["film_plan"]["metadata"]["shot_count"] == 12
+    assert result["film_plan"]["metadata"]["estimated_seconds"] == 24.5
+    assert "no planning model is configured" in result["film_plan"]["metadata"]["planner_disclosure"].lower()
+    assert result["film_plan"]["metadata"]["approved_reference_ids"] == [frog_ref["id"], scorpion_ref["id"]]
+    assert result["shots"][0]["characters"] == ["frog"]
+    assert result["shots"][7]["characters"] == ["frog", "scorpion"]
+    assert result["shots"][-1]["characters"] == ["frog", "scorpion"]
+    assert "style-bible revision 2" in result["film_plan"]["metadata"]["style_bible_notice"]
+    assert "Do not use riverbank or water imagery" not in result["style_bible"]["negative_constraints"]
+    assert "riverbank-master.png" in result["style_bible"]["negative_constraints"]
+    with api.db.connect() as local_db:
+        prior_style = local_db.execute("SELECT style_bible_json FROM project_style_bible_revisions WHERE project_id=? AND revision=1", (project["id"],)).fetchone()
+    assert "Do not use riverbank or water imagery" in prior_style["style_bible_json"]
+    for shot in result["shots"]:
+        assert len(shot["reference_ids"]) == 1
+        assert shot["reference_image"] in {str(frog.resolve()), str(scorpion.resolve())}
+        payload = shot["generation_payload"]
+        assert payload["reference_id"] == shot["reference_ids"][0]
+        assert payload["reference_conditioning"] == "one-image"
+        assert (payload["width"], payload["height"], payload["fps"], payload["frames"]) == (448, 768, 24, 49)
+        assert payload["seed"] == 81 and payload["audio"] is False
+        assert "Do not reuse prior video, riverbank-master.png, benchmark media" in payload["prompt"]
+        assert "Project style bible:" in payload["prompt"]
+    assert not result["film_plan"]["approved"]
+    assert api.db.list_jobs(project_id=project["id"]) == []
+    assert api.db.get_storyboard(woodland["id"])["shots"][0]["prompt"] == "Preserved woodland path draft."
+    assert woodland["story_text"] == "A different woodland path story."
+    assert frog.read_bytes().startswith(b"\x89PNG") and scorpion.read_bytes().startswith(b"\x89PNG")
+    assert unused_riverbank.read_bytes().startswith(b"\x89PNG") and old_video.read_bytes() == b"historical output fixture"
+
+    approved = api.approve_film_plan(result["id"], api.ApproveFilmPlanRequest(
+        revision=result["revision"], style_bible_revision=result["style_bible_revision"]))
+    assert approved["film_plan"]["approved"]
+    assert approved["film_plan"]["approved_revision"] == approved["revision"]
+    assert all(shot["prompt_reviewed"] for shot in approved["shots"])
+    changed_shots = [approved["shots"][0] | {"prompt": approved["shots"][0]["prompt"] + " Revised framing."}, *approved["shots"][1:]]
+    changed = api.update_storyboard(approved["id"], api.StoryboardUpdate(
+        revision=approved["revision"], title=approved["title"], story_text=approved["story_text"], shots=changed_shots))
+    assert changed["revision"] == approved["revision"] + 1
+    assert not changed["film_plan"]["approved"]
+    with pytest.raises(HTTPException) as unsupported:
+        api.build_film_plan(project["id"], api.BuildFilmPlanRequest(
+            story_text="A woodland path and a fallen twig change the animals' plans forever, as two travelers decide to take a different route through the quiet forest.",
+            frog_reference_id=frog_ref["id"], scorpion_reference_id=scorpion_ref["id"],
+        ))
+    assert unsupported.value.status_code == 422
+    assert Path(api.db.get_project_reference(project["id"], frog_ref["id"])["path"]).resolve() == frog.resolve()
+
+
+def test_approved_film_batch_is_sequential_pausable_cancellable_retryable_and_assembles_only_verified_outputs(monkeypatch):
+    import asyncio
+    from uuid import uuid4
+    root = _ROOT / f"batch-inputs-{uuid4().hex[:8]}"
+    root.mkdir()
+    frog, scorpion = root / "frog.png", root / "scorpion.png"
+    frog.write_bytes(b"\x89PNG\r\n\x1a\nfrog fixture")
+    scorpion.write_bytes(b"\x89PNG\r\n\x1a\nscorpion fixture")
+    project = api.create_project(api.ProjectCreateRequest(
+        name=f"Film batch {uuid4().hex[:6]}", workspace_path=str(_ROOT / f"batch-project-{uuid4().hex[:8]}"),
+        aspect_ratio="9:16", frame_rate=24, production_type="handmade cinematic claymation",
+    ))
+    frog_ref = api.add_existing_project_reference(project["id"], api.ProjectReferenceCreate(path=str(frog), name="Original frog", category="character"))
+    scorpion_ref = api.add_existing_project_reference(project["id"], api.ProjectReferenceCreate(path=str(scorpion), name="Original scorpion", category="character"))
+    source_story = ("A frog searches the river for a crossing. A scorpion requests a ride. The frog fears being stung. "
+                    "The scorpion reasons they would both die if he stung the frog, so the frog agrees. They cross the river together. "
+                    "Halfway across, the scorpion stings the frog. The frog asks why. The scorpion says it is in his nature. Both face a tragic end.")
+    plan = api.build_film_plan(project["id"], api.BuildFilmPlanRequest(
+        story_text=source_story, frog_reference_id=frog_ref["id"], scorpion_reference_id=scorpion_ref["id"], preset="Short"))
+    api.approve_film_plan(plan["id"], api.ApproveFilmPlanRequest(revision=plan["revision"], style_bible_revision=plan["style_bible_revision"]))
+    monkeypatch.setattr(api, "detect_integrations", lambda _: {"ltx": {"ready": True}, "remotion": {"ready": True}})
+    batch = api.generate_film(plan["id"], api.GenerateFilmRequest(revision=plan["revision"], style_bible_revision=plan["style_bible_revision"]))
+    assert batch["status"] == "running" and batch["queued_shots"] == 12 and batch["progress"] == 0
+    initial_job_ids = [item["job"]["id"] for item in batch["shots"]]
+    assert len(set(initial_job_ids)) == 12
+    assert all(api.db.get_job(job_id)["payload"]["film_batch_id"] == batch["id"] for job_id in initial_job_ids)
+
+    paused = api.pause_film_batch(batch["id"])
+    assert paused["status"] == "paused"
+    next_job = api.db.next_queued_job()
+    assert not next_job or next_job["id"] not in set(initial_job_ids)
+    resumed = api.resume_film_batch(batch["id"])
+    assert resumed["status"] == "running"
+
+    # Complete the first shot with a test-only file and ffprobe metadata; no adapter runs.
+    first_job = api.db.get_job(initial_job_ids[0])
+    assert api.db.claim_job(first_job["id"])
+    output_dir = api.settings.expanded(api.settings.output_root) / project["id"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    first_output = output_dir / f"{first_job['id']}.test-fixture.mp4"
+    first_output.write_bytes(b"test-only verified fixture")
+    assert api.db.complete_job(first_job["id"], progress=100, result_path=str(first_output), exit_code=0,
+                               verification_metadata={"verified_output": {"width": 448, "height": 768, "fps": 24, "frames": 49}})
+
+    cancelled = asyncio.run(api.cancel_film_batch(batch["id"]))
+    assert cancelled["status"] == "cancelled"
+    assert api.db.get_job(first_job["id"])["status"] == "completed"
+    assert sum(api.db.get_job(job_id)["status"] == "cancelled" for job_id in initial_job_ids) == 11
+    cancelled_shot_ids = [item["shot_id"] for item in cancelled["shots"] if item["status"] == "cancelled"]
+    retried = api.retry_film_batch(batch["id"], api.RetryFilmRequest(shot_ids=cancelled_shot_ids))
+    assert retried["status"] == "running" and retried["queued_shots"] == 11
+    assert next(item for item in retried["shots"] if item["shot_id"] == batch["shots"][0]["shot_id"])["status"] == "completed"
+    retry_job_ids = [item["job"]["id"] for item in retried["shots"] if item["status"] == "queued"]
+    assert len(retry_job_ids) == 11 and not (set(retry_job_ids) & set(initial_job_ids))
+
+    # Mark remaining queue items as verified test fixtures, then exercise the real manifest builder.
+    final_job = None
+    for job_id in retry_job_ids:
+        job = api.db.get_job(job_id)
+        assert api.db.claim_job(job_id)
+        output = output_dir / f"{job_id}.test-fixture.mp4"
+        output.write_bytes(b"test-only verified fixture")
+        assert api.db.complete_job(job_id, progress=100, result_path=str(output), exit_code=0,
+                                   verification_metadata={"verified_output": {"width": 448, "height": 768, "fps": 24, "frames": 49}})
+        final_job = api.db.get_job(job_id)
+    api.worker._assemble_completed_film(final_job)
+    complete = api.get_film_batch(batch["id"])
+    assert complete["status"] == "completed" and complete["completed_shots"] == 12 and complete["progress"] == 100
+    storyboard = api.get_storyboard(plan["id"])
+    assert storyboard["manifest"] is not None
+    assert storyboard["manifest"]["duration_in_frames"] == 548
+    assert len(storyboard["manifest"]["shots"]) == 12
+    assert len(api.db.list_jobs(project_id=project["id"])) == 23
+    assert api.db.list_jobs(project_id=project["id"])[0]["kind"] == "generation"
+    assert first_output.read_bytes() == b"test-only verified fixture"
+    repeated = api.generate_film(plan["id"], api.GenerateFilmRequest(
+        revision=plan["revision"], style_bible_revision=plan["style_bible_revision"]))
+    assert repeated["status"] == "completed" and repeated["queued_shots"] == 0
+    assert len(api.db.list_jobs(project_id=project["id"])) == 23
+    assert all(item["status"] == "completed" and item["job"] for item in repeated["shots"])
+
+
 def test_project_reference_validation_scoping_and_unlink_preserve_source():
     from uuid import uuid4
     project_root = _ROOT / f"refs-production-{uuid4().hex[:8]}"

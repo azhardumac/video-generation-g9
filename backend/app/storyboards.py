@@ -19,6 +19,13 @@ class ShotInput(BaseModel):
     framing: str = Field(default="", max_length=120)
     prompt_reviewed: bool = False
     reviewed_style_revision: int = Field(default=0, ge=0)
+    visual_description: str = Field(default="", max_length=4000)
+    characters: list[str] = Field(default_factory=list, max_length=8)
+    reference_ids: list[str] = Field(default_factory=list, max_length=8)
+    estimated_seconds: float = Field(default=0, ge=0, le=3600)
+    dialogue: str = Field(default="", max_length=1000)
+    transition_after: str = Field(default="dissolve", max_length=32)
+    generation_payload: dict = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_dimensions(self):
@@ -76,6 +83,7 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
             "title": shot["title"], "src": relative,
             "frames": frames, "fps": fps, "caption": shot.get("caption", ""),
             "prompt": shot["prompt"], "job_id": job.get("id"),
+            "transition_after": shot.get("transition_after", "dissolve"),
             "settings_snapshot": job.get("settings_snapshot") or {
                 "prompt": job.get("payload", {}).get("prompt", ""),
                 "reference_image": job.get("payload", {}).get("reference_image") or None,
@@ -91,13 +99,19 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
     cursor = 0
     previous_frames = 0
     for index, clip in enumerate(clips):
-        overlap = min(transition_frames, previous_frames // 4, clip["frames"] // 4) if index else 0
+        previous_transition = clips[index - 1].get("transition_after", "dissolve") if index else "cut"
+        overlap = min(transition_frames, previous_frames // 4, clip["frames"] // 4) if index and previous_transition not in ("cut", "none") else 0
         clip["transition_in_frames"] = overlap
         clip["start_frame"] = cursor - overlap
         cursor = clip["start_frame"] + clip["frames"]
         previous_frames = clip["frames"]
     for index, clip in enumerate(clips):
-        clip["transition_out_frames"] = clips[index + 1]["transition_in_frames"] if index + 1 < len(clips) else 0
+        if index + 1 < len(clips):
+            clip["transition_out_frames"] = clips[index + 1]["transition_in_frames"]
+        elif clip.get("transition_after") == "fade":
+            clip["transition_out_frames"] = min(transition_frames, clip["frames"] // 4)
+        else:
+            clip["transition_out_frames"] = 0
     width, height, fps = canvas
     return {
         "schema_version": 1,

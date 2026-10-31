@@ -20,6 +20,7 @@ from .adapters import verify_video
 from .config import get_settings
 from .db import Database
 from .integrations import detect_integrations
+from .film_planner import UnsupportedStory, make_approved_fable_plan, validate_approved_fable
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, GenerationSettings, Preset
 from .projects import IMAGE_TYPES, VIDEO_TYPES, scan_project
@@ -111,6 +112,29 @@ class CreateStoryboardRequest(BaseModel):
     story_text: str = Field(default="", max_length=20000)
 
 
+class BuildFilmPlanRequest(BaseModel):
+    story_text: str = Field(min_length=80, max_length=20000)
+    title: str = Field(default="The Frog and the Scorpion — River Crossing", min_length=1, max_length=160)
+    frog_reference_id: str = Field(min_length=1, max_length=160)
+    scorpion_reference_id: str = Field(min_length=1, max_length=160)
+    target_format: AspectRatio = "9:16"
+    preset: str = "Short"
+    seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
+
+
+class ApproveFilmPlanRequest(BaseModel):
+    revision: int = Field(ge=1)
+    style_bible_revision: int = Field(ge=0)
+
+
+class GenerateFilmRequest(ApproveFilmPlanRequest):
+    pass
+
+
+class RetryFilmRequest(BaseModel):
+    shot_ids: list[str] = Field(min_length=1, max_length=40)
+
+
 class StyleBibleRequest(BaseModel):
     material: str = Field(default="", max_length=2000)
     silhouettes: str = Field(default="", max_length=2000)
@@ -173,6 +197,16 @@ def _project_output(project: dict) -> Path:
     return settings.expanded(settings.output_root) / project["id"]
 
 
+def _batch_with_resource_warnings(batch: dict) -> dict:
+    root = settings.expanded(settings.output_root)
+    try:
+        metrics = resource_snapshot(str(root if root.exists() else settings.allowed_roots[0]))
+        batch["resource_warnings"] = resource_preflight.assess(metrics)
+    except Exception as exc:
+        batch["resource_warnings"] = [f"Resource safeguards could not be read: {exc}"]
+    return batch
+
+
 def _validate_project_reference(project: dict, raw_path: str | None) -> Path | None:
     if not raw_path:
         return None
@@ -199,6 +233,16 @@ def _style_context(style_bible: dict) -> str:
 
 def _default_dimensions(aspect_ratio: str | None) -> tuple[int, int]:
     return {"16:9": (768, 432), "1:1": (640, 640), "4:3": (640, 480), "3:2": (672, 448)}.get(aspect_ratio or "9:16", (448, 768))
+
+
+def _reference_by_id(project_id: str, reference_id: str, character: str) -> dict:
+    reference = next((item for item in db.project_references(project_id) if item["id"] == reference_id), None)
+    if not reference:
+        raise HTTPException(400, f"Select a linked {character} reference from this project")
+    if reference["category"] != "character":
+        raise HTTPException(400, f"The selected {character} reference must have the character category")
+    path = _validate_project_reference(_project(project_id), reference["path"])
+    return reference | {"path": str(path)}
 
 
 def _validate_image_path(raw: str) -> tuple[Path, str, int, str]:
@@ -574,6 +618,232 @@ def create_project_storyboard(project_id: str, request: CreateStoryboardRequest)
     return db.create_storyboard(project_id, title, [], request.story_text.strip())
 
 
+@app.post("/api/projects/{project_id}/film-plans", status_code=201)
+def build_film_plan(project_id: str, request: BuildFilmPlanRequest):
+    """Build a separate, persistent plan for the approved river-crossing fable."""
+    project = _project(project_id)
+    try:
+        story_text = validate_approved_fable(request.story_text)
+    except UnsupportedStory as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if request.frog_reference_id == request.scorpion_reference_id:
+        raise HTTPException(400, "Choose two distinct linked character references")
+    frog = _reference_by_id(project_id, request.frog_reference_id, "frog")
+    scorpion = _reference_by_id(project_id, request.scorpion_reference_id, "scorpion")
+    try:
+        frames, preset_fps = _preset_frames(request.preset)
+    except HTTPException:
+        raise
+    defaults = db.get_setting(_generation_settings_key(project_id)) or GenerationSettings().model_dump()
+    width, height = _default_dimensions(request.target_format)
+    fps = project.get("frame_rate") or preset_fps
+    style_bible = project.get("style_bible") or {}
+    style_bible_notice = ""
+    if re.search(r"do not use riverbank or water imagery", style_bible.get("negative_constraints", ""), re.IGNORECASE):
+        previous_revision = project.get("style_bible_revision", 0)
+        revised = dict(style_bible)
+        constraints = re.sub(r"do not use riverbank or water imagery[,;.]?\s*", "", revised.get("negative_constraints", ""), flags=re.IGNORECASE).strip()
+        constraints = re.sub(r"\s+", " ", constraints).strip(" ,;.")
+        required_note = "River and water imagery is required by this approved river-crossing story. Do not reuse riverbank-master.png, prior videos, benchmark media, or old storyboard content."
+        revised["negative_constraints"] = (constraints + " " if constraints else "") + required_note
+        project = db.update_project_style_bible(project_id, revised)
+        style_bible = project["style_bible"]
+        style_bible_notice = (f"Updated the conflicting no-water rule for this river-crossing film as style-bible revision "
+                              f"{project['style_bible_revision']}; the prior revision is retained in local style history.")
+    style_context = _style_context(style_bible)
+    output = defaults.get("output_location") or str(_project_output(project))
+    try:
+        output = str(safe_local_path(output, settings))
+        shots, metadata = make_approved_fable_plan(
+            frog=frog, scorpion=scorpion, style_context=style_context,
+            target_format=request.target_format, preset=request.preset, frames=frames,
+            width=width, height=height, fps=fps,
+            seed=request.seed if request.seed is not None else defaults.get("seed"),
+            output_location=output,
+            generation_profile={key: defaults.get(key) for key in (
+                "model", "distilled_two_stage", "low_ram")},
+        )
+        for shot in shots:
+            reference = shot["reference_image"]
+            config = GenerationSettings.model_validate(defaults | {
+                "model": defaults.get("model", "dgrauet/ltx-2.3-mlx-q8"),
+                "width": width, "height": height, "distilled_two_stage": defaults.get("distilled_two_stage", True),
+                "low_ram": defaults.get("low_ram", True), "audio": False,
+                "seed": shot["seed"], "prompt": shot["prompt"], "reference_image": reference,
+                "output_location": output, "preset": request.preset,
+            })
+            payload = _generation_payload(config, project_id, fps_override=fps)
+            payload.update(reference_conditioning="one-image", reference_id=shot["reference_ids"][0],
+                           shot_prompt=shot["prompt"], style_context=style_context,
+                           shot_settings={"width": width, "height": height, "fps": fps,
+                               "output_location": output, "framing": shot["framing"],
+                               "style_bible_revision": project.get("style_bible_revision", 0)})
+            shot["generation_payload"] = payload
+        metadata.update({"target_format": request.target_format, "preset": request.preset,
+                        "frames_per_shot": frames, "fps": fps, "width": width, "height": height,
+                        "expected_workload": f"{len(shots)} sequential LTX jobs · approximately {metadata['estimated_seconds']:.2f}s total source footage",
+                        "ltx_ready_at_plan_time": detect_integrations(settings)["ltx"]["ready"],
+                        "preflight_warnings": sorted({warning for shot in shots for warning in shot["generation_payload"].get("preflight_warnings", [])}),
+                        "approved_reference_ids": [frog["id"], scorpion["id"]],
+                        "style_bible_revision": project.get("style_bible_revision", 0),
+                        "style_bible_snapshot": style_bible,
+                        "style_bible_notice": style_bible_notice,
+                        "experimental_drift_warning": request.preset == "Experimental",
+                        "audio_available": False})
+        matching_benchmarks = [item for item in db.benchmarks()
+            if item["preset"] == request.preset and item["frames"] == frames and item["fps"] == fps
+            and item.get("elapsed_seconds") is not None]
+        if matching_benchmarks:
+            average_seconds = sum(float(item["elapsed_seconds"]) for item in matching_benchmarks) / len(matching_benchmarks)
+            metadata["benchmark_estimate"] = {"samples": len(matching_benchmarks),
+                "average_seconds_per_shot": round(average_seconds, 2),
+                "total_seconds": round(average_seconds * len(shots), 2),
+                "source": "matching completed local job history"}
+            metadata["expected_workload"] = (f"{len(shots)} sequential LTX jobs · approximately "
+                f"{average_seconds * len(shots) / 60:.1f} min from {len(matching_benchmarks)} matching local benchmark(s)")
+        else:
+            metadata["benchmark_estimate"] = None
+            metadata["expected_workload"] = f"{len(shots)} sequential LTX jobs · no matching local timing benchmark; run time unknown"
+        return db.create_film_plan(project_id, request.title.strip(), story_text, shots,
+                                   request.target_format, request.preset, metadata)
+    except HTTPException:
+        raise
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(400, f"Could not prepare generation-ready shots: {exc}") from exc
+
+
+@app.post("/api/storyboards/{storyboard_id}/film-plan/approve")
+def approve_film_plan(storyboard_id: str, request: ApproveFilmPlanRequest):
+    try:
+        return db.approve_film_plan(storyboard_id, request.revision, request.style_bible_revision)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/storyboards/{storyboard_id}/film-plan/generate", status_code=201)
+def generate_film(storyboard_id: str, request: GenerateFilmRequest):
+    story = db.get_storyboard(storyboard_id)
+    if not story or not story.get("film_plan"):
+        raise HTTPException(404, "Film plan not found")
+    if not story["film_plan"]["approved"] or story["revision"] != request.revision or story["style_bible_revision"] != request.style_bible_revision:
+        raise HTTPException(409, "Approve and review this exact saved plan and style-bible revision before generation")
+    if not detect_integrations(settings)["ltx"]["ready"]:
+        raise HTTPException(409, "LTX runner or cached Q8 model weights are unavailable; no weights will be downloaded")
+    project = _project(story["project_id"])
+    for shot in story["shots"]:
+        payload = shot.get("generation_payload") or {}
+        if payload.get("audio"):
+            raise HTTPException(409, f"Shot '{shot['title']}' requests audio, but no audio capability is configured")
+        if payload.get("prompt") != shot["prompt"]:
+            raise HTTPException(409, f"Shot '{shot['title']}' saved prompt differs from its generation payload; save the shot plan again")
+        if len(shot.get("reference_ids") or []) != 1:
+            raise HTTPException(409, f"Shot '{shot['title']}' must have exactly one linked character reference for LTX conditioning")
+        reference = _validate_project_reference(project, payload.get("reference_image"))
+        if reference is None:
+            raise HTTPException(409, f"Shot '{shot['title']}' is missing its selected character image")
+        matches = [item for item in db.project_references(project["id"]) if item["id"] == shot["reference_ids"][0]
+                   and Path(item["path"]).resolve() == reference.resolve()]
+        if not matches:
+            raise HTTPException(409, f"Shot '{shot['title']}' reference is no longer linked to this project")
+        try:
+            safe_local_path(payload.get("output_location", ""), settings)
+        except ValueError as exc:
+            raise HTTPException(400, f"Shot '{shot['title']}' output path is invalid: {exc}") from exc
+    try:
+        batch = db.create_film_batch(storyboard_id, request.revision, request.style_bible_revision)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    metrics_root = settings.expanded(settings.output_root)
+    current_metrics = resource_snapshot(str(metrics_root if metrics_root.exists() else settings.allowed_roots[0]))
+    batch["resource_warnings"] = resource_preflight.assess(current_metrics)
+    if batch["status"] == "completed":
+        try:
+            create_storyboard_manifest(storyboard_id)
+        except HTTPException as exc:
+            batch["composition_warning"] = str(exc.detail)
+    return batch
+
+
+@app.get("/api/storyboards/{storyboard_id}/film-plan/batches")
+def film_plan_batches(storyboard_id: str):
+    story = db.get_storyboard(storyboard_id)
+    if not story or not story.get("film_plan"):
+        raise HTTPException(404, "Film plan not found")
+    return [_batch_with_resource_warnings(batch) for batch in db.list_film_batches(storyboard_id)]
+
+
+@app.get("/api/film-batches/{batch_id}")
+def get_film_batch(batch_id: str):
+    batch = db.get_film_batch(batch_id)
+    if not batch:
+        raise HTTPException(404, "Film batch not found")
+    return _batch_with_resource_warnings(batch)
+
+
+@app.post("/api/film-batches/{batch_id}/pause")
+def pause_film_batch(batch_id: str):
+    try:
+        return _batch_with_resource_warnings(db.set_film_batch_status(batch_id, {"running"}, "paused"))
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/film-batches/{batch_id}/resume")
+def resume_film_batch(batch_id: str):
+    try:
+        return _batch_with_resource_warnings(db.set_film_batch_status(batch_id, {"paused"}, "running"))
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/film-batches/{batch_id}/cancel")
+async def cancel_film_batch(batch_id: str):
+    try:
+        batch, job_ids = db.cancel_film_batch(batch_id)
+        for job_id in job_ids:
+            worker.cancel_job(job_id)
+        return _batch_with_resource_warnings(batch)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/film-batches/{batch_id}/retry")
+def retry_film_batch(batch_id: str, request: RetryFilmRequest):
+    batch = db.get_film_batch(batch_id)
+    if not batch:
+        raise HTTPException(404, "Film batch not found")
+    if not detect_integrations(settings)["ltx"]["ready"]:
+        raise HTTPException(409, "LTX runner or cached Q8 model weights are unavailable; no weights will be downloaded")
+    story = db.get_storyboard(batch["storyboard_id"])
+    if not story:
+        raise HTTPException(404, "Film storyboard not found")
+    project = _project(story["project_id"])
+    for shot_id in request.shot_ids:
+        shot = next((item for item in story["shots"] if item["id"] == shot_id), None)
+        if not shot:
+            raise HTTPException(400, "Selected retry shot is not part of this storyboard")
+        payload = shot.get("generation_payload") or {}
+        if shot.get("reference_ids") != [payload.get("reference_id")]:
+            raise HTTPException(409, f"Shot '{shot['title']}' reference selection changed; review the shot and approve the plan again")
+        try:
+            _validate_project_reference(project, payload.get("reference_image"))
+            safe_local_path(payload.get("output_location", ""), settings)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(409, f"Shot '{shot['title']}' inputs need attention: {exc}") from exc
+    try:
+        return _batch_with_resource_warnings(db.retry_film_batch_shots(batch_id, request.shot_ids))
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @app.post("/api/storyboards/import", status_code=201)
 def import_storyboard(request: ImportStoryboardRequest):
     if request.project_id != "scorpion-frog":
@@ -635,6 +905,23 @@ def update_storyboard(storyboard_id: str, payload: StoryboardUpdate):
         shot_value["height"] = shot.height or default_height
         shot_value["fps"] = shot.fps or project.get("frame_rate") or preset_fps
         shot_value["output_location"] = str(safe_local_path(shot.output_location or str(_project_output(project)), settings))
+        linked_references = db.project_references(project["id"])
+        supplied_reference_ids = set(shot_value.get("reference_ids") or [])
+        if supplied_reference_ids:
+            selected = [item for item in linked_references if item["id"] in supplied_reference_ids]
+            if len(selected) != len(supplied_reference_ids) or (reference and str(reference) not in {str(Path(item["path"]).resolve()) for item in selected}):
+                raise HTTPException(400, "Shot references must be linked to this project and match its selected image")
+        elif reference:
+            shot_value["reference_ids"] = [item["id"] for item in linked_references if Path(item["path"]).resolve() == reference.resolve()]
+        generation_payload = shot_value.get("generation_payload") or {}
+        if generation_payload:
+            generation_payload = generation_payload | {"prompt": shot_value["prompt"], "shot_prompt": shot_value["prompt"],
+                                                        "reference_image": str(reference) if reference else None,
+                                                        "reference_id": (shot_value.get("reference_ids") or [None])[0],
+                                                        "seed": shot_value.get("seed"), "preset": shot_value["preset"],
+                                                        "width": shot_value["width"], "height": shot_value["height"],
+                                                        "fps": shot_value["fps"], "output_location": shot_value["output_location"]}
+            shot_value["generation_payload"] = generation_payload
         if shot_value["prompt_reviewed"] and shot_value["reviewed_style_revision"] != story.get("style_bible_revision", 0):
             raise HTTPException(409, "The style bible changed after this prompt was reviewed; review it again before saving")
         values.append(shot_value)
