@@ -17,6 +17,8 @@
 /* Responsive canvas and portrait output preview */
 html,body,#root{width:100%;min-width:0;min-height:100%;overflow-x:hidden}
 body{min-width:0}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,video:focus-visible{outline:2px solid var(--purple);outline-offset:2px}
+.nav-item{min-width:0}
 .app-shell{width:100%;min-width:0;overflow:hidden}
 .main-content{width:calc(100% - 248px);min-width:0;overflow:hidden}
 .page-scroll{width:100%;min-width:0;overflow-x:hidden}
@@ -66,6 +68,14 @@ body{min-width:0}
   .metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}
   .video-result-footer{align-items:flex-start;flex-direction:column}
   .video-result-footer code{max-width:100%}
+  .storyboard-page{padding:12px}
+  .storyboard-title-row,.timeline-title{flex-direction:column;align-items:stretch}
+  .shot-plan-head{flex-wrap:wrap}
+  .shot-plan-fields{grid-template-columns:minmax(0,1fr)}
+  .storyboard-bottom-actions>.button{flex:1 1 auto}
+  .project-library{padding:14px}
+  .asset-grid{grid-template-columns:minmax(0,1fr)}
+  .integration-grid{grid-template-columns:minmax(0,1fr)}
 }
 
 /* Phase 3 persistent storyboard and Remotion assembly */
