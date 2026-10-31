@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
-import { Aperture, ArrowDownRight, ArrowUpRight, Bell, BookOpen, Check, ChevronDown, CircleHelp, Clapperboard, Command, Film, FolderOpen, Gauge, HardDrive, History, Image, LayoutDashboard, ListVideo, LoaderCircle, Plus, Search, Settings, SlidersHorizontal, Sparkles, WandSparkles, X, AlertTriangle } from 'lucide-react'
+import { Aperture, ArrowUpRight, BookOpen, Check, ChevronDown, Clapperboard, Command, Film, FolderOpen, Gauge, HardDrive, History, Image, LayoutDashboard, ListVideo, LoaderCircle, Plus, Settings, SlidersHorizontal, Sparkles, WandSparkles, X, AlertTriangle } from 'lucide-react'
 import StoryboardPage from './StoryboardPage'
+import ProjectsPage, { type Project } from './ProjectsPage'
+import ProjectReferencesPage from './ProjectReferencesPage'
 
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
 type Asset = { id: string; category: string; relative_path: string; path: string; name: string; size_bytes: number; mime_type: string }
@@ -8,8 +10,6 @@ type JobEvent = { id: number; time: string; level: string; message: string }
 type Job = { id: string; kind?:string; status: string; progress: number; payload: { prompt?: string; preset?: string; frames?:number; fps?:number; seed?:number|null; reference_image?:string|null; composition_id?:string; job_label?:string; preflight_warnings?:string[] }; created_at: string; result_path?: string | null; error?:string|null; exit_code?:number|null; elapsed_seconds?:number|null; verification_metadata?:{verified_output?:{width:number;height:number;fps:number;frames:number}}|null; partial_output_path?:string|null; events?: JobEvent[] }
 type Integration = { ltx: { root: string; installed: boolean; runner: string; runner_available: boolean; model: string; hf_home: string; cache_available: boolean; weights_cached: boolean; ready: boolean }; remotion: { root: string; installed: boolean; cli: string; cli_available: boolean; version: string | null; ready: boolean }; story_project: { root: string; available: boolean }; ffprobe: { available: boolean; path: string | null } }
 type Resources = { disk_free_bytes: number; memory: { total_bytes: number | null; available_bytes: number | null }; swap: { total_bytes: number | null; used_bytes: number | null }; memory_pressure: { free_percent: number; level: string } | null; warnings:string[] }
-const CURRENT_PROJECT_ID = 'scorpion-frog'
-const SCORPION_FROG_PROMPT = 'On a quiet moonlit riverbank, the frog and scorpion pause together at the water’s edge; silver-blue moonlight ripples across the river, reeds and ferns sway in a gentle night breeze, a slow cinematic camera push-in, soft blue mist, natural storybook realism, calm and contemplative mood.'
 const nav = [
   { group: 'STUDIO', items: [['Overview', LayoutDashboard], ['Projects', FolderOpen], ['Storyboard', ListVideo], ['References', Image]] },
   { group: 'PRODUCTION', items: [['Generate video', WandSparkles], ['Job queue', Gauge], ['History & logs', History], ['Remotion render', Clapperboard]] },
@@ -26,30 +26,36 @@ export default function App() {
   const [assets, setAssets] = useState<Asset[]>([])
   const [integrations, setIntegrations] = useState<Integration | null>(null)
   const [resources, setResources] = useState<Resources | null>(null)
-  const [projectImported, setProjectImported] = useState(false)
+  const [projects, setProjects] = useState<Project[]>([])
+  const [activeProject, setActiveProject] = useState<Project | null>(null)
   const [preset, setPreset] = useState('Standard')
-  const [prompt, setPrompt] = useState(SCORPION_FROG_PROMPT)
+  const [prompt, setPrompt] = useState('')
   const [referenceImage, setReferenceImage] = useState('')
   const [seed, setSeed] = useState('')
-  const [outputPath, setOutputPath] = useState('~/AI-Video-Studio/outputs')
+  const [outputPath, setOutputPath] = useState('')
   const [notice, setNotice] = useState('')
   const [connected, setConnected] = useState(false)
   const [loading, setLoading] = useState(false)
 
   const refresh = async () => {
     try {
-      const [p, j, h, i, projectResponse] = await Promise.all([fetch('/api/presets'), fetch('/api/jobs'), fetch('/api/health'), fetch('/api/integrations'), fetch('/api/projects')])
+      const [p, h, i, projectResponse, activeResponse] = await Promise.all([fetch('/api/presets'), fetch('/api/health'), fetch('/api/integrations'), fetch('/api/projects'), fetch('/api/projects/active')])
       if (p.ok) setPresets(await p.json())
-      if (j.ok) setJobs(await j.json())
       if (i.ok) setIntegrations(await i.json())
       if (projectResponse.ok) {
-        const projects: { id: string }[] = await projectResponse.json()
-        const imported = projects.some(project => project.id === 'scorpion-frog')
-        setProjectImported(imported)
-        if (imported) {
-          const response = await fetch('/api/projects/scorpion-frog/assets')
-          if (response.ok) setAssets(await response.json())
-        }
+        const projectList: Project[] = await projectResponse.json()
+        setProjects(projectList)
+        const activeData = activeResponse.ok ? await activeResponse.json() : {project:null}
+        const selected = activeData.project as Project | null
+        setActiveProject(selected)
+        if (selected) {
+          const [assetResponse, referenceResponse, jobResponse] = await Promise.all([fetch(`/api/projects/${selected.id}/assets`), fetch(`/api/projects/${selected.id}/references`), fetch(`/api/jobs?project_id=${encodeURIComponent(selected.id)}`)])
+          if (jobResponse.ok) setJobs(await jobResponse.json())
+          else setJobs([])
+          const indexedAssets:Asset[]=assetResponse.ok?await assetResponse.json():[]
+          const references:Asset[]=referenceResponse.ok?(await referenceResponse.json()).map((ref:{id:string;path:string;name:string;category:string;size_bytes:number;mime_type:string})=>({id:`reference-${ref.id}`,category:`reference_${ref.category}`,relative_path:ref.name,path:ref.path,name:ref.name,size_bytes:ref.size_bytes,mime_type:ref.mime_type})):[]
+          setAssets([...references,...indexedAssets])
+        } else { setAssets([]); setJobs([]) }
       }
       setConnected(h.ok)
     } catch { setConnected(false) }
@@ -61,18 +67,20 @@ export default function App() {
     return()=>{clearInterval(timer);clearInterval(resourceTimer)}
   }, [])
   useEffect(() => {
-    fetch(`/api/settings?project_id=${CURRENT_PROJECT_ID}`).then(r=>r.ok?r.json():null).then(data=>{
-      if (typeof data?.prompt === 'string' && data.prompt.trim()) setPrompt(data.prompt)
+    setPrompt(''); setReferenceImage(''); setSeed('')
+    if(activeProject) fetch(`/api/settings?project_id=${encodeURIComponent(activeProject.id)}`).then(r=>r.ok?r.json():null).then(data=>{
+      if (data) { setPrompt(typeof data.prompt==='string'?data.prompt:''); setReferenceImage(data.reference_image??''); setSeed(data.seed==null?'':String(data.seed)) }
     }).catch(()=>{})
-  }, [])
+  }, [activeProject?.id])
   const running = jobs.filter(j => j.status === 'running').length
 
   async function createJob() {
+    if (!activeProject) { setNotice('Select a project before queueing a generation'); return }
     setLoading(true); setNotice('')
     try {
-      const saved = await fetch(`/api/settings?project_id=${CURRENT_PROJECT_ID}`)
+      const saved = await fetch(`/api/settings?project_id=${encodeURIComponent(activeProject.id)}`)
       const defaults = saved.ok ? await saved.json() : {}
-      const response = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { model: 'dgrauet/ltx-2.3-mlx-q8', width: 448, height: 768, distilled_two_stage: true, low_ram: true, audio: false, ...defaults, prompt, preset, reference_image: referenceImage || defaults.reference_image || null, seed: seed ? Number(seed) : defaults.seed ?? null, output_location: outputPath || defaults.output_location || null } }) })
+      const response = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project_id:activeProject.id, settings: { model: 'dgrauet/ltx-2.3-mlx-q8', width: 448, height: 768, distilled_two_stage: true, low_ram: true, audio: false, ...defaults, prompt, preset, reference_image: referenceImage || defaults.reference_image || null, seed: seed ? Number(seed) : defaults.seed ?? null, output_location: outputPath || defaults.output_location || null } }) })
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail ?? 'Could not queue generation')
       setNotice('Generation added to the local queue'); setActive('Job queue'); await refresh()
@@ -80,14 +88,14 @@ export default function App() {
     finally { setLoading(false) }
   }
 
-  async function importStoryProject() {
-    setNotice('Importing local project references and renders…')
-    try {
-      const response = await fetch('/api/projects/import', { method: 'POST' })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail ?? 'Could not import the project')
-      setAssets(data.assets); setProjectImported(true); setNotice(`Imported ${data.asset_count} local images and videos`)
-    } catch (error) { setNotice(error instanceof Error ? error.message : 'Project import failed') }
+  async function refreshProjects() {
+    const response=await fetch('/api/projects');if(response.ok)setProjects(await response.json())
+    await refresh()
+  }
+  async function selectProject(projectId:string) {
+    const response=await fetch('/api/projects/active',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:projectId||null})})
+    const data=await response.json();if(!response.ok)throw new Error(data.detail??'Could not switch project')
+    setActiveProject(data.project);setActive('Overview');await refresh()
   }
 
   function selectPreset(name: string, warning?: boolean) {
@@ -98,37 +106,37 @@ export default function App() {
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><div className="brand-mark"><Aperture size={20}/></div><div><strong>FRAMEWORK</strong><span>AI VIDEO STUDIO</span></div></div>
-      <button className="project-switch"><span className="project-icon">SF</span><span className="project-copy"><b>Scorpion Frog</b><small>Current project</small></span><ChevronDown size={15}/></button>
+      <label className="project-switch-label" aria-label="Active project"><span className="project-icon">{activeProject?.name.slice(0,2).toUpperCase()??'—'}</span><select className="project-switch" value={activeProject?.id??''} onChange={e=>void selectProject(e.target.value).catch(error=>setNotice(error.message))}><option value="">No active project</option>{projects.map(project=><option key={project.id} value={project.id}>{project.name}</option>)}</select><ChevronDown size={15}/></label>
       <div className="nav-wrap">{nav.map(section => <div className="nav-section" key={section.group}><div className="nav-label">{section.group}</div>{section.items.map(([label, Icon]) => <button key={label} onClick={() => setActive(label)} className={`nav-item ${active === label ? 'active' : ''}`}><Icon size={17}/><span>{label}</span>{label === 'Job queue' && jobs.some(j => j.status === 'queued' || j.status === 'running') && <i className="nav-dot"/>}</button>)}</div>)}</div>
-      <div className="sidebar-bottom"><div className="local-card"><div className="local-top"><span className={`status-dot ${connected ? 'online' : ''}`}/><b>{connected ? 'Local engine ready' : 'Engine offline'}</b><span className="local-badge">LOCAL</span></div><p>{connected ? 'Your studio is running on this machine.' : 'Start the FastAPI service to connect.'}</p><div className="local-meta"><span><HardDrive size={13}/> SQLite</span><span><Aperture size={13}/> MLX</span></div></div><button className="help-link"><CircleHelp size={16}/> Help & documentation</button><div className="profile"><div className="avatar">A</div><div><b>Azhar</b><small>Personal workspace</small></div><button aria-label="More options">•••</button></div></div>
+      <div className="sidebar-bottom"><div className="local-card"><div className="local-top"><span className={`status-dot ${connected ? 'online' : ''}`}/><b>{connected ? 'Local API connected' : 'API offline'}</b><span className="local-badge">LOCAL</span></div><p>{connected ? 'Project data is stored in the local SQLite database.' : 'Start the FastAPI service to connect.'}</p><div className="local-meta"><span><HardDrive size={13}/> SQLite</span><span><Aperture size={13}/> MLX</span></div></div></div>
     </aside>
     <main className="main-content">
-      <header className="topbar"><div className="breadcrumbs"><span>Scorpion Frog</span><span className="slash">/</span><b>{active}</b></div><div className="top-actions"><div className="local-indicator"><span className={`status-dot ${connected ? 'online' : ''}`}/>{connected ? 'Local mode' : 'API disconnected'}</div><button className="icon-button" aria-label="Search"><Search size={17}/></button><button className="icon-button" aria-label="Notifications"><Bell size={17}/><i/></button><span className="top-divider"/><button className="avatar small">A</button></div></header>
+      <header className="topbar"><div className="breadcrumbs"><span>{activeProject?.name??'No project selected'}</span><span className="slash">/</span><b>{active}</b></div><div className="top-actions"><div className="local-indicator"><span className={`status-dot ${connected ? 'online' : ''}`}/>{connected ? 'Local mode' : 'API disconnected'}</div><span className="top-divider"/><span>{activeProject?'Project data stays local':'Select a project to begin'}</span></div></header>
       <div className="page-scroll"><div className="page-container">
-        <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> {dateLabel}</div><h1>{active === 'Overview' ? 'Good evening, Azhar' : active}</h1><p className="subtitle">{active === 'Overview' ? 'Your next frame is waiting to be made.' : 'A local-first production workspace for your next frame.'}</p></div><button className="button primary" onClick={() => setActive('Generate video')}><Plus size={16}/> New generation</button></div>
+        <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> {dateLabel}</div><h1>{active === 'Overview' ? activeProject?.name??'Local video studio' : active}</h1><p className="subtitle">{active === 'Overview' ? activeProject?.description||'Create or select a project to start planning.' : 'A local-first production workspace.'}</p></div>{activeProject&&<button className="button primary" onClick={() => setActive('Generate video')}><Plus size={16}/> New generation</button>}</div>
         {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={14}/></button></div>}
-        {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onMessage={setNotice} integrations={integrations} resources={resources} projectImported={projectImported} onImport={importStoryProject}/>}
+        {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onMessage={setNotice} integrations={integrations} resources={resources} projectId={activeProject?.id??null}/>}
         {active === 'Job queue' && <JobsPage title="Local job queue" jobs={jobs.filter(j=>j.status==='queued'||j.status==='running'||j.status==='failed')} onChanged={refresh} onMessage={setNotice}/>}
         {active === 'History & logs' && <JobsPage title="Generation history" jobs={jobs.filter(j=>j.status==='completed'||j.status==='failed'||j.status==='cancelled')} onChanged={refresh} onMessage={setNotice}/>}
-        {active === 'Projects' && <ProjectLibraryPage assets={assets} imported={projectImported} onImport={importStoryProject} onUseReference={path=>{setReferenceImage(path);setActive('Generate video')}}/>}
-        {active === 'References' && <ProjectLibraryPage assets={assets.filter(asset=>asset.mime_type.startsWith('image/'))} imported={projectImported} onImport={importStoryProject} onUseReference={path=>{setReferenceImage(path);setActive('Generate video')}} referencesOnly/>}
-        {active === 'Storyboard' && <StoryboardPage assets={assets} jobs={jobs} imported={projectImported} onImportProject={importStoryProject} onMessage={setNotice}/>}
+        {active === 'Projects' && <ProjectsPage projects={projects} activeId={activeProject?.id??null} onChanged={refreshProjects} onSelect={selectProject} onMessage={setNotice}/>}
+        {active === 'References' && <ProjectReferencesPage projectId={activeProject?.id??null} onMessage={setNotice} onUse={path=>{setReferenceImage(path);setActive('Generate video')}}/>}
+        {active === 'Storyboard' && <StoryboardPage projectId={activeProject?.id??null} assets={assets} jobs={jobs} onMessage={setNotice}/>}
         {active === 'Remotion render' && <WorkspacePage active={active} onGenerate={()=>setActive('Generate video')} onMessage={setNotice} onJobsChanged={refresh}/>}
         <div hidden={active !== 'Overview' && active !== 'Generate video'}>
-        <section className="stats-grid"><Stat icon={<Film size={16}/>} label="TOTAL GENERATIONS" value={String(jobs.length).padStart(2,'0')} delta="All time"/><Stat icon={<LoaderCircle size={16}/>} label="IN THE QUEUE" value={String(jobs.filter(j=>j.status==='queued'||j.status==='running').length).padStart(2,'0')} delta={running ? `${running} running now` : 'Ready when you are'} accent/><Stat icon={<Check size={16}/>} label="COMPLETED" value={String(jobs.filter(j=>j.status==='completed').length).padStart(2,'0')} delta="This workspace"/><Stat icon={<HardDrive size={16}/>} label="OUTPUT STORAGE" value="Local" delta="On this machine"/></section>
+        <section className="stats-grid"><Stat icon={<Film size={16}/>} label="TOTAL GENERATIONS" value={String(jobs.filter(j=>j.kind==='generation').length).padStart(2,'0')} delta="Selected project"/><Stat icon={<LoaderCircle size={16}/>} label="IN THE QUEUE" value={String(jobs.filter(j=>j.status==='queued'||j.status==='running').length).padStart(2,'0')} delta={running ? `${running} running now` : 'No active jobs'} accent/><Stat icon={<Check size={16}/>} label="COMPLETED GENERATIONS" value={String(jobs.filter(j=>j.kind==='generation'&&j.status==='completed').length).padStart(2,'0')} delta="Selected project"/><Stat icon={<HardDrive size={16}/>} label="OUTPUT DESTINATION" value={outputPath||'Configured default'} delta="Local path"/></section>
         <div className="content-grid">
           <section className="panel generation-panel"><div className="panel-heading"><div><div className="section-kicker">CREATE SOMETHING</div><h2>Quick generation</h2><p>Turn a thought into a moving image.</p></div><div className="sparkle"><Sparkles size={18}/></div></div>
-            <label className="field-label" htmlFor="prompt">YOUR PROMPT <span>Be descriptive</span></label><div className="prompt-wrap"><textarea id="prompt" maxLength={4000} value={prompt} onChange={e=>setPrompt(e.target.value)} placeholder="Describe the scene you want to create…"/><div className="prompt-footer"><span><Command size={12}/> Use <kbd>⌘</kbd><kbd>↵</kbd> to generate</span><span>{prompt.length} / 4,000</span></div></div>
-            <div className="generation-controls"><div className="control-block"><label className="field-label">DURATION PRESET</label><div className="preset-row">{presets.filter(p=>p.name!=='Experimental').map(p=><button key={p.name} className={`preset-chip ${preset===p.name?'chosen':''}`} onClick={()=>selectPreset(p.name)}><span>{p.name}</span><small>{p.frames}f · {p.duration.toFixed(2)}s</small></button>)}</div></div><div className="control-block model-block"><label className="field-label">MODEL <span>MLX · Q8</span></label><button className="model-select"><span className="model-glyph"><Aperture size={16}/></span><span><b>LTX-2.3</b><small>dgrauet / q8</small></span><ChevronDown size={15}/></button></div></div>
-            <div className="generation-fields"><label className="setting-field">Reference image<select value={referenceImage} onChange={e=>setReferenceImage(e.target.value)}><option value="">No reference · text to video</option>{assets.filter(asset=>asset.mime_type.startsWith('image/')).map(asset=><option key={asset.id} value={asset.path}>{asset.relative_path}</option>)}</select></label><label className="setting-field">Seed<input type="number" min="0" placeholder="Random seed" value={seed} onChange={e=>setSeed(e.target.value)}/></label><label className="setting-field">Output path<input value={outputPath} onChange={e=>setOutputPath(e.target.value)} placeholder="~/AI-Video-Studio/outputs"/></label></div>
+            <label className="field-label" htmlFor="prompt">YOUR PROMPT <span>Be descriptive</span></label><div className="prompt-wrap"><textarea id="prompt" maxLength={4000} value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();void createJob()}}} placeholder="Write a prompt for this project…"/><div className="prompt-footer"><span><Command size={12}/> Use <kbd>⌘</kbd><kbd>↵</kbd> to generate</span><span>{prompt.length} / 4,000</span></div></div>
+            <div className="generation-controls"><div className="control-block"><label className="field-label">DURATION PRESET</label><div className="preset-row">{presets.filter(p=>p.name!=='Experimental').map(p=><button key={p.name} className={`preset-chip ${preset===p.name?'chosen':''}`} onClick={()=>selectPreset(p.name)}><span>{p.name}</span><small>{p.frames}f · {p.duration.toFixed(2)}s</small></button>)}</div></div><div className="control-block model-block"><label className="field-label">VALIDATED MODEL PROFILE <span>LOCAL · MLX · Q8</span></label><div className="model-select"><span className="model-glyph"><Aperture size={16}/></span><span><b>{integrations?.ltx.model||'LTX-2.3 Q8'}</b><small>{integrations?.ltx.ready?'Detected local profile':'Local profile not detected'}</small></span></div></div></div>
+            <div className="generation-fields"><label className="setting-field">Reference image<select value={referenceImage} onChange={e=>setReferenceImage(e.target.value)}><option value="">No reference · text to video</option>{assets.filter(asset=>asset.mime_type.startsWith('image/')).map(asset=><option key={asset.id} value={asset.path}>{asset.relative_path}</option>)}</select></label><label className="setting-field">Seed<input type="number" min="0" placeholder="Random seed" value={seed} onChange={e=>setSeed(e.target.value)}/></label><label className="setting-field">Output path<input value={outputPath} onChange={e=>setOutputPath(e.target.value)} placeholder="Leave blank for configured output root"/></label></div>
             {!integrations?.ltx.ready&&<div className="model-caution"><AlertTriangle size={13}/><span>Q8 model files are not detected. Generation stays disabled; no model download will be attempted.</span></div>}
             {Boolean(resources?.warnings?.length)&&<div className="model-caution preflight-warning"><AlertTriangle size={13}/><span>Preflight safeguard: {resources?.warnings.join(' ')}</span></div>}
-            <div className="generation-bottom"><span className="settings-summary"><SlidersHorizontal size={14}/> 448 × 768 <i/> 24 fps <i/> Distilled two-stage <i/> No audio</span><button className="button generate-button" title={!integrations?.ltx.ready?'LTX runner and cached model weights are required':''} disabled={loading || !connected || !prompt.trim() || !integrations?.ltx.ready} onClick={createJob}>{loading ? <LoaderCircle className="spin" size={16}/> : <WandSparkles size={16}/>} Generate video <ArrowUpRight size={15}/></button></div>
+            <div className="generation-bottom"><span className="settings-summary"><SlidersHorizontal size={14}/> Validated profile: 448 × 768 <i/> 24 fps <i/> Distilled two-stage <i/> No audio</span><button className="button generate-button" title={!activeProject?'Select a project first':!integrations?.ltx.ready?'LTX runner and cached model weights are required':''} disabled={loading || !connected || !activeProject || !prompt.trim() || !integrations?.ltx.ready} onClick={createJob}>{loading ? <LoaderCircle className="spin" size={16}/> : <WandSparkles size={16}/>} Generate video <ArrowUpRight size={15}/></button></div>
           </section>
           <section className="panel presets-panel"><div className="panel-heading compact"><div><div className="section-kicker">TUNED TO YOUR MACHINE</div><h2>Generation presets</h2></div><button className="text-button" onClick={()=>setActive('Settings')}>All presets <ArrowUpRight size={13}/></button></div><div className="preset-list">{presets.map(p=><button key={p.name} onClick={()=>selectPreset(p.name,p.visual_drift_warning)} className={`preset-item ${preset===p.name?'selected':''}`}><div className="preset-mark"><span style={{height: `${Math.min(30,10+p.frames/8)}px`}}/></div><div className="preset-info"><b>{p.name}{p.name==='Standard'&&<span className="default-label">DEFAULT</span>}</b><small>{p.frames} frames <i/> {p.fps} fps <i/> {p.duration.toFixed(2)}s</small></div><span className={`preset-status ${p.visual_drift_warning?'warning':''}`}>{p.status}</span></button>)}</div><div className="benchmark-note"><Gauge size={14}/><span>Experimental 193f requires confirmation; it may show visual drift.</span></div></section>
         </div>
         <div className="lower-grid"><section className="panel queue-panel"><div className="panel-heading compact"><div><div className="section-kicker">UP NEXT</div><h2>Recent activity</h2></div><button className="text-button" onClick={()=>setActive('Job queue')}>View queue <ArrowUpRight size={13}/></button></div>{jobs.length ? <div className="job-list">{jobs.slice(0,4).map(j=><div className="job-row" key={j.id}><div className={`job-icon ${j.status}`}><Film size={16}/></div><div className="job-copy"><b>{jobTitle(j)}</b><small>{jobTypeLabel(j)} · {new Date(j.created_at).toLocaleString()}</small></div><span className={`job-status ${j.status}`}>{j.status}</span>{j.status==='running'&&<div className="mini-progress"><span style={{width:`${j.progress}%`}}/></div>}</div>)}</div> : <div className="empty-state"><div className="empty-icon"><Film size={20}/></div><b>No jobs yet</b><span>Your creations and renders will show up here.</span><button className="text-button" onClick={()=>setActive('Generate video')}>Create your first video <ArrowUpRight size={13}/></button></div>}</section>
-          <section className="panel project-panel"><div className="panel-heading compact"><div><div className="section-kicker">YOUR WORKSPACE</div><h2>Recent projects</h2></div><button className="text-button" onClick={()=>setActive('Projects')}>All projects <ArrowUpRight size={13}/></button></div><div className="project-card"><div className="project-art"><div className="art-orb"/><div className="art-leaf one"/><div className="art-leaf two"/><span>FRAME 01</span></div><div className="project-card-copy"><div><b>Scorpion Frog</b><span>Created just now</span></div><button className="icon-button" aria-label="Open project"><ArrowDownRight size={15}/></button></div></div></section></div>
+            <section className="panel project-panel"><div className="panel-heading compact"><div><div className="section-kicker">YOUR WORKSPACE</div><h2>Projects</h2></div><button className="text-button" onClick={()=>setActive('Projects')}>Manage projects <ArrowUpRight size={13}/></button></div>{activeProject?<div className="empty-state"><div className="empty-icon"><FolderOpen size={20}/></div><b>{activeProject.name}</b><span>{activeProject.reference_count} references · {activeProject.shot_count} shots · {activeProject.job_count} jobs</span><button className="text-button" onClick={()=>setActive('Projects')}>Project settings <ArrowUpRight size={13}/></button></div>:<div className="empty-state"><b>No project selected</b><span>Create or open a project to see its production data.</span><button className="text-button" onClick={()=>setActive('Projects')}>Create or import a project <ArrowUpRight size={13}/></button></div>}</section></div>
         <footer className="footer"><span><span className="status-dot online"/> Everything runs locally</span><span><BookOpen size={13}/> Studio v0.1.0 <i/> <span>Made for the frames in your head.</span></span></footer>
         </div>
       </div></div>
@@ -151,35 +159,15 @@ function IntegrationCard({ title, ready, detail, path, secondaryPath, warning=fa
   return <div className="integration-card"><div className="integration-head"><span className={`status-dot ${ready?'online':''}`}/><b>{title}</b><small className={warning?'warn-text':''}>{ready?'Connected':warning?'Needs attention':'Unavailable'}</small></div><div className="integration-detail">{detail}</div><code title={path}>{path}</code>{secondaryPath&&<code title={secondaryPath}>HF_HOME · {secondaryPath}</code>}{action&&<div className="integration-action">{action}</div>}</div>
 }
 
-function ProjectLibraryPage({ assets, imported, onImport, onUseReference, referencesOnly=false }: { assets:Asset[]; imported:boolean; onImport:()=>Promise<void>; onUseReference:(path:string)=>void; referencesOnly?:boolean }) {
-  const videos=assets.filter(asset=>asset.mime_type.startsWith('video/'))
-  const images=assets.filter(asset=>asset.mime_type.startsWith('image/'))
-  const shown=referencesOnly?images:assets
-  return <section className="panel workspace-page project-library"><div className="library-heading"><div><div className="section-kicker">LOCAL PROJECT · READ ONLY ASSET INDEX</div><h2>{referencesOnly?'Character & scene references':'Scorpion & Frog project'}</h2><p className="settings-intro">References and rendered videos stay in their existing project folders.</p></div><button className="button primary" onClick={onImport}><Plus size={14}/>{imported?'Refresh project':'Import project'}</button></div>
-    {!imported?<div className="empty-workspace"><div className="empty-icon"><FolderOpen size={19}/></div><b>Project not imported yet</b><span>Import will index local images and videos without moving or copying them.</span></div>:shown.length?<div className="asset-grid">{shown.map(asset=><AssetCard key={asset.id} asset={asset} onUseReference={onUseReference}/>)}</div>:<div className="empty-workspace"><div className="empty-icon"><Image size={19}/></div><b>No matching assets found</b><span>Refresh the project index to check for new local files.</span></div>}
-    {!referencesOnly&&Boolean(videos.length)&&<div className="asset-summary">{videos.length} video files indexed · {images.length} reference images · preview and verification run locally</div>}
-  </section>
-}
-
-function AssetCard({ asset, onUseReference }: { asset:Asset; onUseReference:(path:string)=>void }) {
-  const [verification,setVerification]=useState<{verified:boolean;format?:{duration?:string;format_name?:string};streams?:{codec_type:string;codec_name:string}[];error?:string}|null>(null)
-  const fileUrl=`/api/projects/scorpion-frog/assets/${asset.id}/file`
-  const isVideo=asset.mime_type.startsWith('video/')
-  async function verify() {
-    const response=await fetch(`/api/projects/scorpion-frog/assets/${asset.id}/verify`)
-    setVerification(await response.json())
-  }
-  return <article className="asset-card">{isVideo?<video src={fileUrl} controls preload="metadata"/>:<img src={fileUrl} loading="lazy" alt={asset.name}/>}<div className="asset-copy"><b title={asset.name}>{asset.name}</b><span>{asset.category.replaceAll('_',' ')} · {formatBytes(asset.size_bytes)}</span><small>{asset.relative_path}</small>{isVideo?<><button className="text-button" onClick={verify}><Check size={12}/> Verify with ffprobe</button>{verification&&<div className={`verify-result ${verification.verified?'ok':'error'}`}>{verification.verified?`${verification.format?.format_name??'Video'} · ${Number(verification.format?.duration??0).toFixed(2)}s · ${verification.streams?.map(stream=>stream.codec_name).join(', ')}`:verification.error}</div>}</>:<button className="text-button" onClick={()=>onUseReference(asset.path)}><Image size={12}/> Use as reference</button>}</div></article>
-}
-
-function SettingsPage({ presets, selected, onSelect, onPresetsChanged, onMessage, integrations, resources, projectImported, onImport }: { presets: Preset[]; selected: string; onSelect: (name: string, warning?: boolean) => void; onPresetsChanged: () => Promise<void>; onMessage: (message: string) => void; integrations: Integration | null; resources: Resources | null; projectImported: boolean; onImport: () => Promise<void> }) {
-  const [values, setValues] = useState({ model: 'dgrauet/ltx-2.3-mlx-q8', width: 448, height: 768, distilled_two_stage: true, low_ram: true, audio: false, seed: null as number | null, reference_image: '', output_location: '', preset: 'Standard', prompt: SCORPION_FROG_PROMPT })
+function SettingsPage({ presets, selected, onSelect, onPresetsChanged, onMessage, integrations, resources, projectId }: { presets: Preset[]; selected: string; onSelect: (name: string, warning?: boolean) => void; onPresetsChanged: () => Promise<void>; onMessage: (message: string) => void; integrations: Integration | null; resources: Resources | null; projectId:string|null }) {
+  const [values, setValues] = useState({ model: 'dgrauet/ltx-2.3-mlx-q8', width: 448, height: 768, distilled_two_stage: true, low_ram: true, audio: false, seed: null as number | null, reference_image: '', output_location: '', preset: 'Standard', prompt: '' })
   const [name, setName] = useState(''); const [frames, setFrames] = useState(97); const [fps, setFps] = useState(24)
-  useEffect(() => { fetch(`/api/settings?project_id=${CURRENT_PROJECT_ID}`).then(r=>r.ok?r.json():null).then(data=>{ if(data) setValues(v=>({...v,...data, prompt:data.prompt || SCORPION_FROG_PROMPT, reference_image:data.reference_image??'', output_location:data.output_location??''})) }).catch(()=>{}) }, [])
+  useEffect(() => { setValues(v=>({...v,prompt:'',reference_image:'',seed:null}));if(projectId)fetch(`/api/settings?project_id=${encodeURIComponent(projectId)}`).then(r=>r.ok?r.json():null).then(data=>{if(data)setValues(v=>({...v,...data,prompt:data.prompt??'',reference_image:data.reference_image??'',output_location:data.output_location??''}))}).catch(()=>{}) }, [projectId])
   const update = (key: string, value: string | number | boolean | null) => setValues(v=>({...v,[key]:value}))
   async function save() {
+    if(!projectId){onMessage('Select a project before saving generation defaults');return}
     const body = {...values, reference_image: values.reference_image || null, output_location: values.output_location || null, preset: selected}
-    const response = await fetch(`/api/settings?project_id=${CURRENT_PROJECT_ID}`, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    const response = await fetch(`/api/settings?project_id=${encodeURIComponent(projectId)}`, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     const result = await response.json(); onMessage(response.ok ? 'Generation defaults saved locally' : result.detail ?? 'Could not save settings')
   }
   async function addPreset() {
@@ -192,12 +180,12 @@ function SettingsPage({ presets, selected, onSelect, onPresetsChanged, onMessage
     <div className="integration-grid">
       <IntegrationCard title="LTX-2.3 MLX · Q8" ready={Boolean(integrations?.ltx.ready)} detail={integrations?.ltx.weights_cached ? 'Runner and cached Q8 weights available' : integrations?.ltx.cache_available ? 'Hugging Face cache exists; expected Q8 weights missing' : 'Hugging Face cache missing'} path={integrations?.ltx.root ?? 'Checking…'} secondaryPath={integrations?.ltx.hf_home} warning={Boolean(integrations && !integrations.ltx.weights_cached)}/>
       <IntegrationCard title="Remotion Studio" ready={Boolean(integrations?.remotion.ready)} detail={integrations?.remotion.version ? `CLI ${integrations.remotion.version}` : integrations?.remotion.cli_available ? 'CLI available' : 'CLI missing'} path={integrations?.remotion.root ?? 'Checking…'}/>
-      <IntegrationCard title="Scorpion & Frog" ready={Boolean(integrations?.story_project.available)} detail={projectImported ? 'Imported and available in this workspace' : 'Available to import'} path={integrations?.story_project.root ?? 'Checking…'} action={!projectImported ? <button className="button secondary mini" onClick={onImport}><Plus size={12}/> Import project</button> : undefined}/>
+      <IntegrationCard title="Active project" ready={Boolean(projectId)} detail={projectId?'Project selected':'Select or create a project'} path={projectId??'No active project'}/>
       <IntegrationCard title="ffprobe" ready={Boolean(integrations?.ffprobe.available)} detail={integrations?.ffprobe.available ? 'Video verification available' : 'ffprobe not found'} path={integrations?.ffprobe.path ?? 'Not detected'}/>
     </div>
     <div className="metric-strip"><div><span>MEMORY AVAILABLE</span><b>{formatBytes(resources?.memory.available_bytes)}</b></div><div><span>SWAP IN USE</span><b>{formatBytes(resources?.swap.used_bytes)}</b></div><div><span>DISK FREE</span><b>{formatBytes(resources?.disk_free_bytes)}</b></div><div><span>MEMORY PRESSURE</span><b className={resources?.memory_pressure?.level==='high'?'warn-text':''}>{resources?.memory_pressure ? `${resources.memory_pressure.level} · ${resources.memory_pressure.free_percent}% free` : 'Unavailable'}</b></div></div>
     {Boolean(resources?.warnings?.length)&&<div className="model-caution preflight-warning"><AlertTriangle size={13}/><span>{resources?.warnings.join(' ')}</span></div>}
-    <div className="settings-divider"/><div className="section-kicker">LOCAL GENERATION</div><h2>Generation defaults</h2><p className="settings-intro">Settings stay on this machine and apply to new generations.</p>
+    <div className="settings-divider"/><div className="section-kicker">LOCAL GENERATION</div><h2>Generation defaults</h2><p className="settings-intro">Settings stay on this machine and apply only to the selected project.</p>
     <div className="settings-form-grid"><label className="setting-field wide">Project prompt<textarea value={values.prompt} onChange={e=>update('prompt',e.target.value)}/></label><label className="setting-field wide">Model<input value={values.model} onChange={e=>update('model',e.target.value)}/></label><label className="setting-field">Width<input type="number" step="8" min="64" value={values.width} onChange={e=>update('width',Number(e.target.value))}/></label><label className="setting-field">Height<input type="number" step="8" min="64" value={values.height} onChange={e=>update('height',Number(e.target.value))}/></label><label className="setting-field">Seed<input type="number" min="0" placeholder="Random" value={values.seed ?? ''} onChange={e=>update('seed',e.target.value ? Number(e.target.value) : null)}/></label><label className="setting-field">Output folder<input placeholder="~/AI-Video-Studio/outputs" value={values.output_location} onChange={e=>update('output_location',e.target.value)}/></label><label className="setting-field wide">Reference image path<input placeholder="Optional local image path" value={values.reference_image} onChange={e=>update('reference_image',e.target.value)}/></label></div>
     <div className="setting-toggles"><label><input type="checkbox" checked={values.distilled_two_stage} onChange={e=>update('distilled_two_stage',e.target.checked)}/> Distilled two-stage</label><label><input type="checkbox" checked={values.low_ram} onChange={e=>update('low_ram',e.target.checked)}/> Low RAM mode</label><label><input type="checkbox" checked={values.audio} onChange={e=>update('audio',e.target.checked)}/> Generate audio</label></div>
     <div className="setting-actions"><button className="button primary" onClick={save}><Check size={14}/> Save defaults</button></div>

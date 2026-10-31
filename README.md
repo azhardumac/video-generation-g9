@@ -4,7 +4,15 @@ Private, local-first AI video studio for generating portrait video with **LTX-2.
 
 ## Current status (31 October 2026)
 
-**Phases 1, 2 and 2.5 are integrated on `main`; Phase 3 is implemented on this feature branch.** The studio includes:
+**Phases 1, 2, 2.5, 3, and 3.2 are on `main`. Issue #11 Milestone A is implemented on the current feature branch and is not yet integrated.** Milestone A adds:
+
+- Real local projects with create, open/switch, rename, archive/restore, and read-only import for allowed directories.
+- Project-scoped local reference links and uploads. References are explicitly selected, categorized, validated, editable, and removable without deleting source files.
+- Persisted active-project selection, per-project settings/jobs/assets/storyboards, and genuinely blank storyboards. New projects do not import or link historical media or story content.
+
+The current app still needs the remaining Issue #11 production workflow (style/character bible, expanded per-shot setup, stronger production preview/export flow) and complete placeholder/control audit before it can be described as fully usable.
+
+The `main` foundation includes:
 
 - Responsive dark dashboard; local integration health for LTX, the offline Q8 model cache, Remotion, the story project, and ffprobe.
 - Short / Standard / Extended / Experimental generation presets; project-scoped prompt/settings; reference-image selection, seed, and output location.
@@ -12,7 +20,7 @@ Private, local-first AI video studio for generating portrait video with **LTX-2.
 - Project importer (read-only), asset references, local video previews, benchmark history, elapsed-time and resource metrics.
 - Offline Hugging Face inference. Output is first written as `.partial.mp4`; ffprobe checks dimensions, frame rate and counted frames before it is finalized.
 - Advisory resource warnings (not hard generation blocks). The 193-frame option warns of observed visual drift.
-- Revisioned SQLite storyboards with scene groups, editable/reorderable shots, local reference paths, per-shot presets/seeds/captions, job links, logs, retries, and cancellation. The Scorpion & Frog importer indexes its current assets in place and seeds a riverbank opening shot.
+- Revisioned SQLite storyboards with scene groups, editable/reorderable shots, local reference paths, per-shot presets/seeds/captions, job links, logs, retries, and cancellation.
 - Deterministic Remotion manifest generation from only completed, ffprobe-verified portrait 24 fps outputs. The timeline preview plays verified clips in storyboard order; the app-owned Remotion composition applies crossfades and optional captions.
 - Remotion rendering is queued only after the user confirms in the storyboard UI. Render output is ffprobe-checked for the timeline's portrait dimensions, 24 fps, and exact frame count.
 
@@ -93,8 +101,8 @@ Open **http://127.0.0.1:5173**. The API runs at **http://127.0.0.1:8000** by def
 ## Generating a clip
 
 1. Open **Settings** to check local LTX runner, model cache, ffprobe, project, and Remotion integration status.
-2. Import the local Scorpion & Frog project if it is not already indexed. Select the riverbank scene reference.
-3. In **Generate video**, choose **Short** (49 frames) for the first test, check the scene prompt and seed, and click Generate **once**. Only this explicit submission starts GPU work.
+2. Create or open a project in **Projects**. Link only reference images explicitly approved for that production. A new storyboard starts empty.
+3. In **Generate video**, write the prompt, choose a preset, and click Generate **once**. Only this explicit submission starts GPU work.
 4. Check **Job queue** and **History & Logs** for live output and resource readings. On success, the finalized MP4 is playable in the UI and includes ffprobe verification.
 5. A failed or canceled job is not marked completed; partial media is retained with an explicit filename if present.
 
@@ -102,15 +110,15 @@ The LTX adapter calls the installed CLI with `--width`, `--height`, `--frames`, 
 
 ## Planning a multi-shot storyboard
 
-1. Start FastAPI and Vite as described above, then open **Storyboard** in the left navigation.
-2. Choose **Import Scorpion & Frog**. The importer reads the configured `STORY_PROJECT` and creates a saved SQLite storyboard with the existing riverbank reference. It does not move or copy images or videos.
-3. Edit the scene name, shot title and prompt. Choose a local reference image and one of Short, Standard, Extended or Experimental; optionally set a seed and caption. Use the up/down controls to order shots. Add shots for new scenes by changing the scene name, then select **Save storyboard**. Each save creates an ordered revision; stale revisions are rejected instead of overwriting newer edits.
+1. Open **Projects** and select a project, then open **Storyboard**.
+2. Enter a title and create a blank storyboard. No prompt, scene, shot, reference, or old output is inserted automatically.
+3. Add scene and shot details explicitly, select a reference image, preset, seed, and caption. Use the up/down controls to order shots, then select **Save storyboard**. Each save creates an ordered revision; stale revisions are rejected instead of overwriting newer edits.
 4. Select **Queue shot** on each shot you intend to generate. This is the explicit action that submits one shot to the existing single-worker LTX queue. Generation does not run during import, editing, tests, manifest preview, or app startup. Follow progress, logs, cancellation, retry and the verified video preview on each shot card.
 5. To reuse a prior clip without generating again, select it under **Reuse verified generation**, choose **Use selected job settings**, save the new storyboard revision, then choose **Attach existing clip**. This adds a link to the existing job; it does not copy or change the source video. The app re-runs ffprobe and requires the prompt, reference image, seed, and preset to match. If any of those shot settings later change, the prior clip is marked stale and cannot enter a new manifest; its job and video remain available as history.
 6. After every shot is completed and ffprobe-verified, select **Preview verified timeline**. The app produces a deterministic manifest under `OUTPUT_ROOT/storyboards/<storyboard-id>/composition-manifest.json` and plays the clips in order for review. Clips must remain under `OUTPUT_ROOT`, use matching portrait dimensions, and be 24 fps; missing, stale, unverified, mismatched, or moved files block assembly.
 7. Review the timeline, crossfade markers, captions and total duration. **Confirm & queue Remotion render** asks for confirmation before adding a render job. The packaged `remotion/` composition uses the existing local Remotion CLI and its installed packages without editing the existing Remotion project. The rendered MP4 is stored under `OUTPUT_ROOT/storyboards/<storyboard-id>/` and verified before completion. No render is started by import, clip attachment, or preview.
 
-Shot deletion is a soft delete and preserves revision snapshots and job/video history. The app blocks removing or archiving shots with queued/running jobs; cancel those jobs first. Archiving a storyboard also retains its database history and media files. The initial importer seeds one shot; additional scene structure and prompts are user-edited. Crossfades default to eight frames, and captions are optional text overlays. The storyboard timeline preview is a local playback preview; final transitions/caption compositing are applied by Remotion when its render is explicitly confirmed.
+Shot deletion is a soft delete and preserves revision snapshots and job/video history. The app blocks removing or archiving shots with queued/running jobs; cancel those jobs first. Archiving a storyboard also retains its database history and media files. Crossfades default to eight frames, and captions are optional text overlays. The storyboard timeline preview is a local playback preview; final transitions/caption compositing are applied by Remotion when its render is explicitly confirmed.
 
 ## Tests
 
@@ -129,6 +137,7 @@ Tests and builds do not require a GPU generation run.
 
 - `.env`, secrets, SQLite databases, videos, reference images, model weights, downloads, and caches are excluded from Git.
 - Imported project assets stay in their original locations.
+- Uploaded reference images are copied only after explicit file selection and stored in app-owned project reference storage. The upload limit defaults to 20 MiB (`PROJECT_UPLOAD_MAX_BYTES`). Removing a reference removes its database link and retains the file.
 - Local path validation restricts file access to configured roots.
 - One GPU generation job runs at a time; output is verified before job completion.
 - Process-group cancellation terminates the launched job and its children, not unrelated local applications.

@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     hf_cache: str = "~/AI-Video-Studio/models/ltx/huggingface"
     remotion_studio: str = "~/AI-Video-Studio/remotion-studio"
     remotion_render_port: int = Field(default=0, ge=0, le=65535)
+    project_upload_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
+    # Reference uploads are opt-in and capped independently from generation inputs.
     story_project: str = "~/AI-Video-Studio/projects/scorpion-frog"
     ltx_executable: str = "~/AI-Video-Studio/src/ltx-2-mlx/.venv/bin/ltx-2-mlx"
     remotion_executable: str = "~/AI-Video-Studio/remotion-studio/node_modules/.bin/remotion"

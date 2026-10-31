@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+import sqlite3
 
 from app.config import Settings
 from app.db import Database
@@ -15,7 +16,7 @@ def test_path_validation_rejects_paths_outside_allowed_root(tmp_path):
         safe_local_path(str(tmp_path / "outside.mp4"), settings)
 
 
-def test_running_job_returns_to_queue_after_restart(tmp_path):
+def test_running_job_is_failed_safely_after_restart(tmp_path):
     settings = Settings(
         _env_file=None,
         database_path=str(tmp_path / "studio.sqlite3"),
@@ -27,8 +28,10 @@ def test_running_job_returns_to_queue_after_restart(tmp_path):
 
     restarted = Database(settings)
     restored = restarted.get_job(job["id"])
-    assert restored["status"] == "queued"
+    assert restored["status"] == "failed"
     assert restored["payload"]["prompt"] == "offline test"
+    assert "review and retry manually" in restored["error"]
+    assert restarted.events(job["id"])[-1]["level"] == "warning"
 
 
 def test_cancel_wins_against_queue_claim_and_completion(tmp_path):
@@ -62,3 +65,52 @@ def test_worker_persists_adapter_failure_without_gpu_or_subprocess(tmp_path):
         assert db.events(job["id"])[-1]["level"] == "error"
 
     asyncio.run(run())
+
+
+def test_legacy_schema_migration_is_backed_up_additive_and_idempotent(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as legacy:
+        legacy.executescript("""
+            CREATE TABLE jobs(id TEXT PRIMARY KEY,kind TEXT NOT NULL,status TEXT NOT NULL,progress INTEGER NOT NULL DEFAULT 0,
+                payload TEXT NOT NULL,result_path TEXT,error TEXT,attempts INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+            CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT,job_id TEXT NOT NULL,time TEXT NOT NULL,level TEXT NOT NULL,message TEXT NOT NULL);
+            CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL);
+            CREATE TABLE benchmark_history(id INTEGER PRIMARY KEY AUTOINCREMENT,preset TEXT NOT NULL,frames INTEGER NOT NULL,fps INTEGER NOT NULL,duration REAL NOT NULL,elapsed_seconds REAL,created_at TEXT NOT NULL);
+            CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,root TEXT NOT NULL,created_at TEXT NOT NULL,imported_at TEXT NOT NULL);
+            CREATE TABLE project_assets(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,category TEXT NOT NULL,relative_path TEXT NOT NULL,size_bytes INTEGER NOT NULL,modified_at REAL NOT NULL,mime_type TEXT NOT NULL);
+            CREATE TABLE storyboards(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,title TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,archived_at TEXT,manifest_json TEXT,manifest_path TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+            CREATE TABLE storyboard_shots(id TEXT PRIMARY KEY,storyboard_id TEXT NOT NULL,position INTEGER NOT NULL,title TEXT NOT NULL,prompt TEXT NOT NULL,reference_image TEXT,preset TEXT NOT NULL,seed INTEGER,caption TEXT NOT NULL DEFAULT '',deleted_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+            CREATE TABLE storyboard_scenes(id TEXT PRIMARY KEY,storyboard_id TEXT NOT NULL,title TEXT NOT NULL,position INTEGER NOT NULL,deleted_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(storyboard_id,title));
+            CREATE TABLE storyboard_revisions(id INTEGER PRIMARY KEY AUTOINCREMENT,storyboard_id TEXT NOT NULL,revision INTEGER NOT NULL,title TEXT NOT NULL,snapshot_json TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(storyboard_id,revision));
+            CREATE TABLE shot_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,shot_id TEXT NOT NULL,job_id TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL);
+            INSERT INTO projects VALUES('legacy','Legacy project','/legacy','2026-01-01','2026-01-01');
+            INSERT INTO project_assets VALUES('asset','legacy','character_reference','frog.png',12,1.0,'image/png');
+            INSERT INTO jobs(id,kind,status,payload,created_at,updated_at) VALUES('job','generation','completed','{\"prompt\":\"historical\"}','2026-01-01','2026-01-01');
+        """)
+    settings = Settings(_env_file=None, database_path=str(path), allowed_path_roots=str(tmp_path))
+    migrated = Database(settings)
+    assert migrated.get_job("job")["payload"]["prompt"] == "historical"
+    assert migrated.get_project_asset("legacy", "asset")["relative_path"] == "frog.png"
+    with migrated.connect() as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 1
+        assert "project_id" in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    backups = list(tmp_path.glob("legacy.sqlite3.pre-migration-*.bak"))
+    assert len(backups) == 1
+    Database(settings)
+    assert len(list(tmp_path.glob("legacy.sqlite3.pre-migration-*.bak"))) == 1
+
+
+def test_failed_migration_rolls_back_schema_and_keeps_backup(tmp_path):
+    path = tmp_path / "broken-legacy.sqlite3"
+    with sqlite3.connect(path) as legacy:
+        legacy.execute("CREATE TABLE jobs(id TEXT PRIMARY KEY,kind TEXT NOT NULL,status TEXT NOT NULL)")
+        legacy.execute("CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,root TEXT NOT NULL,created_at TEXT NOT NULL,imported_at TEXT NOT NULL)")
+        legacy.execute("INSERT INTO projects VALUES('legacy','Legacy','/legacy','2026','2026')")
+    settings = Settings(_env_file=None, database_path=str(path), allowed_path_roots=str(tmp_path))
+    with pytest.raises(sqlite3.OperationalError):
+        Database(settings)
+    backups = list(tmp_path.glob("broken-legacy.sqlite3.pre-migration-*.bak"))
+    assert len(backups) == 1
+    with sqlite3.connect(path) as db:
+        assert "description" not in {row[1] for row in db.execute("PRAGMA table_info(projects)")}
+        assert db.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 1

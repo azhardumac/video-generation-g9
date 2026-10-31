@@ -10,12 +10,13 @@ type ManifestShot = { shot_id: string; scene_title: string; title: string; frame
 type Manifest = { title: string; revision: number; width: number; height: number; fps: number; duration_in_frames: number; shots: ManifestShot[] }
 type Storyboard = { id: string; project_id: string; title: string; revision: number; shots: Shot[]; manifest_path?: string | null; manifest?: Manifest | null }
 
-const emptyShot = (sceneTitle='New scene'): Shot => ({position:0,scene_title:sceneTitle,title:'New shot',prompt:'',reference_image:null,preset:'Short',seed:null,caption:''})
+const emptyShot = (): Shot => ({position:0,scene_title:'',title:'',prompt:'',reference_image:null,preset:'Short',seed:null,caption:''})
 
-export default function StoryboardPage({assets,jobs,imported,onImportProject,onMessage}:{assets:Asset[];jobs:ExistingJob[];imported:boolean;onImportProject:()=>Promise<void>;onMessage:(message:string)=>void}) {
+export default function StoryboardPage({projectId,assets,jobs,onMessage}:{projectId:string|null;assets:Asset[];jobs:ExistingJob[];onMessage:(message:string)=>void}) {
   const [story,setStory]=useState<Storyboard|null>(null)
   const [draft,setDraft]=useState<Shot[]>([])
-  const [title,setTitle]=useState('Scorpion & Frog')
+  const [title,setTitle]=useState('')
+  const [newTitle,setNewTitle]=useState('')
   const [presets,setPresets]=useState<Preset[]>([])
   const [busy,setBusy]=useState('')
   const [dirty,setDirty]=useState(false)
@@ -38,13 +39,15 @@ export default function StoryboardPage({assets,jobs,imported,onImportProject,onM
 
   useEffect(()=>{
     let active=true
-    Promise.all([fetch('/api/storyboards'),fetch('/api/presets')]).then(async([s,p])=>{
+    if(!projectId){setStory(null);setDraft([]);setTitle('');return}
+    setStory(null);setDraft([]);setTitle('');setManifest(null);setDirty(false)
+    Promise.all([fetch(`/api/projects/${encodeURIComponent(projectId)}/storyboards`),fetch('/api/presets')]).then(async([s,p])=>{
       if(!active)return
       if(p.ok)setPresets(await p.json())
       if(s.ok){const list:Storyboard[]=await s.json();if(list[0])await loadStory(list[0].id,true)}
     }).catch(e=>setError(e instanceof Error?e.message:'Could not load local storyboards'))
     return()=>{active=false}
-  },[loadStory])
+  },[loadStory,projectId])
 
   useEffect(()=>{
     if(!story)return
@@ -56,16 +59,16 @@ export default function StoryboardPage({assets,jobs,imported,onImportProject,onM
     if(timelinePlaying&&timelineVideo.current)void timelineVideo.current.play().catch(()=>setTimelinePlaying(false))
   },[timelineIndex,timelinePlaying])
 
-  async function importScorpionFrog(){
-    setBusy('import');setError('')
+  async function createBlankStoryboard(){
+    if(!projectId)return
+    setBusy('create');setError('')
     try{
-      if(!imported)await onImportProject()
-      const response=await fetch('/api/storyboards/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:'scorpion-frog'})})
+      const response=await fetch(`/api/projects/${encodeURIComponent(projectId)}/storyboards`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:newTitle})})
       const data=await response.json()
-      if(!response.ok)throw new Error(data.detail??'Could not create the storyboard')
+      if(!response.ok)throw new Error(data.detail??'Could not create the blank storyboard')
       setStory(data);setTitle(data.title);setDraft(data.shots.map((shot:Shot)=>({...shot})));setDirty(false);setManifest(data.manifest??null)
-      onMessage('Scorpion & Frog storyboard imported; local reference assets remain in place')
-    }catch(e){setError(e instanceof Error?e.message:'Import failed')}
+      setNewTitle('');onMessage('Blank storyboard created; no shots or project assets were added')
+    }catch(e){setError(e instanceof Error?e.message:'Could not create storyboard')}
     finally{setBusy('')}
   }
 
@@ -77,7 +80,7 @@ export default function StoryboardPage({assets,jobs,imported,onImportProject,onM
     setDraft(current=>{const next=[...current];[next[index],next[target]]=[next[target],next[index]];return next.map((shot,i)=>({...shot,position:i}))})
     setDirty(true);setManifest(null)
   }
-  function addShot(){setDraft(current=>[...current,{...emptyShot(current.at(-1)?.scene_title??'New scene'),position:current.length}]);setDirty(true);setManifest(null)}
+  function addShot(){setDraft(current=>[...current,{...emptyShot(),position:current.length}]);setDirty(true);setManifest(null)}
   function removeShot(index:number){
     if(draft.length<2)return
     setDraft(current=>current.filter((_,i)=>i!==index).map((shot,position)=>({...shot,position})));setDirty(true);setManifest(null)
@@ -85,7 +88,7 @@ export default function StoryboardPage({assets,jobs,imported,onImportProject,onM
 
   async function saveDraft(){
     if(!story)throw new Error('Import a project storyboard first')
-    if(draft.some(shot=>!shot.title.trim()||!shot.prompt.trim()))throw new Error('Every shot needs a title and prompt before saving')
+    if(draft.some(shot=>!shot.scene_title.trim()||!shot.title.trim()||!shot.prompt.trim()))throw new Error('Every shot needs a scene, title, and prompt before saving')
     setBusy('save');setError('')
     try{
       const response=await fetch(`/api/storyboards/${story.id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:story.revision,title,shots:draft.map(({status,job,position,...shot})=>({...shot,reference_image:shot.reference_image||null}))})})
@@ -173,7 +176,7 @@ export default function StoryboardPage({assets,jobs,imported,onImportProject,onM
     finally{setBusy('')}
   }
 
-  if(!story)return <section className="panel workspace-page storyboard-page"><div className="section-kicker">PHASE 3 · LOCAL STORYBOARD</div><h2>Storyboard & shots</h2><p className="settings-intro">Import your existing Scorpion & Frog project to create a persistent shot plan. References stay in their original folders.</p>{error&&<div className="model-caution">{error}</div>}<button className="button primary" disabled={busy==='import'} onClick={importScorpionFrog}>{busy==='import'?<LoaderCircle className="spin" size={14}/>:<Film size={14}/>} Import Scorpion & Frog</button></section>
+  if(!story)return <section className="panel workspace-page storyboard-page"><div className="section-kicker">PROJECT STORYBOARD</div><h2>Storyboard & shots</h2>{!projectId?<div className="empty-workspace"><Film size={18}/><b>Select a project first</b><span>Storyboards are saved within a project.</span></div>:<><p className="settings-intro">Create a blank persistent storyboard. No scenes, shots, prompts, or references are added automatically.</p>{error&&<div className="model-caution">{error}</div>}<label className="setting-field">Storyboard title<input value={newTitle} maxLength={160} onChange={e=>setNewTitle(e.target.value)} placeholder="Enter a title"/></label><button className="button primary" disabled={busy==='create'||!newTitle.trim()} onClick={()=>void createBlankStoryboard()}>{busy==='create'?<LoaderCircle className="spin" size={14}/>:<Plus size={14}/>} Create blank storyboard</button></>}</section>
 
   return <section className="panel workspace-page storyboard-page">
     <div className="section-kicker">PERSISTENT STORYBOARD · REVISION {story.revision}</div>
