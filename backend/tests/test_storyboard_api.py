@@ -196,6 +196,48 @@ def test_fresh_project_switch_and_blank_storyboard_are_isolated():
     assert api.set_active_project(api.ActiveProjectRequest(project_id=None))["project"] is None
 
 
+def test_fresh_scorpion_frog_production_uses_only_explicit_character_selections():
+    from uuid import uuid4
+    source = _ROOT / f"approved-originals-{uuid4().hex[:8]}"
+    source.mkdir()
+    frog = source / "frog-character-original.png"
+    scorpion = source / "scorpion-character-original.png"
+    riverbank = source / "riverbank-master.png"
+    prior_video = source / "benchmark-output.mp4"
+    for index, image in enumerate((frog, scorpion, riverbank)):
+        image.write_bytes(b"\x89PNG\r\n\x1a\noriginal image fixture " + bytes([index]))
+    prior_video.write_bytes(b"legacy video fixture")
+
+    project_root = _ROOT / f"claymation-production-{uuid4().hex[:8]}"
+    project = api.create_project(api.ProjectCreateRequest(
+        name="Scorpion & Frog · Handmade Claymation",
+        workspace_path=str(project_root), description="Handmade cinematic claymation",
+        aspect_ratio="9:16", frame_rate=24,
+        production_type="handmade cinematic claymation",
+    ))
+    assert api.project_references(project["id"]) == []
+    assert api.db.project_assets(project["id"]) == []
+    assert api.db.list_jobs(project_id=project["id"]) == []
+    assert api.list_project_storyboards(project["id"]) == []
+
+    for name, path in (("Original frog", frog), ("Original scorpion", scorpion)):
+        api.add_existing_project_reference(project["id"], api.ProjectReferenceCreate(
+            path=str(path), name=name, category="character", notes="Approved original",
+        ))
+    assert {Path(reference["path"]).resolve() for reference in api.project_references(project["id"])} == {frog.resolve(), scorpion.resolve()}
+    assert api.project_references(project["id"])[0]["category"] == "character"
+
+    storyboard = api.create_project_storyboard(project["id"], api.CreateStoryboardRequest(
+        title="Claymation production storyboard",
+    ))
+    assert storyboard["shots"] == []
+    assert storyboard["story_text"] == ""
+    assert storyboard["manifest"] is None
+    assert api.db.list_jobs(project_id=project["id"]) == []
+    assert riverbank.read_bytes().startswith(b"\x89PNG")
+    assert prior_video.read_bytes() == b"legacy video fixture"
+
+
 def test_project_reference_validation_scoping_and_unlink_preserve_source():
     from uuid import uuid4
     project_root = _ROOT / f"refs-production-{uuid4().hex[:8]}"
