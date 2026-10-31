@@ -801,12 +801,23 @@ def _film_export_status(story: dict) -> dict:
     manifest_ready = bool(manifest and manifest.get("revision") == story["revision"])
     all_verified = bool(shots) and len(current_verified) == len(shots)
     reconciled = bool(shots) and all(shot.get("reconciled_job_id") == (shot.get("job") or {}).get("id") for shot in shots)
+    latest_render = None
+    for job in db.list_jobs(limit=500, project_id=story["project_id"]):
+        job_manifest = ((job.get("payload") or {}).get("props") or {}).get("manifest") or {}
+        if job.get("kind") == "render" and job_manifest.get("storyboard_id") == story["id"]:
+            latest_render = {"id": job["id"], "status": job["status"], "progress": job["progress"],
+                             "result_path": job.get("result_path"), "elapsed_seconds": job.get("elapsed_seconds"),
+                             "error": job.get("error"), "verification_metadata": job.get("verification_metadata"),
+                             "current": bool(manifest_ready and job_manifest == manifest),
+                             "manifest_revision": job_manifest.get("revision")}
+            break
     return {"storyboard_id": story["id"], "revision": story["revision"],
             "style_bible_revision": story["style_bible_revision"], "approved": bool(story.get("film_plan", {}).get("approved")),
             "total_shots": len(shots), "verified_shots": len(current_verified), "missing_shots": missing,
             "all_verified": all_verified, "reconciled": reconciled, "manifest_ready": manifest_ready,
             "manifest_path": story.get("manifest_path"), "manifest": manifest,
             "remotion_ready": detect_integrations(settings)["remotion"]["ready"],
+            "latest_render": latest_render,
             "source_batches": [{key: value for key, value in candidate.items() if key != "job_ids"} for candidate in candidates],
             "recommended_source_batch_id": candidates[0]["id"] if len(candidates) == 1 else None,
             "ambiguous_source_batches": len(candidates) > 1, "paused_batches": paused}
@@ -1245,6 +1256,15 @@ def queue_storyboard_render(storyboard_id: str):
     integration = detect_integrations(settings)["remotion"]
     if not integration["ready"]:
         raise HTTPException(409, "The configured local Remotion CLI is unavailable")
+    prior_renders = [job for job in db.list_jobs(limit=500, project_id=story["project_id"])
+                     if job.get("kind") == "render" and
+                     (((job.get("payload") or {}).get("props") or {}).get("manifest") or {}).get("storyboard_id") == storyboard_id and
+                     (((job.get("payload") or {}).get("props") or {}).get("manifest") or {}) == manifest]
+    if any(job["status"] in ("queued", "running") for job in prior_renders):
+        raise HTTPException(409, "A Remotion render for this composition is already queued or running")
+    if any(job["status"] == "completed" and job.get("result_path") and Path(job["result_path"]).is_file() and
+           (job.get("verification_metadata") or {}).get("verified_output") for job in prior_renders):
+        raise HTTPException(409, "This composition already has a completed verified render")
     output_root = settings.expanded(settings.output_root)
     output_path = output_root / "storyboards" / storyboard_id / f"storyboard-r{story['revision']}.mp4"
     entrypoint = Path(__file__).resolve().parents[2] / "remotion" / "index.ts"
