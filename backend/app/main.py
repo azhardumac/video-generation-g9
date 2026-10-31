@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from hashlib import sha256
 import os
@@ -5,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 from typing import Literal
 from uuid import uuid4
@@ -106,10 +108,23 @@ class ProjectReferenceUpdate(BaseModel):
 
 class CreateStoryboardRequest(BaseModel):
     title: str = Field(min_length=1, max_length=160)
+    story_text: str = Field(default="", max_length=20000)
+
+
+class StyleBibleRequest(BaseModel):
+    material: str = Field(default="", max_length=2000)
+    silhouettes: str = Field(default="", max_length=2000)
+    proportions: str = Field(default="", max_length=2000)
+    composition: str = Field(default="", max_length=2000)
+    negative_constraints: str = Field(default="", max_length=2000)
 
 
 class ImportStoryboardRequest(BaseModel):
     project_id: str = "scorpion-frog"
+
+
+class RevealOutputRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4000)
 
 
 def _preset_frames(name: str) -> tuple[int, int]:
@@ -123,11 +138,15 @@ def _preset_frames(name: str) -> tuple[int, int]:
     return row["frames"], row["fps"]
 
 
-def _generation_payload(config: GenerationSettings) -> dict:
-    frames, fps = _preset_frames(config.preset)
+def _generation_payload(config: GenerationSettings, project_id: str | None = None, fps_override: int | None = None) -> dict:
+    frames, preset_fps = _preset_frames(config.preset)
+    fps = fps_override or preset_fps
+    project = _project(project_id) if project_id else None
+    default_output = str(_project_output(project)) if project else settings.output_root
     try:
-        output = safe_local_path(config.output_location or settings.output_root, settings)
-        reference = safe_local_path(config.reference_image, settings, must_exist=True) if config.reference_image else None
+        output = safe_local_path(config.output_location or default_output, settings)
+        reference = _validate_project_reference(project, config.reference_image) if project else (
+            safe_local_path(config.reference_image, settings, must_exist=True) if config.reference_image else None)
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(400, str(exc)) from exc
     root = settings.expanded(settings.output_root)
@@ -148,6 +167,38 @@ def _project(project_id: str, *, allow_archived: bool = False) -> dict:
 def _project_id_for_name(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")[:40] or "project"
     return f"{slug}-{uuid4().hex}"
+
+
+def _project_output(project: dict) -> Path:
+    return settings.expanded(settings.output_root) / project["id"]
+
+
+def _validate_project_reference(project: dict, raw_path: str | None) -> Path | None:
+    if not raw_path:
+        return None
+    try:
+        path = safe_local_path(raw_path, settings, must_exist=True)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    allowed = {Path(item["path"]).resolve() for item in db.project_references(project["id"])}
+    root = settings.expanded(project["root"])
+    for asset in db.project_assets(project["id"]):
+        allowed.add((root / asset["relative_path"]).resolve())
+    if path not in allowed:
+        raise HTTPException(400, "Reference image must be linked to the selected project first")
+    return path
+
+
+def _style_context(style_bible: dict) -> str:
+    labels = (("material", "Material and finish"), ("silhouettes", "Silhouettes"),
+              ("proportions", "Character proportions"), ("composition", "Composition guidance"),
+              ("negative_constraints", "Negative constraints"))
+    return "\n".join(f"{label}: {style_bible[key].strip()}" for key, label in labels
+                     if style_bible.get(key, "").strip())
+
+
+def _default_dimensions(aspect_ratio: str | None) -> tuple[int, int]:
+    return {"16:9": (768, 432), "1:1": (640, 640), "4:3": (640, 480), "3:2": (672, 448)}.get(aspect_ratio or "9:16", (448, 768))
 
 
 def _validate_image_path(raw: str) -> tuple[Path, str, int, str]:
@@ -329,6 +380,23 @@ def restore_project(project_id: str):
         raise HTTPException(404, str(exc)) from exc
 
 
+@app.get("/api/projects/{project_id}/style-bible")
+def get_project_style_bible(project_id: str):
+    project = _project(project_id)
+    return {"revision": project["style_bible_revision"], "fields": project["style_bible"]}
+
+
+@app.put("/api/projects/{project_id}/style-bible")
+def update_project_style_bible(project_id: str, request: StyleBibleRequest):
+    _project(project_id)
+    values = {key: value.strip() for key, value in request.model_dump().items()}
+    try:
+        project = db.update_project_style_bible(project_id, values)
+        return {"revision": project["style_bible_revision"], "fields": project["style_bible"]}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @app.get("/api/projects/{project_id}/assets")
 def project_assets(project_id: str):
     project = _project(project_id)
@@ -503,7 +571,7 @@ def create_project_storyboard(project_id: str, request: CreateStoryboardRequest)
     title = request.title.strip()
     if not title:
         raise HTTPException(422, "Storyboard title cannot be blank")
-    return db.create_storyboard(project_id, title, [])
+    return db.create_storyboard(project_id, title, [], request.story_text.strip())
 
 
 @app.post("/api/storyboards/import", status_code=201)
@@ -555,18 +623,23 @@ def update_storyboard(storyboard_id: str, payload: StoryboardUpdate):
     story = db.get_storyboard(storyboard_id)
     if not story:
         raise HTTPException(404, "Storyboard not found")
+    project = _project(story["project_id"])
     values = []
     for shot in payload.shots:
-        _preset_frames(shot.preset)
+        _, preset_fps = _preset_frames(shot.preset)
         shot_value = shot.model_dump()
-        if shot.reference_image:
-            try:
-                shot_value["reference_image"] = str(safe_local_path(shot.reference_image, settings, must_exist=True))
-            except (ValueError, FileNotFoundError) as exc:
-                raise HTTPException(400, str(exc)) from exc
+        reference = _validate_project_reference(project, shot.reference_image)
+        shot_value["reference_image"] = str(reference) if reference else None
+        default_width, default_height = _default_dimensions(project.get("aspect_ratio"))
+        shot_value["width"] = shot.width or default_width
+        shot_value["height"] = shot.height or default_height
+        shot_value["fps"] = shot.fps or project.get("frame_rate") or preset_fps
+        shot_value["output_location"] = str(safe_local_path(shot.output_location or str(_project_output(project)), settings))
+        if shot_value["prompt_reviewed"] and shot_value["reviewed_style_revision"] != story.get("style_bible_revision", 0):
+            raise HTTPException(409, "The style bible changed after this prompt was reviewed; review it again before saving")
         values.append(shot_value)
     try:
-        return db.update_storyboard(storyboard_id, payload.revision, payload.title, values)
+        return db.update_storyboard(storyboard_id, payload.revision, payload.title, values, payload.story_text.strip())
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except RuntimeError as exc:
@@ -603,12 +676,27 @@ def queue_storyboard_shot(storyboard_id: str, shot_id: str):
     shot = next((item for item in story["shots"] if item["id"] == shot_id), None)
     if not shot:
         raise HTTPException(404, "Shot not found")
+    if not shot.get("prompt_reviewed") or shot.get("reviewed_style_revision", 0) != story.get("style_bible_revision", 0):
+        raise HTTPException(409, "Review and confirm the exact shot prompt and style context before queueing")
     if not detect_integrations(settings)["ltx"]["ready"]:
         raise HTTPException(409, "LTX runner or cached Q8 model weights are unavailable; no weights will be downloaded")
-    defaults = db.get_setting(_generation_settings_key(story["project_id"])) or db.get_setting("generation") or GenerationSettings().model_dump()
-    config = GenerationSettings.model_validate(defaults | {"prompt": shot["prompt"], "preset": shot["preset"],
-                         "seed": shot["seed"], "reference_image": shot["reference_image"]})
-    payload = _generation_payload(config)
+    project = _project(story["project_id"])
+    defaults = db.get_setting(_generation_settings_key(story["project_id"])) or GenerationSettings().model_dump()
+    style_context = _style_context(story.get("style_bible") or {})
+    effective_prompt = (style_context + "\n\n" if style_context else "") + shot["prompt"]
+    width = shot.get("width") or defaults.get("width", 448)
+    height = shot.get("height") or defaults.get("height", 768)
+    fps = shot.get("fps") or project.get("frame_rate") or _preset_frames(shot["preset"])[1]
+    output_location = shot.get("output_location") or str(_project_output(project))
+    reference = _validate_project_reference(project, shot.get("reference_image"))
+    config = GenerationSettings.model_validate(defaults | {"prompt": effective_prompt, "preset": shot["preset"],
+                         "width": width, "height": height, "output_location": output_location,
+                         "seed": shot["seed"], "reference_image": str(reference) if reference else None})
+    payload = _generation_payload(config, project["id"], fps_override=fps)
+    shot_settings = {"style_context": style_context, "style_bible_revision": story.get("style_bible_revision", 0),
+                     "width": width, "height": height, "fps": fps, "output_location": payload["output_location"],
+                     "framing": shot.get("framing", ""), "aspect_ratio": project.get("aspect_ratio")}
+    payload.update(shot_prompt=shot["prompt"], style_context=style_context, shot_settings=shot_settings)
     try:
         return db.create_shot_job(storyboard_id, shot_id, payload)
     except KeyError as exc:
@@ -733,13 +821,15 @@ def _generation_settings_key(project_id: str | None) -> str:
 
 @app.get("/api/settings")
 def read_settings(project_id: str | None = None):
-    if project_id is not None:
-        _project(project_id)
+    project = _project(project_id) if project_id is not None else None
     key = _generation_settings_key(project_id)
     specific = db.get_setting(key)
     if specific is not None:
-        return specific
-    value = (db.get_setting("generation") if project_id is None else None) or GenerationSettings().model_dump()
+        value = specific
+    else:
+        value = (db.get_setting("generation") if project_id is None else None) or GenerationSettings().model_dump()
+    if project and not value.get("output_location"):
+        value = value | {"output_location": str(_project_output(project))}
     return value
 
 
@@ -771,7 +861,7 @@ def create_job(request: CreateJob):
     status = detect_integrations(settings)
     if not status["ltx"]["ready"]:
         raise HTTPException(409, "LTX runner or cached Q8 model weights are unavailable. The app will not download model files.")
-    payload = _generation_payload(request.settings)
+    payload = _generation_payload(request.settings, project_id)
     return db.create_job(request.kind, payload, project_id=project_id)
 
 
@@ -874,3 +964,27 @@ def media_file(path: str):
     if media_type is None or not video.is_file():
         raise HTTPException(400, "Only local video files can be previewed")
     return FileResponse(video, media_type=media_type, headers={"Content-Disposition": "inline"})
+
+
+@app.post("/api/outputs/reveal")
+async def reveal_output(request: RevealOutputRequest):
+    if sys.platform != "darwin":
+        raise HTTPException(501, "Reveal in Finder is supported on macOS only")
+    try:
+        path = safe_local_path(request.path, settings, must_exist=True)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not path.is_file() or path.suffix.lower() not in VIDEO_TYPES:
+        raise HTTPException(400, "Choose an existing local video output")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "open", "-R", str(path), stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+    except OSError as exc:
+        raise HTTPException(500, f"Could not reveal this output in Finder: {exc}") from exc
+    if process.returncode:
+        detail = stderr.decode(errors="replace").strip() if stderr else "Finder returned an error"
+        raise HTTPException(500, f"Could not reveal this output in Finder: {detail}")
+    return {"revealed": True, "path": str(path)}

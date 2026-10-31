@@ -1,0 +1,21 @@
+import { useEffect, useState } from 'react'
+import { BookOpen, Save } from 'lucide-react'
+
+type Fields={material:string;silhouettes:string;proportions:string;composition:string;negative_constraints:string}
+const empty:Fields={material:'',silhouettes:'',proportions:'',composition:'',negative_constraints:''}
+export default function StyleBiblePage({projectId,onMessage}:{projectId:string|null;onMessage:(message:string)=>void}){
+ const [fields,setFields]=useState<Fields>(empty),[revision,setRevision]=useState(0),[refs,setRefs]=useState<{id:string;name:string;category:string;path:string}[]>([]),[busy,setBusy]=useState(false)
+ useEffect(()=>{setFields(empty);setRevision(0);setRefs([]);if(!projectId)return;Promise.all([fetch(`/api/projects/${projectId}/style-bible`),fetch(`/api/projects/${projectId}/references`)]).then(async([style,refsResponse])=>{if(style.ok){const data=await style.json();setFields({...empty,...data.fields});setRevision(data.revision)}if(refsResponse.ok)setRefs(await refsResponse.json())}).catch(()=>onMessage('Could not load local style guidance'))},[projectId])
+ async function save(){if(!projectId)return;setBusy(true);try{const response=await fetch(`/api/projects/${projectId}/style-bible`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(fields)});const data=await response.json();if(!response.ok)throw new Error(data.detail??'Could not save style bible');setFields(data.fields);setRevision(data.revision);onMessage('Project style bible saved. Existing shot outputs may now be stale until regenerated.')}catch(e){onMessage(e instanceof Error?e.message:'Could not save style bible')}finally{setBusy(false)}}
+ if(!projectId)return <section className="panel workspace-page"><div className="empty-workspace"><BookOpen size={18}/><b>Select a project first</b><span>Visual style guidance belongs to a project.</span></div></section>
+ return <section className="panel workspace-page"><div className="section-kicker">PROJECT VISUAL GUIDANCE · REVISION {revision}</div><h2>Style and character bible</h2><p className="settings-intro">Write production-specific guidance for material, silhouettes, character proportions, composition, and constraints. Saved text is included in each shot’s exact LTX prompt and shown for review before queueing.</p><div className="settings-form-grid">
+  <label className="setting-field wide">Material and finish<textarea value={fields.material} onChange={e=>setFields({...fields,material:e.target.value})} placeholder="Describe the intended material and surface finish"/></label>
+  <label className="setting-field wide">Silhouettes<textarea value={fields.silhouettes} onChange={e=>setFields({...fields,silhouettes:e.target.value})} placeholder="Describe recognizable silhouette traits"/></label>
+  <label className="setting-field wide">Character proportions<textarea value={fields.proportions} onChange={e=>setFields({...fields,proportions:e.target.value})} placeholder="Describe proportions that should stay consistent"/></label>
+  <label className="setting-field wide">Shot composition<textarea value={fields.composition} onChange={e=>setFields({...fields,composition:e.target.value})} placeholder="Describe framing and composition preferences"/></label>
+  <label className="setting-field wide">Negative constraints<textarea value={fields.negative_constraints} onChange={e=>setFields({...fields,negative_constraints:e.target.value})} placeholder="List visual outcomes to avoid"/></label>
+ </div><button className="button primary" disabled={busy} onClick={()=>void save()}><Save size={14}/> Save style bible</button>
+ <div className="settings-divider"/><h3>Project character references</h3>{refs.filter(ref=>ref.category==='character').length?<ul className="style-reference-list">{refs.filter(ref=>ref.category==='character').map(ref=><li key={ref.id}><b>{ref.name}</b><code>{ref.path}</code></li>)}</ul>:<div className="empty-workspace style-empty"><b>No character references linked</b><span>Add only the approved character images in References. They remain available for shot-specific selection.</span></div>}
+ <div className="model-caution"><span>The installed LTX command supports one image reference per shot. This page does not combine images or claim that both characters are image-conditioned at once; select one linked image for each shot.</span></div>
+ </section>
+}
