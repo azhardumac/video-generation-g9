@@ -10,7 +10,7 @@ Private, local-first AI video studio for generating portrait video with **LTX-2.
 - Project-scoped local reference links and uploads. References are explicitly selected, categorized, validated, editable, and removable without deleting source files.
 - Persisted active-project selection, per-project settings/jobs/assets/storyboards, and genuinely blank storyboards. New projects do not import or link historical media or story content.
 
-Milestone B adds project-specific story text and a revisioned visual style/character bible; editable per-shot framing, prompt review, reference, seed, frame preset, dimensions, frame rate and output path; stale/verified output state; project-scoped queued shot jobs; local composition preview; and safe output reveal. A new project remains empty until the user writes its story and explicitly selects references. LTX supports exactly one conditioning image per shot, and the review panel exposes the full prompt assembled from the saved style bible and shot text.
+Milestone B adds project-specific story text and a revisioned visual style/character bible; editable per-shot framing, prompt review, reference, seed, frame preset, dimensions, frame rate and output path; stale/verified output state; project-scoped queued shot jobs; local composition preview; and safe output reveal. A new project remains empty until the user writes its story and explicitly selects references. The standard storyboard shot form uses one reference image; Issue #21 adds opt-in repeated temporal anchors only for a scene with an approved continuity package. Those guides do not lock identities or placement. The review panel exposes the full prompt assembled from the saved style bible and shot text.
 
 Milestone C removes the legacy standalone Remotion form with hardcoded Scorpion & Frog composition/output defaults; rendering remains available from the reviewed storyboard assembly flow. Generation summaries now reflect active project settings and preset, controls have visible keyboard focus and accessible mobile navigation labels, and a clean-production regression verifies empty initial data plus only the two explicitly selected approved character references. No LTX generation or Remotion render was executed during Issue #11 work.
 
@@ -131,8 +131,11 @@ This workflow creates a new storyboard and keeps any existing woodland draft or 
 5. LTX accepts one conditioning image per shot. Each shot therefore attaches one selected character image, while the plan records both characters when they share a scene. The app does not create or imply a two-image composite. River and water are required by this story; if the existing style bible forbids them, **Build Film Plan** creates a new style-bible revision that permits the river while retaining the previous revision and continuing to forbid reuse of `riverbank-master.png`, old videos, benchmark media, and old storyboard material.
 6. Review all scene and shot cards. Edit prompts or dialogue/captions and choose **Save plan edits**; saving creates a new storyboard revision and invalidates approval. Tick the review statement and choose **Approve Film Plan** to record approval for the exact storyboard and style-bible revisions. Approval alone does not queue work.
 7. **Generate Film** explicitly queues all incomplete shots in order. The existing local worker runs one job at a time. The page shows persisted status, actual job logs, resource warnings, verified output previews, and ffprobe width, height, frame rate, and frame count. Pause prevents the next batch shot from starting (a running shot may finish); cancel stops queued work and requests cancellation of the active child process. Resume continues a paused batch. Selective retry queues only checked failed/cancelled shots; verified completed shots are never duplicated.
-8. When every required shot has a current, verified output, the worker writes a deterministic Remotion composition manifest in `OUTPUT_ROOT/storyboards/<storyboard-id>/composition-manifest.json`. Shot order, crossfades, and available text captions are included. There is no configured voice/audio capability, so the composition has no audio track or placeholder sound.
-9. Choose **Render final film** and confirm the explicit Remotion render prompt. The normal local worker renders the saved manifest and ffprobe verifies the expected canvas, frame rate, and total frame count. A verified final MP4 is playable in the page and **Reveal final MP4 in Finder** opens its output location. No generation or render starts on page load, plan build, approval, or manifest creation.
+8. Open the always-visible **Export / Remotion** navigation item. It reports missing shots, verified source batches, reconciliation state, manifest readiness, and local Remotion availability even when no composition manifest exists. Choose **Reconcile Verified Shots** to select a complete source batch; the app re-runs ffprobe against every clip and links them to the exact approved shot revision. Only matching queued duplicates in paused same-revision batches are cancelled. Completed extra outputs are retained. This recovery operation never starts LTX.
+9. The **Export / Remotion** panel has one progressive primary action. If the manifest is absent, **Prepare composition** writes a deterministic manifest under `OUTPUT_ROOT/storyboards/<storyboard-id>/composition-manifest.json`; this metadata-only operation reuses the clips in saved shot order and does not encode a video. If a complete source batch needs recovery, open **Technical recovery and batch history**, choose **Reconcile Verified Shots**, then return to **Prepare composition**.
+10. When the manifest is ready, **Render final film** asks for confirmation before starting the Remotion render. The page then shows saved render progress and disables repeat render actions. When complete, the ffprobe-verified MP4 is playable in the page and **Watch / Reveal final MP4** opens its output location. A compact status ribbon shows source clips, composition, and final export state. Prior duplicate batches and their logs stay in collapsed history. Generate Film remains idempotent for reconciled clips and will not create another batch when all shots are ready.
+
+For the already generated 12-shot river-crossing film, select its saved plan and open **Export / Remotion**. The ribbon reports 12/12 source clips, composition status, and final render status based on the persisted current shot links and render job. If recovery is needed, use **Technical recovery and batch history** to reconcile; prior cancelled duplicate batches stay collapsed and completed extra clips remain in history. Click **Prepare composition** if the manifest is absent; the status will report 548 frames, 22.83 seconds, 448×768 at 24 fps. Then click **Render final film** and confirm. This uses the 12 existing verified clips; it does not run LTX. After rendering, refreshes and restarts restore progress and the completed MP4 status from SQLite job history.
 
 Generation model, local output location, seed defaults, distilled mode, and low-RAM mode remain project-scoped. The story's content supplies each shot prompt; an unrelated saved prompt is not appended to or substituted for the approved fable. The `Experimental` 193-frame preset retains its visual-drift warning. All created media remains under configured local output paths and outside Git.
 
@@ -229,3 +232,34 @@ cd "$HOME/AI-Video-Studio/apps/ai-video-studio" && ./scripts/start-frontend.sh
 
 Open <http://127.0.0.1:5173>. Setup checks never run LTX inference or a
 Remotion render.
+
+# Visual continuity and review (Issue #21)
+
+Open **Scene continuity** for the selected project to choose the original frog
+and scorpion references, optionally link and separately approve an environment
+plate, and record per-scene layout, framing, expected character count, river
+scale, camera orientation, and continuity notes. Saving creates a new project
+revision and clears approval; approval is explicit. Historical outputs and
+`riverbank-master`-style files are rejected as implicit anchors and require the
+explicit historical-image checkbox before they can be saved as the selected
+environment plate. No files are moved, replaced, or generated by this page.
+
+The Story to Film page shows **ffprobe technical verification** separately from
+creative review. For a current verified shot, compare the playable clip beside
+the project's selected reference images. Approvals require every manual review
+checkbox; rejections require a reason. Creative rejection preserves the clip,
+job status, technical verification, and export availability. A review becomes
+stale if the selected job, storyboard revision, or approved continuity revision
+changes.
+
+The safe one-shot path is to make and review a storyboard, save its shot prompt,
+approve the project continuity revision, then use **Queue this shot only** on a
+single shot. This action confirms the exact shot and never starts/resumes a film
+batch. Independent I2V is the default. Experimental repeated image anchors can
+be selected per scene and are described as temporal guidance only; they do not
+lock identity or guarantee consistent characters. Video extension and IC-LoRA
+controls remain disabled until local audio/memory validation and required cached
+weights are available. See [the installed runtime audit](docs/LOCAL_LTX_2_3_CAPABILITY_AUDIT.md).
+
+Backend tests do not invoke LTX or Remotion. This release does not run GPU
+generation, video continuation, model downloads, or a Remotion render.

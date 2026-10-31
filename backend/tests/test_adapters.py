@@ -49,6 +49,19 @@ def test_ltx_text_to_video_omits_image_anchor(tmp_path):
     assert command[command.index("--frames") + 1] == "49"
 
 
+def test_ltx_command_supports_repeatable_temporal_anchors(tmp_path):
+    payload = _payload(tmp_path) | {"reference_anchors": [
+        {"path": "/refs/frog.png", "frame_index": 0, "strength": 1.0},
+        {"path": "/refs/river-plate.png", "frame_index": 24, "strength": 0.8},
+    ]}
+    command = build_ltx_command("ltx", payload, "/out/job.partial.mp4", "/refs/scorpion.png")
+    positions = [index for index, arg in enumerate(command) if arg == "--image"]
+    assert len(positions) == 2
+    assert command[positions[0] + 1:positions[0] + 4] == ["/refs/frog.png", "0", "1.0"]
+    assert command[positions[1] + 1:positions[1] + 4] == ["/refs/river-plate.png", "24", "0.8"]
+    assert "/refs/scorpion.png" not in command
+
+
 def test_adapter_invokes_exact_i2v_argv_offline_and_renames_verified_output(tmp_path, monkeypatch):
     async def run():
         settings = _settings(tmp_path)

@@ -42,7 +42,11 @@ def build_ltx_command(executable: str, payload: dict, output_path: str, referenc
         "--frames", str(payload["frames"]), "--frame-rate", str(payload["fps"]),
         "--output", output_path,
     ]
-    if reference_image:
+    anchors = payload.get("reference_anchors") or []
+    if anchors:
+        for anchor in anchors:
+            args += ["--image", anchor["path"], str(anchor.get("frame_index", 0)), str(anchor.get("strength", 1.0))]
+    elif reference_image:
         args += ["--image", reference_image, "0", "1.0"]
     if payload.get("seed") is not None:
         args += ["--seed", str(payload["seed"])]
@@ -117,7 +121,11 @@ class LTXAdapter:
         reference = None
         if payload.get("reference_image"):
             reference = safe_local_path(payload["reference_image"], self.settings, must_exist=True)
-        args = build_ltx_command(str(executable), payload, str(partial), str(reference) if reference else None)
+        anchors = []
+        for anchor in payload.get("reference_anchors", []):
+            anchor_path = safe_local_path(anchor["path"], self.settings, must_exist=True)
+            anchors.append(anchor | {"path": str(anchor_path)})
+        args = build_ltx_command(str(executable), payload | {"reference_anchors": anchors}, str(partial), str(reference) if reference else None)
 
         env = os.environ.copy()
         env["HF_HOME"] = str(self.settings.expanded(self.settings.hf_cache))
