@@ -19,8 +19,10 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
+        self._backup_before_migration()
         with self.connect() as db:
-            db.executescript("""
+            db.execute("BEGIN IMMEDIATE")
+            self._execute_schema_script(db, """
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
                     progress INTEGER NOT NULL DEFAULT 0, payload TEXT NOT NULL,
@@ -43,7 +45,10 @@ class Database:
                 );
                 CREATE TABLE IF NOT EXISTS projects (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL,
-                    created_at TEXT NOT NULL, imported_at TEXT NOT NULL
+                    created_at TEXT NOT NULL, imported_at TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '', aspect_ratio TEXT,
+                    frame_rate INTEGER, production_type TEXT NOT NULL DEFAULT '',
+                    workspace_kind TEXT NOT NULL DEFAULT 'imported', archived_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS project_assets (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, category TEXT NOT NULL,
@@ -82,6 +87,18 @@ class Database:
                     job_id TEXT NOT NULL UNIQUE, settings_snapshot TEXT,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS project_references (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL,
+                    category TEXT NOT NULL CHECK(category IN ('character','scene','style','other')),
+                    path TEXT NOT NULL, source_kind TEXT NOT NULL CHECK(source_kind IN ('linked','uploaded')),
+                    notes TEXT NOT NULL DEFAULT '', mime_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL, content_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, path), UNIQUE(project_id, content_hash)
+                );
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+                );
             """)
             shot_columns = {row[1] for row in db.execute("PRAGMA table_info(storyboard_shots)")}
             if "scene_id" not in shot_columns:
@@ -89,16 +106,86 @@ class Database:
             shot_job_columns = {row[1] for row in db.execute("PRAGMA table_info(shot_jobs)")}
             if "settings_snapshot" not in shot_job_columns:
                 db.execute("ALTER TABLE shot_jobs ADD COLUMN settings_snapshot TEXT")
+            project_columns = {row[1] for row in db.execute("PRAGMA table_info(projects)")}
+            for column, declaration in (
+                ("description", "TEXT NOT NULL DEFAULT ''"),
+                ("aspect_ratio", "TEXT"),
+                ("frame_rate", "INTEGER"),
+                ("production_type", "TEXT NOT NULL DEFAULT ''"),
+                ("workspace_kind", "TEXT NOT NULL DEFAULT 'imported'"),
+                ("archived_at", "TEXT"),
+            ):
+                if column not in project_columns:
+                    db.execute(f"ALTER TABLE projects ADD COLUMN {column} {declaration}")
             existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             for column, declaration in (
                 ("exit_code", "INTEGER"),
                 ("elapsed_seconds", "REAL"),
                 ("verification_metadata", "TEXT"),
                 ("partial_output_path", "TEXT"),
+                ("project_id", "TEXT"),
             ):
                 if column not in existing:
                     db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {declaration}")
-            db.execute("UPDATE jobs SET status='queued', updated_at=? WHERE status='running'", (now_iso(),))
+            # Recover legacy job scope from its shot/storyboard when available.
+            db.execute("UPDATE jobs SET project_id=(SELECT b.project_id FROM shot_jobs sj "
+                       "JOIN storyboard_shots s ON s.id=sj.shot_id JOIN storyboards b ON b.id=s.storyboard_id "
+                       "WHERE sj.job_id=jobs.id LIMIT 1) WHERE project_id IS NULL")
+            for job in db.execute("SELECT id,payload FROM jobs WHERE kind='render' AND project_id IS NULL"):
+                try:
+                    payload = json.loads(job["payload"])
+                    storyboard_id = payload.get("props", {}).get("manifest", {}).get("storyboard_id")
+                except (TypeError, json.JSONDecodeError):
+                    storyboard_id = None
+                if storyboard_id:
+                    story = db.execute("SELECT project_id FROM storyboards WHERE id=?", (storyboard_id,)).fetchone()
+                    if story:
+                        db.execute("UPDATE jobs SET project_id=? WHERE id=?", (story["project_id"], job["id"]))
+            legacy_projects = list(db.execute("SELECT id FROM projects WHERE archived_at IS NULL"))
+            if len(legacy_projects) == 1:
+                # This app's pre-project-lifecycle build supported only one project.
+                db.execute("UPDATE jobs SET project_id=? WHERE project_id IS NULL", (legacy_projects[0]["id"],))
+            interrupted = list(db.execute("SELECT id FROM jobs WHERE status='running'"))
+            for job in interrupted:
+                message = "Application restarted while this job was running; review and retry manually."
+                db.execute("UPDATE jobs SET status='failed',error=COALESCE(error,?),updated_at=? WHERE id=?",
+                           (message, now_iso(), job["id"]))
+                db.execute("INSERT INTO events(job_id,time,level,message) VALUES(?,?,?,?)",
+                           (job["id"], now_iso(), "warning", message))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?)", (now_iso(),))
+
+    @staticmethod
+    def _execute_schema_script(db: sqlite3.Connection, script: str):
+        """Execute schema statements without sqlite3.executescript's implicit commits."""
+        statement = ""
+        for line in script.splitlines():
+            statement += line + "\n"
+            if sqlite3.complete_statement(statement):
+                sql = statement.strip()
+                if sql:
+                    db.execute(sql)
+                statement = ""
+        if statement.strip():
+            raise sqlite3.OperationalError("Incomplete database schema migration statement")
+
+    def _backup_before_migration(self):
+        if not self.path.is_file() or self.path.stat().st_size == 0:
+            return
+        try:
+            with sqlite3.connect(f"file:{self.path}?mode=ro", uri=True) as source:
+                has_migrations = source.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+                ).fetchone()
+                if has_migrations:
+                    current = source.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] or 0
+                    if current >= 1:
+                        return
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                backup = self.path.with_name(f"{self.path.name}.pre-migration-{stamp}.bak")
+                with sqlite3.connect(backup) as destination:
+                    source.backup(destination)
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"Could not create a pre-migration database backup: {exc}") from exc
 
     @contextmanager
     def connect(self):
@@ -114,12 +201,12 @@ class Database:
         finally:
             db.close()
 
-    def create_job(self, kind: str, payload: dict) -> dict:
+    def create_job(self, kind: str, payload: dict, project_id: str | None = None) -> dict:
         job_id, now = str(uuid4()), now_iso()
         payload["job_id"] = job_id
         with self.lock, self.connect() as db:
-            db.execute("INSERT INTO jobs(id,kind,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                       (job_id, kind, "queued", json.dumps(payload), now, now))
+            db.execute("INSERT INTO jobs(id,kind,status,payload,project_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                       (job_id, kind, "queued", json.dumps(payload), project_id, now, now))
             db.execute("INSERT INTO events(job_id,time,level,message) VALUES(?,?,?,?)",
                        (job_id, now, "info", "Job added to local queue"))
         return self.get_job(job_id)
@@ -146,9 +233,13 @@ class Database:
         with self.connect() as db:
             return self._job(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
-    def list_jobs(self, limit: int = 100):
+    def list_jobs(self, limit: int = 100, project_id: str | None = None):
         with self.connect() as db:
-            return [self._job(row) for row in db.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,))]
+            if project_id is None:
+                rows = db.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,))
+            else:
+                rows = db.execute("SELECT * FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT ?", (project_id, limit))
+            return [self._job(row) for row in rows]
 
     def update_job(self, job_id: str, **values):
         values["updated_at"] = now_iso()
@@ -233,24 +324,120 @@ class Database:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM benchmark_history ORDER BY id DESC LIMIT 200")]
 
-    def import_project(self, project_id: str, name: str, root: str, assets: list[dict]):
+    def create_project(self, project: dict):
         now = now_iso()
         with self.lock, self.connect() as db:
-            db.execute("INSERT INTO projects(id,name,root,created_at,imported_at) VALUES(?,?,?,?,?) "
-                       "ON CONFLICT(id) DO UPDATE SET name=excluded.name,root=excluded.root,imported_at=excluded.imported_at",
-                       (project_id, name, root, now, now))
-            db.execute("DELETE FROM project_assets WHERE project_id=?", (project_id,))
-            db.executemany("INSERT INTO project_assets(id,project_id,category,relative_path,size_bytes,modified_at,mime_type) VALUES(?,?,?,?,?,?,?)",
-                           [(a["id"], project_id, a["category"], a["relative_path"], a["size_bytes"], a["modified_at"], a["mime_type"]) for a in assets])
+            db.execute("INSERT INTO projects(id,name,root,created_at,imported_at,description,aspect_ratio,frame_rate,production_type,workspace_kind) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,'created')",
+                       (project["id"], project["name"], project["root"], now, now, project.get("description", ""),
+                        project["aspect_ratio"], project["frame_rate"], project["production_type"]))
+        return self.get_project(project["id"])
 
-    def list_projects(self):
+    def import_project(self, project_id: str, name: str, root: str, assets: list[dict], *, description: str = ""):
+        now = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("INSERT INTO projects(id,name,root,created_at,imported_at,description,workspace_kind) VALUES(?,?,?,?,?,?,'imported') "
+                       "ON CONFLICT(id) DO UPDATE SET name=excluded.name,root=excluded.root,imported_at=excluded.imported_at "
+                       "WHERE projects.workspace_kind='imported' AND projects.archived_at IS NULL",
+                       (project_id, name, root, now, now, description))
+            for asset in assets:
+                existing = db.execute("SELECT id FROM project_assets WHERE project_id=? AND relative_path=?",
+                                      (project_id, asset["relative_path"])).fetchone()
+                # Keep the identifier already referenced by legacy rows; namespace new IDs by project.
+                asset_id = existing["id"] if existing else asset.get("id", str(uuid4()))
+                collision = db.execute("SELECT project_id FROM project_assets WHERE id=?", (asset_id,)).fetchone()
+                if collision and collision["project_id"] != project_id:
+                    asset_id = str(uuid4())
+                db.execute("INSERT INTO project_assets(id,project_id,category,relative_path,size_bytes,modified_at,mime_type) "
+                           "VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET category=excluded.category,"
+                           "size_bytes=excluded.size_bytes,modified_at=excluded.modified_at,mime_type=excluded.mime_type "
+                           "WHERE project_assets.project_id=excluded.project_id",
+                           (asset_id, project_id, asset["category"], asset["relative_path"], asset["size_bytes"],
+                            asset["modified_at"], asset["mime_type"]))
+        return self.get_project(project_id)
+
+    def update_project(self, project_id: str, **values):
+        allowed = {"name", "description", "aspect_ratio", "frame_rate", "production_type"}
+        fields = {key: value for key, value in values.items() if key in allowed}
+        if not fields:
+            return self.get_project(project_id)
+        with self.lock, self.connect() as db:
+            cursor = db.execute(f"UPDATE projects SET {', '.join(key+'=?' for key in fields)} WHERE id=? AND archived_at IS NULL",
+                                (*fields.values(), project_id))
+            if cursor.rowcount != 1:
+                raise KeyError("Project not found")
+        return self.get_project(project_id)
+
+    def archive_project(self, project_id: str):
+        with self.lock, self.connect() as db:
+            active = db.execute("SELECT 1 FROM jobs WHERE project_id=? AND status IN ('queued','running') LIMIT 1", (project_id,)).fetchone()
+            if active:
+                raise RuntimeError("Cancel active project jobs before archiving this project")
+            cursor = db.execute("UPDATE projects SET archived_at=? WHERE id=? AND archived_at IS NULL", (now_iso(), project_id))
+            if cursor.rowcount != 1:
+                raise KeyError("Project not found")
+            db.execute("UPDATE settings SET value='null',updated_at=? WHERE key='active_project_id' AND value=?",
+                       (now_iso(), json.dumps(project_id)))
+
+    def restore_project(self, project_id: str):
+        with self.lock, self.connect() as db:
+            cursor = db.execute("UPDATE projects SET archived_at=NULL WHERE id=? AND archived_at IS NOT NULL", (project_id,))
+            if cursor.rowcount != 1:
+                raise KeyError("Archived project not found")
+        return self.get_project(project_id)
+
+    def list_projects(self, include_archived: bool = False):
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM projects ORDER BY imported_at DESC")]
+            where = "" if include_archived else "WHERE p.archived_at IS NULL"
+            return [dict(row) for row in db.execute(
+                f"SELECT p.*,(SELECT COUNT(*) FROM storyboard_shots s JOIN storyboards b ON b.id=s.storyboard_id "
+                f"WHERE b.project_id=p.id AND b.archived_at IS NULL AND s.deleted_at IS NULL) AS shot_count,"
+                f"(SELECT COUNT(*) FROM project_references r WHERE r.project_id=p.id) AS reference_count,"
+                f"(SELECT COUNT(*) FROM jobs j WHERE j.project_id=p.id) AS job_count FROM projects p {where} ORDER BY p.imported_at DESC,p.id")]
 
     def get_project(self, project_id: str):
         with self.connect() as db:
             row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
             return dict(row) if row else None
+
+    def project_references(self, project_id: str):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM project_references WHERE project_id=? ORDER BY category,name COLLATE NOCASE,id", (project_id,))]
+
+    def get_project_reference(self, project_id: str, reference_id: str):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM project_references WHERE project_id=? AND id=?", (project_id, reference_id)).fetchone()
+            return dict(row) if row else None
+
+    def add_project_reference(self, reference: dict):
+        now = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("INSERT INTO project_references(id,project_id,name,category,path,source_kind,notes,mime_type,size_bytes,content_hash,created_at,updated_at) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (reference["id"], reference["project_id"], reference["name"], reference["category"], reference["path"],
+                        reference["source_kind"], reference.get("notes", ""), reference["mime_type"], reference["size_bytes"],
+                        reference["content_hash"], now, now))
+        return self.get_project_reference(reference["project_id"], reference["id"])
+
+    def update_project_reference(self, project_id: str, reference_id: str, **values):
+        allowed = {"name", "category", "path", "source_kind", "notes", "mime_type", "size_bytes", "content_hash"}
+        fields = {key: value for key, value in values.items() if key in allowed}
+        if not fields:
+            return self.get_project_reference(project_id, reference_id)
+        fields["updated_at"] = now_iso()
+        with self.lock, self.connect() as db:
+            cursor = db.execute(f"UPDATE project_references SET {', '.join(key+'=?' for key in fields)} WHERE project_id=? AND id=?",
+                                (*fields.values(), project_id, reference_id))
+            if cursor.rowcount != 1:
+                raise KeyError("Project reference not found")
+        return self.get_project_reference(project_id, reference_id)
+
+    def remove_project_reference(self, project_id: str, reference_id: str):
+        with self.lock, self.connect() as db:
+            cursor = db.execute("DELETE FROM project_references WHERE project_id=? AND id=?", (project_id, reference_id))
+            if cursor.rowcount != 1:
+                raise KeyError("Project reference not found")
 
     def project_assets(self, project_id: str):
         with self.connect() as db:
@@ -292,9 +479,12 @@ class Database:
             self._story_snapshot(db, storyboard_id, 1, title, timestamp)
         return self.get_storyboard(storyboard_id)
 
-    def list_storyboards(self):
+    def list_storyboards(self, project_id: str | None = None):
         with self.connect() as db:
-            ids = [row[0] for row in db.execute("SELECT id FROM storyboards WHERE archived_at IS NULL ORDER BY updated_at DESC,id")]
+            if project_id is None:
+                ids = [row[0] for row in db.execute("SELECT id FROM storyboards WHERE archived_at IS NULL ORDER BY updated_at DESC,id")]
+            else:
+                ids = [row[0] for row in db.execute("SELECT id FROM storyboards WHERE project_id=? AND archived_at IS NULL ORDER BY updated_at DESC,id", (project_id,))]
         return [self.get_storyboard(storyboard_id, include_events=False) for storyboard_id in ids]
 
     def get_storyboard(self, storyboard_id: str, *, include_events: bool = True):
@@ -442,7 +632,7 @@ class Database:
         job_id, timestamp = str(uuid4()), now_iso()
         payload["job_id"] = job_id
         with self.lock, self.connect() as db:
-            shot = db.execute("SELECT 1 FROM storyboard_shots s JOIN storyboards b ON b.id=s.storyboard_id "
+            shot = db.execute("SELECT b.project_id FROM storyboard_shots s JOIN storyboards b ON b.id=s.storyboard_id "
                               "WHERE s.id=? AND s.storyboard_id=? AND s.deleted_at IS NULL AND b.archived_at IS NULL",
                               (shot_id, storyboard_id)).fetchone()
             if not shot:
@@ -450,8 +640,9 @@ class Database:
             active = db.execute("SELECT 1 FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? AND j.status IN ('queued','running') LIMIT 1", (shot_id,)).fetchone()
             if active:
                 raise RuntimeError("This shot already has a queued or running job")
-            db.execute("INSERT INTO jobs(id,kind,status,progress,payload,created_at,updated_at) VALUES(?, 'generation','queued',0,?,?,?)",
-                       (job_id, json.dumps(payload), timestamp, timestamp))
+            project_id = shot["project_id"]
+            db.execute("INSERT INTO jobs(id,kind,status,progress,payload,project_id,created_at,updated_at) VALUES(?, 'generation','queued',0,?,?,?,?)",
+                       (job_id, json.dumps(payload), project_id, timestamp, timestamp))
             db.execute("INSERT INTO events(job_id,time,level,message) VALUES(?,?,?,?)", (job_id, timestamp, "info", "Shot generation added to local queue"))
             snapshot = self.generation_settings_snapshot(payload)
             db.execute("INSERT INTO shot_jobs(shot_id,job_id,settings_snapshot,created_at) VALUES(?,?,?,?)",
@@ -462,7 +653,7 @@ class Database:
     def link_existing_shot_job(self, storyboard_id: str, shot_id: str, job_id: str):
         timestamp = now_iso()
         with self.lock, self.connect() as db:
-            shot = db.execute("SELECT s.* FROM storyboard_shots s JOIN storyboards b ON b.id=s.storyboard_id "
+            shot = db.execute("SELECT s.*,b.project_id FROM storyboard_shots s JOIN storyboards b ON b.id=s.storyboard_id "
                               "WHERE s.id=? AND s.storyboard_id=? AND s.deleted_at IS NULL AND b.archived_at IS NULL",
                               (shot_id, storyboard_id)).fetchone()
             if not shot:
@@ -473,6 +664,8 @@ class Database:
             job = self._job(job_row)
             if job["kind"] != "generation" or job["status"] != "completed":
                 raise RuntimeError("Only a completed generation job can be linked as an existing shot output")
+            if job.get("project_id") != shot["project_id"]:
+                raise RuntimeError("Generation job belongs to another project or has no project assignment")
             if db.execute("SELECT 1 FROM shot_jobs WHERE job_id=?", (job_id,)).fetchone():
                 raise RuntimeError("This generation job is already linked to a storyboard shot")
             snapshot = self.generation_settings_snapshot(job["payload"])
