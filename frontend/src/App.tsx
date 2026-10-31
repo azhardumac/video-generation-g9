@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
-import { Aperture, ArrowUpRight, BookOpen, Check, ChevronDown, Command, Film, FolderOpen, Gauge, HardDrive, History, Image, LayoutDashboard, ListVideo, LoaderCircle, Plus, Settings, SlidersHorizontal, Sparkles, WandSparkles, X, AlertTriangle } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { Aperture, ArrowUpRight, BookOpen, Check, ChevronDown, Command, Download, Film, FolderOpen, Gauge, HardDrive, History, Image, LayoutDashboard, ListVideo, LoaderCircle, Plus, Settings, SlidersHorizontal, Sparkles, WandSparkles, X, AlertTriangle } from 'lucide-react'
 import StoryboardPage from './StoryboardPage'
 import ProjectsPage, { type Project } from './ProjectsPage'
 import ProjectReferencesPage from './ProjectReferencesPage'
 import StyleBiblePage from './StyleBiblePage'
 import FilmPlanPage from './FilmPlanPage'
+import SetupPage from './SetupPage'
 
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
 type Asset = { id: string; category: string; relative_path: string; path: string; name: string; size_bytes: number; mime_type: string }
@@ -15,7 +16,7 @@ type Resources = { disk_free_bytes: number; memory: { total_bytes: number | null
 const nav = [
   { group: 'STUDIO', items: [['Overview', LayoutDashboard], ['Projects', FolderOpen], ['Storyboard', ListVideo], ['Story to Film', Film], ['References', Image], ['Style bible', BookOpen]] },
   { group: 'PRODUCTION', items: [['Generate video', WandSparkles], ['Job queue', Gauge], ['History & logs', History]] },
-  { group: 'WORKSPACE', items: [['Settings', Settings]] },
+  { group: 'WORKSPACE', items: [['Setup', Download], ['Settings', Settings]] },
 ] as const
 const dateLabel = new Intl.DateTimeFormat('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }).format(new Date()).toUpperCase()
 const jobTitle = (job:Job) => job.payload.job_label || (job.kind === 'render' ? `Remotion render · ${job.payload.composition_id || 'storyboard composition'}` : job.payload.prompt || 'Untitled generation')
@@ -40,6 +41,7 @@ export default function App() {
   const [connected, setConnected] = useState(false)
   const [loading, setLoading] = useState(false)
   const [unsavedStoryboard, setUnsavedStoryboard] = useState(false)
+  const setupInitialCheck = useRef(false)
 
   const refresh = async () => {
     try {
@@ -67,6 +69,14 @@ export default function App() {
   useEffect(() => {
     const refreshResources=async()=>{try{const response=await fetch('/api/resources');if(response.ok)setResources(await response.json())}catch{}}
     void refresh();void refreshResources()
+    void fetch('/api/setup/status').then(async response=>{
+      if(!response.ok||setupInitialCheck.current)return
+      setupInitialCheck.current=true
+      const setup=await response.json()
+      let dismissed=false
+      try{dismissed=localStorage.getItem('ai-video-studio-setup-dismissed')==='1'}catch{}
+      if(!setup.ready&&!dismissed)setActive('Setup')
+    }).catch(()=>{})
     const timer=window.setInterval(refresh,2500);const resourceTimer=window.setInterval(refreshResources,10000)
     return()=>{clearInterval(timer);clearInterval(resourceTimer)}
   }, [])
@@ -139,6 +149,7 @@ export default function App() {
         <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> {dateLabel}</div><h1>{active === 'Overview' ? activeProject?.name??'Local video studio' : active}</h1><p className="subtitle">{active === 'Overview' ? activeProject?.description||'Create or select a project to start planning.' : 'A local-first production workspace.'}</p></div>{activeProject&&<button className="button primary" onClick={() => navigate('Generate video')}><Plus size={16}/> New generation</button>}</div>
         {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={14}/></button></div>}
         {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onSaved={()=>activeProject?loadProjectSettings(activeProject.id):Promise.resolve()} onRecheck={recheckLocalStatus} onMessage={setNotice} integrations={integrations} resources={resources} projectId={activeProject?.id??null}/>}
+        {active === 'Setup' && <SetupPage onMessage={setNotice} onContinue={()=>setActive('Overview')}/>}
         {active === 'Job queue' && <JobsPage title="Local job queue" jobs={jobs.filter(j=>j.status==='queued'||j.status==='running'||j.status==='failed')} onChanged={refresh} onMessage={setNotice}/>}
         {active === 'History & logs' && <JobsPage title="Generation history" jobs={jobs.filter(j=>j.status==='completed'||j.status==='failed'||j.status==='cancelled')} onChanged={refresh} onMessage={setNotice}/>}
         {active === 'Projects' && <ProjectsPage projects={projects} activeId={activeProject?.id??null} onChanged={refreshProjects} onSelect={selectProject} onMessage={setNotice}/>}
@@ -153,7 +164,7 @@ export default function App() {
             <label className="field-label" htmlFor="prompt">YOUR PROMPT <span>Be descriptive</span></label><div className="prompt-wrap"><textarea id="prompt" maxLength={4000} value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();void createJob()}}} placeholder="Write a prompt for this project…"/><div className="prompt-footer"><span><Command size={12}/> Use <kbd>⌘</kbd><kbd>↵</kbd> to generate</span><span>{prompt.length} / 4,000</span></div></div>
             <div className="generation-controls"><div className="control-block"><label className="field-label">DURATION PRESET</label><div className="preset-row">{presets.filter(p=>p.name!=='Experimental').map(p=><button key={p.name} className={`preset-chip ${preset===p.name?'chosen':''}`} onClick={()=>selectPreset(p.name)}><span>{p.name}</span><small>{p.frames}f · {p.duration.toFixed(2)}s</small></button>)}</div></div><div className="control-block model-block"><label className="field-label">VALIDATED MODEL PROFILE <span>LOCAL · MLX · Q8</span></label><div className="model-select"><span className="model-glyph"><Aperture size={16}/></span><span><b>{integrations?.ltx.model||'LTX-2.3 Q8'}</b><small>{integrations?.ltx.ready?'Detected local profile':'Local profile not detected'}</small></span></div></div></div>
             <div className="generation-fields"><label className="setting-field">Reference image<select value={referenceImage} onChange={e=>setReferenceImage(e.target.value)}><option value="">No reference · text to video</option>{assets.filter(asset=>asset.mime_type.startsWith('image/')).map(asset=><option key={asset.id} value={asset.path}>{asset.relative_path}</option>)}</select></label><label className="setting-field">Seed<input type="number" min="0" placeholder="Random seed" value={seed} onChange={e=>setSeed(e.target.value)}/></label><label className="setting-field">Output path<input value={outputPath} onChange={e=>setOutputPath(e.target.value)} placeholder="Leave blank for configured output root"/></label></div>
-            {!integrations?.ltx.ready&&<div className="model-caution"><AlertTriangle size={13}/><span>Q8 model files are not detected. Generation stays disabled; no model download will be attempted.</span></div>}
+            {!integrations?.ltx.ready&&<div className="model-caution"><AlertTriangle size={13}/><span>Q8 model files are not detected. Generation stays disabled. Open Setup to explicitly install the local model cache.</span></div>}
             {Boolean(resources?.warnings?.length)&&<div className="model-caution preflight-warning"><AlertTriangle size={13}/><span>Preflight safeguard: {resources?.warnings.join(' ')}</span></div>}
             <div className="generation-bottom"><span className="settings-summary"><SlidersHorizontal size={14}/> {generationProfile.model} · {generationProfile.width} × {generationProfile.height} <i/> {presets.find(p=>p.name===preset)?.frames??'—'} frames at {presets.find(p=>p.name===preset)?.fps??generationProfile.fps} fps <i/> {generationProfile.distilled_two_stage?'Distilled two-stage':'Single-stage'} <i/> {generationProfile.audio?'Audio on':'No audio'}</span><button className="button generate-button" title={!activeProject?'Select a project first':!integrations?.ltx.ready?'LTX runner and cached model weights are required':''} disabled={loading || !connected || !activeProject || !prompt.trim() || !integrations?.ltx.ready} onClick={createJob}>{loading ? <LoaderCircle className="spin" size={16}/> : <WandSparkles size={16}/>} Generate video <ArrowUpRight size={15}/></button></div>
           </section>
@@ -207,7 +218,7 @@ function SettingsPage({ presets, selected, onSelect, onPresetsChanged, onSaved, 
   async function recheck(){setRechecking(true);try{await onRecheck();onMessage('Local integrations and resource safeguards rechecked')}catch(error){onMessage(error instanceof Error?error.message:'Could not recheck local integrations')}finally{setRechecking(false)}}
   return <section className="panel settings-page"><div className="settings-presets-heading"><div><div className="section-kicker">LOCAL CONNECTIONS</div><h2>Integration status</h2></div><button className="button secondary" onClick={()=>void recheck()} disabled={rechecking}>{rechecking?'Checking…':'Recheck local status'}</button></div><p className="settings-intro">Checks local installations, cache presence, ffprobe, and resource safeguards. Checks are read-only; no model is downloaded and no generation starts.</p>
     <div className="integration-grid">
-      <IntegrationCard title="LTX-2.3 MLX · Q8" ready={Boolean(integrations?.ltx.ready)} detail={integrations?.ltx.weights_cached ? 'Runner and cached Q8 weights available' : integrations?.ltx.cache_available ? 'Hugging Face cache exists; expected Q8 weights missing. Check LTX_EXECUTABLE and HF_CACHE in .env.' : 'Hugging Face cache missing. Check HF_CACHE in .env; the app will not download weights.'} path={integrations?.ltx.root ?? 'Checking…'} secondaryPath={integrations?.ltx.hf_home} warning={Boolean(integrations && !integrations.ltx.weights_cached)}/>
+      <IntegrationCard title="LTX-2.3 MLX · Q8" ready={Boolean(integrations?.ltx.ready)} detail={integrations?.ltx.weights_cached ? 'Runner and cached Q8 weights available' : integrations?.ltx.cache_available ? 'Hugging Face cache exists; expected Q8 weights missing. Use Setup for an explicit install.' : 'Hugging Face cache missing. Use Setup to opt in to a download; startup and generation never fetch weights.'} path={integrations?.ltx.root ?? 'Checking…'} secondaryPath={integrations?.ltx.hf_home} warning={Boolean(integrations && !integrations.ltx.weights_cached)}/>
       <IntegrationCard title="Remotion Studio" ready={Boolean(integrations?.remotion.ready)} detail={integrations?.remotion.version ? `CLI ${integrations.remotion.version}` : integrations?.remotion.cli_available ? 'CLI available' : 'CLI missing. Check REMOTION_STUDIO and REMOTION_EXECUTABLE in .env.'} path={integrations?.remotion.root ?? 'Checking…'}/>
       <IntegrationCard title="Active project" ready={Boolean(projectId)} detail={projectId?'Project selected':'Select or create a project'} path={projectId??'No active project'}/>
       <IntegrationCard title="ffprobe" ready={Boolean(integrations?.ffprobe.available)} detail={integrations?.ffprobe.available ? 'Video verification available' : 'ffprobe not found. Install FFmpeg locally or set FFPROBE_EXECUTABLE in .env.'} path={integrations?.ffprobe.path ?? 'Not detected'}/>

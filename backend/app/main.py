@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from hashlib import sha256
+import ipaddress
 import os
 from pathlib import Path
 import re
@@ -26,6 +27,7 @@ from .presets import BUILTIN_PRESETS, GenerationSettings, Preset
 from .projects import IMAGE_TYPES, VIDEO_TYPES, scan_project
 from .resources import ResourcePreflight, resource_snapshot
 from .storyboards import ShotInput, StoryboardUpdate, build_composition_manifest
+from .setup_service import inspect_setup, setup_manager
 from .worker import LocalWorker
 
 
@@ -299,6 +301,81 @@ def _reference_storage_root(project: dict, category: str) -> Path:
 @app.get("/api/health")
 def health():
     return {"status": "ok", "mode": "local", "worker": "single"}
+
+
+class SetupInstallRequest(BaseModel):
+    download_model: bool = False
+    confirm_model_download: bool = False
+
+
+def _require_setup_loopback(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    try:
+        local = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        local = False
+    if not local:
+        raise HTTPException(403, "Setup installation is available only from a loopback client")
+
+
+@app.get("/api/setup/status")
+def setup_status(request: Request):
+    _require_setup_loopback(request)
+    result = inspect_setup(settings)
+    running = setup_manager.snapshot()
+    result.update(running)
+    stage = str(running.get("installing") or "").casefold()
+    stage_map = (("homebrew", "homebrew"), ("git", "git"), ("gh", "gh"), ("ffmpeg", "ffmpeg"),
+                 ("ffprobe", "ffprobe"), ("python@3.11", "python_homebrew"), ("python", "python"), ("node", "node"), ("npm", "npm"),
+                 ("uv", "uv"), ("ltx_source", "ltx_source"), ("ltx_dependencies", "ltx_runner"),
+                 ("ltx_runner", "ltx_runner"), ("backend", "backend"), ("frontend", "frontend"),
+                 ("remotion", "remotion"), ("model", "model"), ("env", "env"), ("projects", "projects"),
+                 ("outputs", "outputs"))
+    # Generic stage words follow the more specific phase names to avoid
+    # flagging the wrong component (e.g. ltx_source contains 'ltx').
+    component_id = next((target for token, target in stage_map if token in stage), None)
+    if component_id:
+        for item in result["components"]:
+            if item["id"] == component_id:
+                item["status"] = "downloading"
+                if component_id == "model" and result.get("download_progress_percent") is not None:
+                    item["detail"] = f"Downloading {result['download_progress_percent']:.0f}% · resumable cache files are retained."
+                else:
+                    item["detail"] = running.get("installing") or item["detail"]
+                break
+    result["ready"] = all(item["status"] == "installed" for item in result["components"])
+    result["minimum_non_model_free_bytes"] = 12 * 1024**3
+    result["disk_sufficient_for_bootstrap"] = result["disk_free_bytes"] >= result["minimum_non_model_free_bytes"]
+    return result
+
+
+@app.post("/api/setup/install", status_code=202)
+def install_setup(request: Request, payload: SetupInstallRequest):
+    _require_setup_loopback(request)
+    if payload.download_model and not payload.confirm_model_download:
+        raise HTTPException(422, "Model download requires explicit confirmation after reviewing the large-download notice")
+    snapshot = inspect_setup(settings)
+    if snapshot["disk_free_bytes"] < 12 * 1024**3:
+        raise HTTPException(409, "At least 12 GiB free disk space is recommended for installing the app dependencies")
+    app_root = Path(__file__).resolve().parents[2]
+    try:
+        state = setup_manager.start(app_root, settings, payload.download_model, payload.confirm_model_download)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except (OSError, FileNotFoundError) as exc:
+        raise HTTPException(500, f"Could not start local bootstrap: {exc}") from exc
+    return {"install_state": state["install_state"], "message": "Setup started. Missing components are installed in order; existing local data and .env are preserved."}
+
+
+@app.post("/api/setup/cancel")
+def cancel_setup(request: Request):
+    _require_setup_loopback(request)
+    try:
+        return setup_manager.cancel()
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/integrations")
