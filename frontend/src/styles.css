@@ -170,6 +170,25 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .film-clip-preview{display:block;width:min(100%,300px);max-height:520px;aspect-ratio:7/12;object-fit:contain;margin:14px auto;background:#08090b;border-radius:9px}
 .final-film-preview{width:min(100%,448px)}
 .render-button{margin-top:8px}
+@media(max-width:700px){.film-batch-panel,.film-render-panel{padding:12px}.film-batch-shot-head{align-items:flex-start}.film-clip-preview{max-height:70vh}}
+
+/* First-run dependency setup */
+.setup-page{min-width:0;overflow:hidden}
+.setup-page .panel-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
+.setup-page .panel-heading h2{margin:5px 0}.setup-page .panel-heading p{max-width:760px;color:var(--muted,#9598a6);font-size:13px;line-height:1.55}
+.setup-safety,.setup-disk-check,.setup-complete{display:flex;align-items:flex-start;gap:10px;margin:12px 0;padding:12px 14px;border:1px solid var(--line,#282b36);border-radius:10px;background:rgba(255,255,255,.025);font-size:12px;line-height:1.5;color:#c5c7d1}
+.setup-safety svg,.setup-complete svg{flex:none;color:#90c9a1}
+.setup-disk-check{justify-content:space-between;flex-wrap:wrap}.setup-disk-check span{color:var(--muted,#9598a6)}.setup-disk-check.fail{border-color:#693c45;color:#e4a3ad}.setup-disk-check.pass{border-color:#315b45}
+.setup-component-list{display:grid;gap:8px;margin:16px 0}
+.setup-component{display:grid;grid-template-columns:26px minmax(0,1fr) auto;align-items:start;gap:10px;padding:12px;border:1px solid var(--line,#282b36);border-radius:10px;background:rgba(255,255,255,.018);min-width:0}
+.setup-status-mark{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;background:#1b1c24;color:#9b9eaa}.setup-status-mark.installed{color:#90c9a1;background:rgba(65,139,91,.12)}.setup-status-mark.incompatible{color:#e3a8a1;background:rgba(170,70,55,.12)}.setup-status-mark.downloading{color:#baa1ff;background:rgba(141,109,255,.14)}
+.setup-component-copy{display:grid;gap:4px;min-width:0}.setup-component-copy b{font-size:12px}.setup-component-copy small{color:var(--muted,#9598a6);font-size:11px;line-height:1.5}.setup-component-copy code{overflow-wrap:anywhere;color:#787b88;font-size:9px}
+.setup-status-label{padding:3px 7px;border-radius:6px;background:rgba(255,255,255,.045);color:#9ea0ac;font-size:9px;text-transform:uppercase;letter-spacing:.06em}.setup-status-label.installed{color:#90c9a1}.setup-status-label.incompatible{color:#e3a8a1}.setup-status-label.downloading{color:#baa1ff}
+.setup-model-consent{margin:16px 0;padding:14px;border:1px solid #655135;border-radius:10px;background:rgba(180,132,56,.07)}.setup-model-consent label{display:flex;gap:9px;align-items:center;font-size:12px;font-weight:600}.setup-model-consent p{margin:8px 0 0 23px;color:#c0b18d;font-size:11px;line-height:1.55}.setup-model-consent code{color:#e4d1a0}
+.setup-progress{margin:14px 0;padding:12px;border:1px solid #40334f;border-radius:10px;background:#111017}.setup-progress-heading{display:flex;justify-content:space-between;gap:12px;color:#c2b4e9;font-size:11px}.setup-progress progress{display:block;width:100%;height:8px;margin:10px 0;accent-color:#9d82f2}.setup-log{max-height:270px;overflow:auto;margin-top:9px;padding:10px;border-radius:8px;background:#090a0e;color:#aeb0bc;font:10px/1.55 'DM Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere}.setup-log-details{margin:12px 0;color:var(--muted,#9598a6);font-size:11px}.setup-log-details summary{cursor:pointer}.setup-log-details .setup-log{max-height:220px}
+.setup-actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:16px 0}.setup-complete{border-color:#315b45;color:#b8d7c0}
+@media(max-width:650px){.setup-component{grid-template-columns:24px minmax(0,1fr)}.setup-status-label{grid-column:2;justify-self:start}.setup-disk-check{align-items:flex-start;flex-direction:column}}
+
 @media(max-width:700px){.film-batch-panel,.film-render-panel{padding:12px}.film-batch-shot-head{align-items:flex-start}.film-clip-preview{max-height:70vh}.film-export-ribbon{grid-template-columns:1fr}}
 /* Visual continuity and creative review */
 .continuity-panel h3{margin:26px 0 8px;color:var(--text-primary,#f0f0f3);font-size:16px}

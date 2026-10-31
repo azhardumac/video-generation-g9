@@ -85,22 +85,18 @@ Default project checkout path: `~/AI-Video-Studio/apps/ai-video-studio`.
 2. Start FastAPI in terminal 1:
 
    ```bash
-   cd ~/AI-Video-Studio/apps/ai-video-studio/backend
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   python -m app.server
+   cd ~/AI-Video-Studio/apps/ai-video-studio
+   ./scripts/start-backend.sh
    ```
 
 3. Start Vite in terminal 2:
 
    ```bash
-   cd ~/AI-Video-Studio/apps/ai-video-studio/frontend
-   npm install
-   npm run dev
+   cd ~/AI-Video-Studio/apps/ai-video-studio
+   ./scripts/start-frontend.sh
    ```
 
-Open **http://127.0.0.1:5173**. The API runs at **http://127.0.0.1:8000** by default, bound to loopback. Existing virtual environments and npm dependencies can be reused; there is no need to reinstall them on every startup.
+These launchers use the pinned local environments and honor API host/port configuration without reinstalling packages. Open **http://127.0.0.1:5173**. The API runs at **http://127.0.0.1:8000** by default, bound to loopback.
 
 ## Generating a clip
 
@@ -175,6 +171,67 @@ The Remotion check type-checks only this repository's `remotion/` composition ag
 ## Repository workflow
 
 `main` is the integration branch for completed phases. Feature work belongs on `feature/*` branches with PRs targeting `main`. Phase 1, Phase 2, and Phase 2.5 PRs were integrated without force pushes. The GitHub repository is private.
+
+## First-run Apple Silicon setup (Issue #22)
+
+Supported target: Apple Silicon macOS with Apple Command Line Tools. Authenticate
+to GitHub only if required to clone this private repository (`gh auth login` is
+interactive; no token is stored by the setup). Clone into the established local
+layout, then run the bootstrap once:
+
+```sh
+gh repo clone azhardumac/video-generation-g9 "$HOME/AI-Video-Studio/apps/ai-video-studio" && \
+  cd "$HOME/AI-Video-Studio/apps/ai-video-studio" && ./scripts/bootstrap.sh
+```
+
+After cloning, **`./scripts/bootstrap.sh` is the one-command installation**. It
+installs/verifies Homebrew, Git, GitHub CLI, FFmpeg/ffprobe, Python, uv and Node;
+creates the pinned FastAPI environment; installs the frontend from its npm lock;
+installs Remotion CLI/runtime **4.0.538** with React **19.2.3** from the committed npm lockfile; and pins the
+local LTX source checkout to
+`14a3ddd6054736beb45b4d836135fa4d44490531` (`ltx-pipelines-mlx 0.18.0`). The
+tested Python runtime is **3.11.17**, Node is the **22 LTS** line, and backend
+direct/transitive dependencies are locked in `backend/uv.lock`. It uses the
+existing `~/AI-Video-Studio` directory tree and matching paths in `.env.example`.
+
+The bootstrap is safe to rerun. It never resets an existing LTX checkout or
+overwrites `.env`; it creates `.env` with mode 0600 only when absent. It does not
+replace SQLite files, references, generated media, or model files. An LTX source
+revision mismatch is reported without modifying that tree; set `LTX_ROOT` to a
+separate install path to use the pinned checkout. Existing configured paths in
+`.env` are read as data, never sourced or executed. `AI_VIDEO_STUDIO_HOME`,
+`AI_VIDEO_STUDIO_APP_DIR`, `LTX_ROOT`, `HF_CACHE`/`HF_HOME`, `REMOTION_STUDIO`,
+`STORY_PROJECT`, and `OUTPUT_ROOT` can override the standard paths. Existing
+model cache files are reused through the Hugging Face cache and no cache cleanup
+is performed.
+
+The Q8 model is a separate, explicit opt-in. In a terminal, bootstrap asks
+before downloading any missing model weights. In **Setup**, select the model
+download and confirm the large transfer. The downloader queries current
+Hugging Face file-size metadata, checks free space for the exact missing bytes
+plus 8 GiB headroom, reports progress, and resumes from the existing Hub cache.
+The API does not request a model download on ordinary startup. If Hugging Face
+access is gated, accept the model terms and run `hf auth login` yourself before
+retrying; credentials are never embedded or displayed. Bootstrap recommends at
+least 12 GiB free for non-model application dependencies.
+
+Useful read-only and no-install checks are `./scripts/bootstrap.sh --check`,
+`./scripts/bootstrap.sh --dry-run`, and `bash -n scripts/bootstrap.sh`. Setup
+also appears as the first-run screen in the application, with local component
+status, disk checks, live installer logs, cancellation and rerun guidance.
+
+Start the backend and frontend locally after bootstrap, in separate terminals:
+
+```sh
+cd "$HOME/AI-Video-Studio/apps/ai-video-studio" && ./scripts/start-backend.sh
+```
+
+```sh
+cd "$HOME/AI-Video-Studio/apps/ai-video-studio" && ./scripts/start-frontend.sh
+```
+
+Open <http://127.0.0.1:5173>. Setup checks never run LTX inference or a
+Remotion render.
 
 # Visual continuity and review (Issue #21)
 
