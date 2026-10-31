@@ -219,6 +219,14 @@ def test_fresh_scorpion_frog_production_uses_only_explicit_character_selections(
     assert api.db.project_assets(project["id"]) == []
     assert api.db.list_jobs(project_id=project["id"]) == []
     assert api.list_project_storyboards(project["id"]) == []
+    with pytest.raises(HTTPException) as missing_reference:
+        api.add_existing_project_reference(project["id"], api.ProjectReferenceCreate(
+            path=str(project_root / "references/character/missing.png"),
+            name="Missing reference", category="character",
+        ))
+    assert missing_reference.value.status_code == 404
+    assert "Check that the path exists and is readable" in missing_reference.value.detail
+    assert api.project_references(project["id"]) == []
 
     for name, path in (("Original frog", frog), ("Original scorpion", scorpion)):
         api.add_existing_project_reference(project["id"], api.ProjectReferenceCreate(

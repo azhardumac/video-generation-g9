@@ -4,7 +4,7 @@ Private, local-first AI video studio for generating portrait video with **LTX-2.
 
 ## Current status (31 October 2026)
 
-**Phases 1, 2, 2.5, 3, and 3.2 are on `main`. Issue #11 Milestones A, B, and C are implemented on stacked feature branches and are not yet integrated.** Milestone A adds:
+**Phases 1, 2, 2.5, 3, 3.2, and Issue #11 Milestones A, B, and C are merged into `main`.** Milestone A adds:
 
 - Real local projects with create, open/switch, rename, archive/restore, and read-only import for allowed directories.
 - Project-scoped local reference links and uploads. References are explicitly selected, categorized, validated, editable, and removable without deleting source files.
@@ -14,7 +14,7 @@ Milestone B adds project-specific story text and a revisioned visual style/chara
 
 Milestone C removes the legacy standalone Remotion form with hardcoded Scorpion & Frog composition/output defaults; rendering remains available from the reviewed storyboard assembly flow. Generation summaries now reflect active project settings and preset, controls have visible keyboard focus and accessible mobile navigation labels, and a clean-production regression verifies empty initial data plus only the two explicitly selected approved character references. No LTX generation or Remotion render was executed during Issue #11 work.
 
-Issue #11 is **not yet declared complete**. The full acceptance checklist must still be reviewed against the integrated branches and exercised in a fresh application session; no claim of end-to-end production readiness is made from subprocess-free tests.
+Issue #11's application work is merged, but its release gate still requires a complete fresh-session acceptance and user-approved real LTX/Remotion run. No LTX generation or Remotion render is started automatically; do not call the app fully operational until the applicable release checks pass.
 
 The `main` foundation includes:
 
@@ -150,7 +150,7 @@ Tests and builds do not require a GPU generation run.
 
 ## Roadmap
 
-**Issue #11 integration follow-up:** merge the stacked Milestone A/B/C pull requests in order, then review the full acceptance checklist in a fresh application session. Preserve all local project media and model caches.
+**Issue #11 release follow-up:** finish the fresh-session acceptance checklist and obtain explicit approval before any real LTX generation or Remotion render. Preserve all local project media and model caches.
 
 ## Repository workflow
 

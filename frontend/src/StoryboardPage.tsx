@@ -13,6 +13,10 @@ type ProductionProject={id:string;root:string;workspace_kind:string;aspect_ratio
 
 const dimensions=(ratio:string|null):[number,number]=>({'16:9':[768,432],'1:1':[640,640],'4:3':[640,480],'3:2':[672,448]} as Record<string,[number,number]>)[ratio??'']??[448,768]
 const emptyShot = (project:ProductionProject|null): Shot => {const [width,height]=dimensions(project?.aspect_ratio??null);return {position:0,scene_title:'',title:'',prompt:'',reference_image:null,preset:'Short',seed:null,caption:'',width,height,fps:project?.frame_rate??24,output_location:'',framing:'',prompt_reviewed:false,reviewed_style_revision:0}}
+const formatStyleContext=(style:Record<string,string>|undefined)=>[
+  ['material','Material and finish'],['silhouettes','Silhouettes'],['proportions','Character proportions'],
+  ['composition','Composition guidance'],['negative_constraints','Negative constraints'],
+].filter(([key])=>Boolean(style?.[key]?.trim())).map(([key,label])=>`${label}: ${style![key].trim()}`).join('\n')
 
 export default function StoryboardPage({projectId,project,assets,jobs,ltxReady,onMessage,onDirtyChange}:{projectId:string|null;project:ProductionProject|null;assets:Asset[];jobs:ExistingJob[];ltxReady:boolean;onMessage:(message:string)=>void;onDirtyChange:(dirty:boolean)=>void}) {
   const [story,setStory]=useState<Storyboard|null>(null)
@@ -93,7 +97,7 @@ export default function StoryboardPage({projectId,project,assets,jobs,ltxReady,o
     setDraft(current=>{const next=[...current];[next[index],next[target]]=[next[target],next[index]];return next.map((shot,i)=>({...shot,position:i}))})
     setDirty(true);setManifest(null)
   }
-  function addShot(){setDraft(current=>[...current,{...emptyShot(project),position:current.length}]);setDirty(true);setManifest(null)}
+  function addShot(){const context=formatStyleContext(story?.style_bible);const bibleRevision=story?.style_bible_revision??0;setDraft(current=>[...current,{...emptyShot(project),position:current.length,style_context:context,style_bible_revision:bibleRevision,reviewed_style_revision:bibleRevision}]);setDirty(true);setManifest(null)}
 
   function reviewShot(index:number,approved:boolean){setDraft(current=>current.map((shot,i)=>i===index?{...shot,prompt_reviewed:approved,reviewed_style_revision:story?.style_bible_revision??0}:shot));setDirty(true)}
   function removeShot(index:number){
