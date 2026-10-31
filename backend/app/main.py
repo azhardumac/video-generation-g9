@@ -135,6 +135,10 @@ class RetryFilmRequest(BaseModel):
     shot_ids: list[str] = Field(min_length=1, max_length=40)
 
 
+class ReconcileVerifiedShotsRequest(ApproveFilmPlanRequest):
+    source_batch_id: str = Field(min_length=1, max_length=80)
+
+
 class StyleBibleRequest(BaseModel):
     material: str = Field(default="", max_length=2000)
     silhouettes: str = Field(default="", max_length=2000)
@@ -722,6 +726,161 @@ def approve_film_plan(storyboard_id: str, request: ApproveFilmPlanRequest):
         raise HTTPException(409, str(exc)) from exc
 
 
+def _expected_shot_output(shot: dict) -> dict:
+    payload = shot.get("generation_payload") or {}
+    return {"width": int(payload.get("width") or shot.get("width") or 0),
+            "height": int(payload.get("height") or shot.get("height") or 0),
+            "fps": int(payload.get("fps") or shot.get("fps") or 0),
+            "frames": int(payload.get("frames") or 0)}
+
+
+def _job_matches_shot(job: dict, shot: dict, storyboard: dict, batch_id: str) -> bool:
+    payload = job.get("payload") or {}
+    expected_payload = shot.get("generation_payload") or {}
+    return bool(
+        job.get("kind") == "generation" and job.get("status") == "completed" and job.get("exit_code") == 0 and
+        job.get("project_id") == storyboard["project_id"] and
+        payload.get("shot_id") == shot["id"] and payload.get("storyboard_id") == storyboard["id"] and
+        payload.get("film_batch_id") == batch_id and
+        db.generation_settings_snapshot(payload) == db.generation_settings_snapshot(shot) and
+        payload.get("reference_image") == expected_payload.get("reference_image") and
+        payload.get("frames") == expected_payload.get("frames") and payload.get("audio") is False
+    )
+
+
+def _verified_source_batches(story: dict) -> list[dict]:
+    if not story.get("film_plan", {}).get("approved"):
+        return []
+    shot_by_id = {shot["id"]: shot for shot in story["shots"]}
+    candidates = []
+    for batch in db.list_film_batches(story["id"]):
+        if (batch["status"] != "completed" or batch["project_id"] != story["project_id"] or
+                batch["storyboard_revision"] != story["revision"] or
+                batch["style_bible_revision"] != story["style_bible_revision"] or len(batch["shots"]) != len(shot_by_id)):
+            continue
+        matches = {}
+        reasons = []
+        for item in batch["shots"]:
+            shot = shot_by_id.get(item["shot_id"])
+            job = item.get("job")
+            if not shot or not job or not _job_matches_shot(job, shot, story, batch["id"]):
+                reasons.append(item.get("title", item["shot_id"]) + ": job or settings do not match this approved shot")
+                continue
+            expected = _expected_shot_output(shot)
+            recorded = (job.get("verification_metadata") or {}).get("verified_output")
+            if not recorded or any(recorded.get(key) != value for key, value in expected.items()):
+                reasons.append(shot["title"] + ": recorded ffprobe metadata does not match the shot")
+                continue
+            try:
+                path = safe_local_path(job.get("result_path") or "", settings, must_exist=True)
+                output_root = safe_local_path(settings.output_root, settings)
+                if not path.is_file() or output_root not in path.parents:
+                    raise ValueError("output is outside OUTPUT_ROOT or is not a file")
+            except (ValueError, FileNotFoundError) as exc:
+                reasons.append(shot["title"] + ": " + str(exc))
+                continue
+            matches[shot["id"]] = job["id"]
+        if len(matches) == len(shot_by_id):
+            candidates.append({"id": batch["id"], "created_at": batch["created_at"],
+                               "verified_shots": len(matches), "total_shots": len(shot_by_id),
+                               "job_ids": matches})
+    return candidates
+
+
+def _film_export_status(story: dict) -> dict:
+    candidates = _verified_source_batches(story)
+    shots = story.get("shots", [])
+    current_verified = [shot["id"] for shot in shots if shot.get("status") == "verified" and shot.get("settings_match")]
+    missing = [shot["title"] for shot in shots if shot["id"] not in current_verified]
+    batches = db.list_film_batches(story["id"])
+    paused = [{"id": batch["id"], "status": batch["status"],
+               "queued_jobs": [item["job"]["id"] for item in batch["shots"] if item.get("job") and item["job"].get("status") == "queued"],
+               "completed_jobs": [item["job"]["id"] for item in batch["shots"] if item.get("job") and item["job"].get("status") == "completed"]}
+              for batch in batches if batch["status"] == "paused"]
+    manifest = story.get("manifest")
+    manifest_ready = bool(manifest and manifest.get("revision") == story["revision"])
+    all_verified = bool(shots) and len(current_verified) == len(shots)
+    reconciled = bool(shots) and all(shot.get("reconciled_job_id") == (shot.get("job") or {}).get("id") for shot in shots)
+    return {"storyboard_id": story["id"], "revision": story["revision"],
+            "style_bible_revision": story["style_bible_revision"], "approved": bool(story.get("film_plan", {}).get("approved")),
+            "total_shots": len(shots), "verified_shots": len(current_verified), "missing_shots": missing,
+            "all_verified": all_verified, "reconciled": reconciled, "manifest_ready": manifest_ready,
+            "manifest_path": story.get("manifest_path"), "manifest": manifest,
+            "remotion_ready": detect_integrations(settings)["remotion"]["ready"],
+            "source_batches": [{key: value for key, value in candidate.items() if key != "job_ids"} for candidate in candidates],
+            "recommended_source_batch_id": candidates[0]["id"] if len(candidates) == 1 else None,
+            "ambiguous_source_batches": len(candidates) > 1, "paused_batches": paused}
+
+
+@app.get("/api/storyboards/{storyboard_id}/film-plan/export-status")
+def film_plan_export_status(storyboard_id: str):
+    story = db.get_storyboard(storyboard_id)
+    if not story or not story.get("film_plan"):
+        raise HTTPException(404, "Film plan not found")
+    return _film_export_status(story)
+
+
+@app.post("/api/storyboards/{storyboard_id}/film-plan/reconcile")
+async def reconcile_verified_shots(storyboard_id: str, request: ReconcileVerifiedShotsRequest):
+    story = db.get_storyboard(storyboard_id, include_events=False)
+    if not story or not story.get("film_plan"):
+        raise HTTPException(404, "Film plan not found")
+    if (not story["film_plan"]["approved"] or story["revision"] != request.revision or
+            story["style_bible_revision"] != request.style_bible_revision):
+        raise HTTPException(409, "The current storyboard and style bible need approval before reconciling outputs")
+    source = next((item for item in _verified_source_batches(story) if item["id"] == request.source_batch_id), None)
+    if not source:
+        raise HTTPException(409, "The selected batch is not a complete, current, project-scoped set of verified shots")
+    shots_by_id = {shot["id"]: shot for shot in story["shots"]}
+    for shot_id, job_id in source["job_ids"].items():
+        shot, job = shots_by_id[shot_id], db.get_job(job_id)
+        if not job or not _job_matches_shot(job, shot, story, source["id"]):
+            raise HTTPException(409, f"Shot '{shot['title']}' changed or its recorded job is no longer eligible; nothing was reconciled")
+        expected = _expected_shot_output(shot)
+        recorded = (job.get("verification_metadata") or {}).get("verified_output")
+        try:
+            path = safe_local_path(job.get("result_path") or "", settings, must_exist=True)
+            output_root = safe_local_path(settings.output_root, settings)
+            if not path.is_file() or output_root not in path.parents:
+                raise ValueError("The output is not a regular file under OUTPUT_ROOT")
+            actual = await verify_video(str(path), settings, expected=expected)
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            raise HTTPException(409, f"Shot '{shot['title']}' failed fresh ffprobe verification: {exc}; no associations were changed") from exc
+        if actual.get("verified_output") != recorded:
+            raise HTTPException(409, f"Shot '{shot['title']}' current ffprobe metadata differs from its recorded result; no associations were changed")
+    duplicate_job_ids = []
+    for batch in db.list_film_batches(storyboard_id):
+        if (batch["status"] != "paused" or batch["id"] == source["id"] or
+                batch["storyboard_revision"] != request.revision or batch["style_bible_revision"] != request.style_bible_revision):
+            continue
+        for item in batch["shots"]:
+            job = item.get("job")
+            if job and job["status"] == "queued" and item["shot_id"] in shots_by_id and _job_matches_queued_duplicate(job, item["shot_id"], story, batch["id"]):
+                duplicate_job_ids.append(job["id"])
+    paused_before = [batch for batch in db.list_film_batches(storyboard_id) if batch["status"] == "paused"]
+    canonical_ids = set(source["job_ids"].values())
+    preserved_completed = sum(1 for batch in paused_before for item in batch["shots"]
+                              if item.get("job") and item["job"]["status"] == "completed" and item["job"]["id"] not in canonical_ids)
+    try:
+        result = db.reconcile_film_shots(storyboard_id, request.revision, request.style_bible_revision,
+                                         source["id"], source["job_ids"], duplicate_job_ids)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"storyboard": result["storyboard"], "cancelled_job_ids": result["cancelled_job_ids"],
+            "reconciled_shots": len(source["job_ids"]), "preserved_completed_outputs": preserved_completed}
+
+
+def _job_matches_queued_duplicate(job: dict, shot_id: str, story: dict, batch_id: str) -> bool:
+    shot = next((item for item in story["shots"] if item["id"] == shot_id), None)
+    payload = job.get("payload") or {}
+    return bool(shot and job.get("status") == "queued" and job.get("kind") == "generation" and
+                job.get("project_id") == story["project_id"] and payload.get("shot_id") == shot_id and
+                payload.get("storyboard_id") == story["id"] and payload.get("film_batch_id") == batch_id and
+                db.generation_settings_snapshot(payload) == db.generation_settings_snapshot(shot))
+
+
 @app.post("/api/storyboards/{storyboard_id}/film-plan/generate", status_code=201)
 def generate_film(storyboard_id: str, request: GenerateFilmRequest):
     story = db.get_storyboard(storyboard_id)
@@ -729,6 +888,21 @@ def generate_film(storyboard_id: str, request: GenerateFilmRequest):
         raise HTTPException(404, "Film plan not found")
     if not story["film_plan"]["approved"] or story["revision"] != request.revision or story["style_bible_revision"] != request.style_bible_revision:
         raise HTTPException(409, "Approve and review this exact saved plan and style-bible revision before generation")
+    export_status = _film_export_status(story)
+    if export_status["all_verified"] and export_status["reconciled"]:
+        return {"status": "ready_for_export", "queued_shots": 0, "total_shots": len(story["shots"]),
+                "export_status": export_status,
+                "message": "All required shots are reconciled to current verified outputs; no jobs were queued. Continue to Export / Remotion."}
+    if export_status["source_batches"]:
+        return {"status": "reconciliation_required", "queued_shots": 0, "total_shots": len(story["shots"]),
+                "export_status": export_status,
+                "message": "A complete verified source batch already exists. Reconcile its clips and assemble them from Export / Remotion; no new generation jobs were queued."}
+    if export_status["all_verified"]:
+        return {"status": "ready_for_export", "queued_shots": 0, "total_shots": len(story["shots"]),
+                "export_status": export_status,
+                "message": "All required shots already have current verified outputs; no new jobs were queued. Continue to Export / Remotion."}
+    if any(batch["queued_jobs"] for batch in export_status["paused_batches"]):
+        raise HTTPException(409, "A paused film batch still contains queued work. Reconcile verified clips or cancel the duplicate queue before generating missing shots.")
     if not detect_integrations(settings)["ltx"]["ready"]:
         raise HTTPException(409, "LTX runner or cached Q8 model weights are unavailable; no weights will be downloaded")
     project = _project(story["project_id"])
@@ -1005,7 +1179,8 @@ async def link_existing_storyboard_job(storyboard_id: str, shot_id: str, job_id:
         raise HTTPException(404, "Generation job not found")
     if job["kind"] != "generation" or job["status"] != "completed":
         raise HTTPException(409, "Only completed generation jobs can be attached")
-    if db.generation_settings_snapshot(job["payload"]) != db.generation_settings_snapshot(shot):
+    job_snapshot, current_snapshot = db.generation_settings_snapshot(job["payload"]), db.generation_settings_snapshot(shot)
+    if any(key in current_snapshot and current_snapshot[key] != value for key, value in job_snapshot.items()):
         raise HTTPException(409, "Existing output settings do not match this shot; copy the job settings into the shot and save first")
     recorded = (job.get("verification_metadata") or {}).get("verified_output")
     if not recorded or not job.get("result_path"):
