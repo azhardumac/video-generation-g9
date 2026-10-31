@@ -465,6 +465,7 @@ def test_approved_film_batch_is_sequential_pausable_cancellable_retryable_and_as
     assert api.db.get_film_batch(duplicate_batch_id)["status"] == "cancelled"
     assert api.film_plan_export_status(plan["id"])["reconciled"]
     assert all(shot["reconciled_job_id"] == shot["job"]["id"] for shot in reconciled["storyboard"]["shots"])
+    assert not api.film_plan_export_status(plan["id"])["manifest_ready"]
     assembled = api.create_storyboard_manifest(plan["id"])
     assert assembled["manifest"]["duration_in_frames"] == 548
     assert Path(assembled["manifest_path"]).is_file()
@@ -473,6 +474,45 @@ def test_approved_film_batch_is_sequential_pausable_cancellable_retryable_and_as
     assert repeated["status"] == "ready_for_export" and repeated["queued_shots"] == 0
     assert len(api.db.list_jobs(project_id=project["id"])) == 25
     assert all(item["status"] == "verified" and item["job"] for item in api.get_storyboard(plan["id"])["shots"])
+    assert api.film_plan_export_status(plan["id"])["manifest_ready"]
+    monkeypatch.setattr(api, "detect_integrations", lambda _: {"ltx": {"ready": True}, "remotion": {"ready": True}})
+    running_render = api.queue_storyboard_render(plan["id"])
+    assert api.film_plan_export_status(plan["id"])["latest_render"]["status"] == "queued"
+    with pytest.raises(HTTPException, match="already queued or running") as duplicate_render:
+        api.queue_storyboard_render(plan["id"])
+    assert duplicate_render.value.status_code == 409
+    assert api.db.claim_job(running_render["id"])
+    api.db.update_job(running_render["id"], progress=37)
+    running_state = api.film_plan_export_status(plan["id"])["latest_render"]
+    assert running_state["status"] == "running" and running_state["progress"] == 37 and running_state["current"]
+    assert api.db.fail_job(running_render["id"], error="test-only render failure", exit_code=1)
+    assert api.film_plan_export_status(plan["id"])["latest_render"]["status"] == "failed"
+
+    completed_render = api.queue_storyboard_render(plan["id"])
+    assert api.db.claim_job(completed_render["id"])
+    final_path = Path(completed_render["payload"]["output_path"])
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_bytes(b"test-only final render")
+    assert api.db.complete_job(completed_render["id"], progress=100, result_path=str(final_path), exit_code=0,
+                               elapsed_seconds=42.5,
+                               verification_metadata={"verified_output": {"width": 448, "height": 768, "fps": 24, "frames": 548}})
+    completed_state = api.film_plan_export_status(plan["id"])["latest_render"]
+    assert completed_state["status"] == "completed" and completed_state["elapsed_seconds"] == 42.5
+    assert completed_state["current"] and completed_state["verification_metadata"]["verified_output"]["frames"] == 548
+    from app.db import Database
+    monkeypatch.setattr(api, "db", Database(api.settings))
+    assert api.film_plan_export_status(plan["id"])["latest_render"]["id"] == completed_render["id"]
+    with pytest.raises(HTTPException, match="already has a completed verified render"):
+        api.queue_storyboard_render(plan["id"])
+
+    current_story = api.get_storyboard(plan["id"])
+    api.db.update_storyboard(plan["id"], plan["revision"], plan["title"], [
+            shot | {"prompt": shot["prompt"] + (" Edited after render." if index == 0 else "")}
+            for index, shot in enumerate(current_story["shots"])])
+    stale_state = api.film_plan_export_status(plan["id"])
+    assert not stale_state["manifest_ready"] and not stale_state["latest_render"]["current"]
+    assert stale_state["latest_render"]["status"] == "completed" and Path(final_path).is_file()
+    assert len(api.db.list_jobs(project_id=project["id"])) == 27
 
 
 def test_project_reference_validation_scoping_and_unlink_preserve_source():
