@@ -92,9 +92,9 @@ def test_legacy_schema_migration_is_backed_up_additive_and_idempotent(tmp_path):
     assert migrated.get_job("job")["payload"]["prompt"] == "historical"
     assert migrated.get_project_asset("legacy", "asset")["relative_path"] == "frog.png"
     with migrated.connect() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 5
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        assert {"project_scene_continuity", "project_scene_continuity_revisions", "shot_creative_reviews"}.issubset(tables)
+        assert {"project_scene_continuity", "project_scene_continuity_revisions", "shot_creative_reviews", "film_runs", "film_run_events", "film_run_shots", "film_run_shot_attempts"}.issubset(tables)
         assert "project_id" in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
     backups = list(tmp_path.glob("legacy.sqlite3.pre-migration-*.bak"))
     assert len(backups) == 1
@@ -118,14 +118,14 @@ def test_failed_migration_rolls_back_schema_and_keeps_backup(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 1
 
 
-def test_fifth_additive_migration_backs_up_version_four_database(tmp_path):
+def test_sixth_additive_migration_backs_up_version_five_database(tmp_path):
     path = tmp_path / "version-two.sqlite3"
     settings = Settings(_env_file=None,database_path=str(path),allowed_path_roots=str(tmp_path))
     first = Database(settings)
     with first.connect() as db:
-        db.execute("DELETE FROM schema_migrations WHERE version=5")
+        db.execute("DELETE FROM schema_migrations WHERE version=6")
     migrated = Database(settings)
     assert migrated is not None
     with migrated.connect() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 5
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
     assert len(list(tmp_path.glob("version-two.sqlite3.pre-migration-*.bak"))) == 1

@@ -15,13 +15,14 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .adapters import verify_video
 from .config import get_settings
 from .db import Database
 from .integrations import detect_integrations
 from .film_planner import UnsupportedStory, make_approved_fable_plan, validate_approved_fable
+from .film_orchestrator import FilmOrchestrator, FilmRunConflict, FilmRunTransitionError, STAGES
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, GenerationSettings, Preset
 from .projects import IMAGE_TYPES, VIDEO_TYPES, scan_project
@@ -34,6 +35,7 @@ from .worker import LocalWorker
 settings = get_settings()
 db = Database(settings)
 worker = LocalWorker(db, settings)
+film_orchestrator = FilmOrchestrator(db)
 resource_preflight = ResourcePreflight(settings)
 
 
@@ -165,6 +167,41 @@ class BuildFilmPlanRequest(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
 
 
+class FilmRunBudget(BaseModel):
+    max_shots: int = Field(default=12, ge=1, le=40)
+    max_retries_per_shot: int = Field(default=1, ge=0, le=3)
+    max_generation_seconds: int = Field(default=3600, ge=60, le=86400)
+    max_output_bytes: int = Field(default=8 * 1024**3, ge=256 * 1024**2, le=50 * 1024**3)
+
+
+class CreateFilmRunRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=20000)
+    reference_ids: list[str] = Field(default_factory=list, max_length=16)
+    preset: str = "Short"
+    budget: FilmRunBudget = Field(default_factory=FilmRunBudget)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    initial_confirmation: bool = False
+
+    @model_validator(mode="after")
+    def normalized_prompt(self):
+        self.prompt = self.prompt.strip()
+        if not self.prompt:
+            raise ValueError("Story prompt cannot be blank")
+        if len(set(self.reference_ids)) != len(self.reference_ids):
+            raise ValueError("Reference selections must be unique")
+        return self
+
+
+class FilmRunRevisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+
+class FilmRunAuthorizationRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    confirmed: bool = False
+    budget_acknowledged: bool = False
+
+
 class ApproveFilmPlanRequest(BaseModel):
     revision: int = Field(ge=1)
     style_bible_revision: int = Field(ge=0)
@@ -242,6 +279,13 @@ def _project_id_for_name(name: str) -> str:
 
 def _project_output(project: dict) -> Path:
     return settings.expanded(settings.output_root) / project["id"]
+
+
+def _available_bytes_for_path(path: Path) -> int:
+    candidate = path.expanduser()
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return shutil.disk_usage(candidate).free
 
 
 def _batch_with_resource_warnings(batch: dict) -> dict:
@@ -870,6 +914,182 @@ def list_storyboards(project_id: str | None = None):
         return []
     _project(selected)
     return db.list_storyboards(selected)
+
+
+@app.get("/api/film-orchestration/capabilities")
+def film_orchestration_capabilities():
+    return {
+        "stages": list(STAGES),
+        "general_story_planner": {"available": False, "status": "not_configured",
+                                  "detail": "No local general-purpose story model is configured. Arbitrary prompts are not auto-expanded into scenes."},
+        "legacy_planner": {"available": True, "status": "limited_fixture",
+                           "detail": "The existing deterministic planner is limited to the approved Scorpion & Frog fable."},
+        "technical_verification": {"available": True, "method": "ffprobe"},
+        "creative_quality_detection": {"available": False, "status": "manual_review_required",
+                                        "detail": "Technical verification is separate from human creative review; no automated visual quality detector is claimed."},
+        "generation_worker": {"available": True, "concurrency": 1},
+        "remotion": {"available": Path(settings.expanded(settings.remotion_executable)).is_file(),
+                     "explicit_confirmation_required": True},
+    }
+
+
+@app.post("/api/projects/{project_id}/film-runs/preview")
+def preview_film_run(project_id: str, request: CreateFilmRunRequest):
+    """Read-only cost and capability preview; it writes no run and queues no jobs."""
+    _project(project_id)
+    for reference_id in request.reference_ids:
+        detail = _reference_details(project_id, reference_id)
+        if _is_historical_visual_reference(detail):
+            raise HTTPException(400, "Historical outputs cannot be silently attached to a new film run")
+    frames, fps = _preset_frames(request.preset)
+    benchmark = next((row for row in db.benchmarks()
+                      if row["frames"] == frames and row["fps"] == fps and row["elapsed_seconds"] is not None), None)
+    samples = []
+    for job in db.list_jobs(project_id=project_id, limit=1000):
+        payload = job.get("payload", {})
+        verified = (job.get("verification_metadata") or {}).get("verified_output") or {}
+        path = Path(job["result_path"]) if job.get("result_path") else None
+        if (job.get("kind") == "generation" and job.get("status") == "completed" and path and path.is_file()
+                and payload.get("frames") == frames and payload.get("fps") == fps
+                and verified.get("frames") == frames and verified.get("fps") == fps):
+            try:
+                samples.append(path.stat().st_size)
+            except OSError:
+                pass
+    estimated_shots = request.budget.max_shots * (request.budget.max_retries_per_shot + 1)
+    output_root = settings.expanded(settings.output_root)
+    available_output_bytes = _available_bytes_for_path(output_root)
+    return {
+        "preview_only": True,
+        "writes_database": False,
+        "queues_jobs": False,
+        "general_story_planner_available": False,
+        "planner_message": "No general story planner is configured; scene count and story runtime cannot yet be inferred from arbitrary prompts.",
+        "requested_max_shots": request.budget.max_shots,
+        "preset": request.preset,
+        "frames": frames,
+        "fps": fps,
+        "maximum_footage_seconds": round(request.budget.max_shots * frames / fps, 2),
+        "generation_time_estimate_seconds": round(float(benchmark["elapsed_seconds"]) * estimated_shots, 2) if benchmark else None,
+        "generation_time_sample": ("local benchmark history" if benchmark else None),
+        "estimated_output_bytes": int(sorted(samples)[len(samples)//2] * estimated_shots) if samples else None,
+        "estimated_output_within_cap": (int(sorted(samples)[len(samples)//2] * estimated_shots) <= request.budget.max_output_bytes) if samples else None,
+        "generation_time_within_cap": (float(benchmark["elapsed_seconds"]) * estimated_shots <= request.budget.max_generation_seconds) if benchmark else None,
+        "storage_sample_count": len(samples),
+        "storage_hard_cap_bytes": request.budget.max_output_bytes,
+        "available_output_bytes": available_output_bytes,
+        "disk_sufficient_for_budget": available_output_bytes >= request.budget.max_output_bytes,
+        "generation_time_hard_cap_seconds": request.budget.max_generation_seconds,
+        "maximum_retries_per_shot": request.budget.max_retries_per_shot,
+        "technical_verification": "ffprobe",
+        "creative_quality_status": "manual review required; no automated visual detector is implemented",
+    }
+
+
+@app.get("/api/projects/{project_id}/film-runs")
+def list_film_runs(project_id: str):
+    _project(project_id)
+    return film_orchestrator.list(project_id)
+
+
+@app.post("/api/projects/{project_id}/film-runs", status_code=201)
+def create_film_run(project_id: str, request: CreateFilmRunRequest):
+    project = _project(project_id)
+    preview = preview_film_run(project_id, request)
+    free_bytes = preview["available_output_bytes"]
+    if free_bytes < request.budget.max_output_bytes:
+        raise HTTPException(409, f"The approved output storage cap ({request.budget.max_output_bytes} bytes) exceeds current free space ({free_bytes} bytes). Lower the cap or free disk space and re-preview.")
+    if preview["estimated_output_within_cap"] is False:
+        raise HTTPException(409, "Measured output-size samples exceed the approved storage cap. Increase the cap or reduce the maximum shot/retry count and re-preview.")
+    if preview["generation_time_within_cap"] is False:
+        raise HTTPException(409, "The measured time estimate exceeds the approved generation time cap. Increase the cap or reduce the maximum shot/retry count and re-preview.")
+    references = []
+    for reference_id in request.reference_ids:
+        reference = db.get_project_reference(project_id, reference_id)
+        if not reference:
+            raise HTTPException(400, "Character and environment attachments must be linked to the selected project")
+        detail = _reference_details(project_id, reference_id)
+        if _is_historical_visual_reference(detail):
+            raise HTTPException(400, "Historical outputs cannot be silently attached to a new film run")
+        references.append({"id": reference_id, "category": reference["category"]})
+    try:
+        frames, fps = _preset_frames(request.preset)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+    request_data = {
+        "prompt": request.prompt,
+        "reference_ids": [item["id"] for item in references],
+        "reference_categories": [item["category"] for item in references],
+        "preset": request.preset,
+        "budget": request.budget.model_dump(),
+        "generation_profile": {"frames": frames, "fps": fps, "width": 448, "height": 768},
+        "authorization": ({"confirmed": True, "scope": "local LTX jobs within the declared shot/time/storage budget"}
+                          if request.initial_confirmation else {}),
+    }
+    try:
+        run = film_orchestrator.create(project["id"], request.idempotency_key, request_data,
+                                       authorized=request.initial_confirmation)
+    except FilmRunConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        status = 409 if "Idempotency key" in str(exc) else 400
+        raise HTTPException(status, str(exc)) from exc
+    run["generation_jobs_created"] = 0
+    run["planner_status"] = "not_configured" if run["status"] == "waiting_for_planner" else "awaiting_authorization"
+    run["message"] = ("The request and its budget were saved. A general story planner is not configured, so no shot plan or generation job was created."
+                      if request.initial_confirmation else "A dry request was saved. Explicit initial authorization is required before any future generation stage.")
+    return run
+
+
+@app.get("/api/film-runs/{run_id}")
+def get_film_run(run_id: str):
+    run = film_orchestrator.get(run_id)
+    _project(run["project_id"])
+    return run
+
+
+def _film_run_control(run_id: str, request: FilmRunRevisionRequest, action: str):
+    try:
+        if action == "pause":
+            return film_orchestrator.pause(run_id, request.expected_revision)
+        if action == "resume":
+            return film_orchestrator.resume(run_id, request.expected_revision)
+        return film_orchestrator.cancel(run_id, request.expected_revision)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (RuntimeError, FilmRunTransitionError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/film-runs/{run_id}/authorize")
+def authorize_film_run(run_id: str, request: FilmRunAuthorizationRequest):
+    if not request.confirmed or not request.budget_acknowledged:
+        raise HTTPException(422, "Explicit confirmation of the run scope and budget is required")
+    try:
+        return film_orchestrator.authorize(run_id, request.expected_revision,
+                                           {"confirmed": True, "budget_acknowledged": True,
+                                            "scope": "local LTX work within the persisted run budget"})
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (RuntimeError, FilmRunTransitionError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/film-runs/{run_id}/pause")
+def pause_film_run(run_id: str, request: FilmRunRevisionRequest):
+    return _film_run_control(run_id, request, "pause")
+
+
+@app.post("/api/film-runs/{run_id}/resume")
+def resume_film_run(run_id: str, request: FilmRunRevisionRequest):
+    return _film_run_control(run_id, request, "resume")
+
+
+@app.post("/api/film-runs/{run_id}/cancel")
+def cancel_film_run(run_id: str, request: FilmRunRevisionRequest):
+    return _film_run_control(run_id, request, "cancel")
 
 
 @app.get("/api/projects/{project_id}/storyboards")

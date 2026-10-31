@@ -3,11 +3,12 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 from contextlib import contextmanager
 
 from .config import Settings
 from .paths import safe_local_path
+from .film_orchestrator import FilmRunConflict, FilmRunTransitionError
 
 
 def now_iso() -> str:
@@ -19,7 +20,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration(target_version=5)
+        self._backup_before_migration(target_version=6)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -144,6 +145,37 @@ class Database:
                     UNIQUE(batch_id,shot_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_film_batch_jobs_job ON film_batch_shots(job_id);
+                CREATE TABLE IF NOT EXISTS film_runs (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+                    request_hash TEXT NOT NULL, prompt TEXT NOT NULL, request_json TEXT NOT NULL DEFAULT '{}',
+                    reference_ids_json TEXT NOT NULL, preset TEXT NOT NULL, budget_json TEXT NOT NULL,
+                    authorization_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL, stage TEXT NOT NULL, completed_stages_json TEXT NOT NULL DEFAULT '[]',
+                    checkpoint_json TEXT NOT NULL DEFAULT '{}', storyboard_id TEXT, film_batch_id TEXT,
+                    render_job_id TEXT, error TEXT, revision INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(project_id,idempotency_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_film_runs_project_updated ON film_runs(project_id,updated_at DESC);
+                CREATE TABLE IF NOT EXISTS film_run_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                    time TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_film_run_events_order ON film_run_events(run_id,id);
+                CREATE TABLE IF NOT EXISTS film_run_shots (
+                    id TEXT PRIMARY KEY, run_id TEXT NOT NULL, shot_key TEXT NOT NULL,
+                    request_hash TEXT NOT NULL, shot_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'planned',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(run_id,shot_key)
+                );
+                CREATE TABLE IF NOT EXISTS film_run_shot_attempts (
+                    id TEXT PRIMARY KEY, run_id TEXT NOT NULL, shot_key TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+                    request_hash TEXT NOT NULL, job_id TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'reserved',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(run_id,shot_key,attempt_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_film_run_shots_order ON film_run_shots(run_id,created_at);
             """)
             shot_columns = {row[1] for row in db.execute("PRAGMA table_info(storyboard_shots)")}
             if "reconciled_job_id" not in shot_columns:
@@ -234,6 +266,13 @@ class Database:
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(5,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(6,?)", (now_iso(),))
+            for run in db.execute("SELECT id,revision,stage FROM film_runs WHERE status='running'"):
+                message = "Application restarted during orchestration; the run was paused at its last durable checkpoint."
+                db.execute("UPDATE film_runs SET status='paused',error=?,revision=revision+1,updated_at=? WHERE id=? AND status='running'",
+                           (message, now_iso(), run["id"]))
+                db.execute("INSERT INTO film_run_events(run_id,revision,time,level,message) VALUES(?,?,?,?,?)",
+                           (run["id"], run["revision"] + 1, now_iso(), "warning", message))
             db.execute("INSERT OR IGNORE INTO project_style_bible_revisions(project_id,revision,style_bible_json,created_at) "
                        "SELECT id,style_bible_revision,style_bible_json,? FROM projects", (now_iso(),))
             db.execute("UPDATE film_batches SET status='paused',updated_at=? WHERE status='running' AND EXISTS "
@@ -658,6 +697,173 @@ class Database:
                             shot.get("width"), shot.get("height"), shot.get("fps"), shot.get("output_location"), shot.get("framing", ""), timestamp, timestamp))
             self._story_snapshot(db, storyboard_id, 1, title, timestamp)
         return self.get_storyboard(storyboard_id)
+
+    @staticmethod
+    def _film_run(row):
+        if row is None:
+            return None
+        item = dict(row)
+        for field, column in (("request", "request_json"), ("reference_ids", "reference_ids_json"), ("budget", "budget_json"),
+                              ("authorization", "authorization_json"), ("completed_stages", "completed_stages_json"),
+                              ("checkpoint", "checkpoint_json")):
+            item[field] = json.loads(item.pop(column) or "{}")
+        item["events"] = []
+        return item
+
+    def create_film_run(self, project_id: str, idempotency_key: str, request_hash: str, request: dict,
+                        *, status: str, stage: str):
+        timestamp, run_id = now_iso(), str(uuid4())
+        budget = request.get("budget", {})
+        authorization = request.get("authorization", {}) if status != "awaiting_authorization" else {}
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR IGNORE INTO film_runs(id,project_id,idempotency_key,request_hash,prompt,request_json,reference_ids_json,preset,budget_json,authorization_json,status,stage,created_at,updated_at) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (run_id, project_id, idempotency_key, request_hash, request["prompt"],
+                        json.dumps(request, ensure_ascii=False, sort_keys=True),
+                        json.dumps(request.get("reference_ids", [])), request.get("preset", "Short"),
+                        json.dumps(budget, sort_keys=True), json.dumps(authorization, sort_keys=True),
+                        status, stage, timestamp, timestamp))
+            row = db.execute("SELECT * FROM film_runs WHERE project_id=? AND idempotency_key=?",
+                             (project_id, idempotency_key)).fetchone()
+            created = row["id"] == run_id
+            if not created and row["request_hash"] != request_hash:
+                raise ValueError("Idempotency key was already used for a different film request")
+            if created:
+                db.execute("INSERT INTO film_run_events(run_id,revision,time,level,message) VALUES(?,?,?,?,?)",
+                           (run_id, 1, timestamp, "info", "Prompt and generation budget saved; no generation job was submitted."))
+        result = self.get_film_run(row["id"])
+        result["created"] = created
+        return result
+
+    def get_film_run(self, run_id: str):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM film_runs WHERE id=?", (run_id,)).fetchone()
+            result = self._film_run(row)
+            if result:
+                result["events"] = [dict(event) for event in db.execute(
+                    "SELECT revision,time,level,message FROM film_run_events WHERE run_id=? ORDER BY id", (run_id,))]
+            return result
+
+    def list_film_runs(self, project_id: str, limit: int = 100):
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM film_runs WHERE project_id=? ORDER BY updated_at DESC LIMIT ?",
+                              (project_id, limit))
+            runs = [self._film_run(row) for row in rows]
+            for run in runs:
+                run["events"] = [dict(event) for event in db.execute(
+                    "SELECT revision,time,level,message FROM film_run_events WHERE run_id=? ORDER BY id", (run["id"],))]
+            return runs
+
+    def update_film_run(self, run_id: str, expected_revision: int, *, status: str, message: str,
+                        authorization: dict | None = None, error: str | None = None):
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changes = {"status": status, "revision": expected_revision + 1, "updated_at": timestamp, "error": error}
+            if authorization is not None:
+                changes["authorization_json"] = json.dumps(authorization, sort_keys=True)
+            cursor = db.execute("UPDATE film_runs SET " + ",".join(f"{key}=?" for key in changes) +
+                                " WHERE id=? AND revision=?", (*changes.values(), run_id, expected_revision))
+            if cursor.rowcount != 1:
+                raise RuntimeError("Film run changed; refresh before updating it")
+            db.execute("INSERT INTO film_run_events(run_id,revision,time,level,message) VALUES(?,?,?,?,?)",
+                       (run_id, expected_revision + 1, timestamp, "error" if error else "info", message[:2000]))
+        return self.get_film_run(run_id)
+
+    def checkpoint_film_run(self, run_id: str, expected_revision: int, expected_stage: str,
+                            next_stage: str, checkpoint: dict, *, status: str, message: str):
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT stage,completed_stages_json,checkpoint_json FROM film_runs WHERE id=? AND revision=? AND status='running'",
+                             (run_id, expected_revision)).fetchone()
+            if not row or row["stage"] != expected_stage:
+                raise RuntimeError("Film run stage changed; checkpoint was not applied")
+            completed = json.loads(row["completed_stages_json"])
+            completed.append(expected_stage)
+            checkpoints = json.loads(row["checkpoint_json"])
+            checkpoints[expected_stage] = checkpoint
+            cursor = db.execute("UPDATE film_runs SET stage=?,status=?,completed_stages_json=?,checkpoint_json=?,revision=revision+1,updated_at=?,error=NULL "
+                                "WHERE id=? AND revision=? AND status='running'",
+                                (next_stage, status, json.dumps(completed), json.dumps(checkpoints, ensure_ascii=False), timestamp,
+                                 run_id, expected_revision))
+            if cursor.rowcount != 1:
+                raise RuntimeError("Film run changed while saving its checkpoint")
+            db.execute("INSERT INTO film_run_events(run_id,revision,time,level,message) VALUES(?,?,?,?,?)",
+                       (run_id, expected_revision + 1, timestamp, "info", message[:2000]))
+        return self.get_film_run(run_id)
+
+    def ensure_film_run_shot(self, run_id: str, shot_key: str, shot_request: dict):
+        """Persist one logical shot once; repeats with different settings conflict."""
+        if not shot_key or len(shot_key) > 200:
+            raise ValueError("A stable shot key of at most 200 characters is required")
+        encoded = json.dumps(shot_request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        import hashlib
+        request_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        timestamp, shot_id = now_iso(), str(uuid4())
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = db.execute("SELECT status,authorization_json,budget_json FROM film_runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise KeyError("Film run not found")
+            if not json.loads(run["authorization_json"]).get("confirmed"):
+                raise FilmRunTransitionError("A shot cannot be planned without initial run authorization")
+            existing = db.execute("SELECT * FROM film_run_shots WHERE run_id=? AND shot_key=?", (run_id, shot_key)).fetchone()
+            if existing:
+                if existing["request_hash"] != request_hash:
+                    raise FilmRunConflict("Shot idempotency key was reused with different shot settings")
+                item = dict(existing)
+                item["shot"] = json.loads(item.pop("shot_json"))
+                item["created"] = False
+                return item
+            budget = json.loads(run["budget_json"])
+            count = db.execute("SELECT COUNT(*) FROM film_run_shots WHERE run_id=?", (run_id,)).fetchone()[0]
+            if count >= budget["max_shots"]:
+                raise FilmRunTransitionError("Film run exceeds the approved shot-count budget")
+            db.execute("INSERT INTO film_run_shots(id,run_id,shot_key,request_hash,shot_json,status,created_at,updated_at) "
+                       "VALUES(?,?,?,?,?,'planned',?,?)",
+                       (shot_id, run_id, shot_key, request_hash, encoded, timestamp, timestamp))
+        return {"id": shot_id, "run_id": run_id, "shot_key": shot_key, "request_hash": request_hash,
+                "shot": shot_request, "status": "planned", "created": True}
+
+    def reserve_film_run_shot_attempt(self, run_id: str, shot_key: str, attempt_number: int, attempt_request: dict):
+        """Reserve a stable per-shot attempt key before a future adapter can submit work."""
+        import hashlib
+        if attempt_number < 0:
+            raise ValueError("Attempt number cannot be negative")
+        encoded = json.dumps(attempt_request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        request_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = db.execute("SELECT status,stage,authorization_json,budget_json FROM film_runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise KeyError("Film run not found")
+            if run["status"] != "running" or run["stage"] != "generate_shots":
+                raise FilmRunTransitionError("Shot attempts can be reserved only during the generation stage")
+            if not json.loads(run["authorization_json"]).get("confirmed"):
+                raise FilmRunTransitionError("An authorized generation budget is required")
+            shot = db.execute("SELECT id FROM film_run_shots WHERE run_id=? AND shot_key=?", (run_id, shot_key)).fetchone()
+            if not shot:
+                raise KeyError("Film run shot is not planned")
+            budget = json.loads(run["budget_json"])
+            if attempt_number > budget["max_retries_per_shot"]:
+                raise FilmRunTransitionError("Per-shot retry budget is exhausted")
+            existing = db.execute("SELECT * FROM film_run_shot_attempts WHERE run_id=? AND shot_key=? AND attempt_number=?",
+                                  (run_id, shot_key, attempt_number)).fetchone()
+            if existing:
+                if existing["request_hash"] != request_hash:
+                    raise FilmRunConflict("Shot attempt idempotency key was reused with different settings")
+                return dict(existing) | {"created": False}
+            key = str(uuid5(NAMESPACE_URL, f"framework-film-run:{run_id}:{shot_key}:{attempt_number}"))
+            attempt_id = str(uuid4())
+            db.execute("INSERT INTO film_run_shot_attempts(id,run_id,shot_key,attempt_number,idempotency_key,request_hash,status,created_at,updated_at) "
+                       "VALUES(?,?,?,?,?,?,'reserved',?,?)",
+                       (attempt_id, run_id, shot_key, attempt_number, key, request_hash, timestamp, timestamp))
+        return {"id": attempt_id, "run_id": run_id, "shot_key": shot_key,
+                "attempt_number": attempt_number, "idempotency_key": key,
+                "request_hash": request_hash, "status": "reserved", "created": True}
 
     def create_film_plan(self, project_id: str, title: str, source_story: str, shots: list[dict],
                          target_format: str, preset: str, metadata: dict) -> dict:
