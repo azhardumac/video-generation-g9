@@ -671,3 +671,147 @@ def test_reveal_output_rejects_non_macos_and_non_video_paths(monkeypatch):
     with pytest.raises(HTTPException) as nonvideo:
         asyncio.run(api.reveal_output(api.RevealOutputRequest(path=str(_PROJECT))))
     assert nonvideo.value.status_code==400
+
+
+def test_project_scene_continuity_is_scoped_versioned_and_requires_historical_approval(monkeypatch):
+    from uuid import uuid4
+    root = _ROOT / f"continuity-{uuid4().hex}"
+    root.mkdir()
+    project_id = f"continuity-project-{uuid4().hex}"
+    api.db.create_project({"id":project_id,"name":"Continuity test","root":str(root),"aspect_ratio":"9:16","frame_rate":24,"production_type":"test"})
+    frog_path, scorpion_path = root / "frog-original.png", root / "scorpion-original.png"
+    historic_path = root / "riverbank-master.png"
+    old_video_path = root / "old-generated-footage.mp4"
+    frog_path.write_bytes(b"\x89PNG\r\n\x1a\noriginal frog")
+    scorpion_path.write_bytes(b"\x89PNG\r\n\x1a\noriginal scorpion")
+    historic_path.write_bytes(b"\x89PNG\r\n\x1a\nhistorical scene")
+    old_video_path.write_bytes(b"not a playable video; reference validation fixture")
+    refs = [
+        api.add_existing_project_reference(project_id, api.ProjectReferenceCreate(path=str(frog_path), name="Original frog", category="character")),
+        api.add_existing_project_reference(project_id, api.ProjectReferenceCreate(path=str(scorpion_path), name="Original scorpion", category="character")),
+        api.add_existing_project_reference(project_id, api.ProjectReferenceCreate(path=str(historic_path), name="riverbank-master historical plate", category="scene")),
+    ]
+    frog, scorpion, historic = refs
+    old_video = api.db.add_project_reference({"id":str(uuid4()), "project_id":project_id,
+        "name":"old generated footage", "category":"scene", "path":str(old_video_path),
+        "source_kind":"linked", "mime_type":"video/mp4", "size_bytes":old_video_path.stat().st_size,
+        "content_hash":"test-only"})
+    scene = {"title":"Crossing wide", "stage_layout":"One frog left, one scorpion right; broad water between banks.",
+             "framing":"Wide side view", "continuity_notes":"Exactly two characters; preserve handmade clay silhouettes.",
+             "expected_character_count":2, "character_identities":["frog","scorpion"],
+             "river_width_scale":"Wide river across the frame", "camera_orientation":"Bank-to-bank side view",
+             "anchor_reference_ids":[historic["id"]], "anchor_frame_indices":[0]}
+    body = {"frog_reference_id":frog["id"], "scorpion_reference_id":scorpion["id"],
+            "environment_reference_id":historic["id"], "scenes":[scene]}
+    with pytest.raises(HTTPException, match="Explicitly approve"):
+        api.save_scene_continuity(project_id, api.SceneContinuitySaveRequest(document=body))
+    body["historical_reference_approval_id"] = f"wrong-{historic['id']}"
+    with pytest.raises(HTTPException, match="this exact reference"):
+        api.save_scene_continuity(project_id, api.SceneContinuitySaveRequest(document=body))
+    body["historical_reference_approval_id"] = historic["id"]
+    saved = api.save_scene_continuity(project_id, api.SceneContinuitySaveRequest(document=body))
+    assert saved["revision"] == 1 and saved["approved_revision"] is None
+    assert saved["document"]["frog_reference_id"] == frog["id"]
+    video_body = body | {"environment_reference_id":old_video["id"], "historical_reference_approval_id":old_video["id"],
+        "scenes":[scene | {"anchor_reference_ids":[old_video["id"]]}]}
+    with pytest.raises(HTTPException, match="image files"):
+        api.save_scene_continuity(project_id, api.SceneContinuitySaveRequest(document=video_body))
+    approved = api.approve_scene_continuity(project_id, api.SceneContinuityApproveRequest(revision=1))
+    assert approved["approved_revision"] == 1
+    monkeypatch.setattr(api, "detect_integrations", lambda _: {"ltx":{"ready":True,"runner_available":True,"weights_cached":True}})
+    capabilities = api.get_scene_continuity(project_id)["capabilities"]
+    assert capabilities["multi_image_anchors"]["status"] == "experimental"
+    assert capabilities["video_extension"]["enabled"] is False
+    assert capabilities["ic_lora"]["status"] == "weights_missing"
+    body["historical_reference_approval_id"] = None
+    body["environment_reference_id"] = None
+    body["scenes"] = [{key:value for key,value in scene.items() if key not in ("anchor_reference_ids", "anchor_frame_indices")} | {"title":"New river scene", "anchor_reference_ids":[], "anchor_frame_indices":[]}]
+    edited = api.save_scene_continuity(project_id, api.SceneContinuitySaveRequest(document=body))
+    assert edited["revision"] == 2 and edited["approved_revision"] is None
+    assert api.db.get_scene_continuity(project_id)["revision"] == 2
+    assert api.db.get_scene_continuity(project_id)["document"]["scenes"][0]["title"] == "New river scene"
+
+    other_root = root / "other-project"
+    other_root.mkdir()
+    api.db.create_project({"id":"other-continuity-scope", "name":"Other", "root":str(other_root),
+                           "aspect_ratio":"9:16", "frame_rate":24, "production_type":"test"})
+    other_ref_path = other_root / "other-frog.png"
+    other_ref_path.write_bytes(b"\x89PNG\r\n\x1a\nother frog")
+    other_ref = api.add_existing_project_reference("other-continuity-scope", api.ProjectReferenceCreate(
+        path=str(other_ref_path), name="Other frog", category="character"))
+    with pytest.raises(HTTPException, match="linked to this project"):
+        api.save_scene_continuity(project_id, api.SceneContinuitySaveRequest(document={
+            "frog_reference_id":other_ref["id"], "scorpion_reference_id":scorpion["id"], "scenes":[]}))
+
+
+def test_creative_rejection_does_not_change_technical_verification_and_keeps_review_history(monkeypatch):
+    from uuid import uuid4
+    api.db.import_project("scorpion-frog", "Scorpion & Frog", str(_PROJECT), [])
+    root = _ROOT / f"creative-review-{uuid4().hex}"
+    root.mkdir()
+    project_id = f"creative-project-{uuid4().hex}"
+    api.db.create_project({"id":project_id,"name":"Creative review test","root":str(root),"aspect_ratio":"9:16","frame_rate":24,"production_type":"test"})
+    frog_path, scorpion_path = root / "frog.png", root / "scorpion.png"
+    frog_path.write_bytes(b"\x89PNG\r\n\x1a\nfrog ref")
+    scorpion_path.write_bytes(b"\x89PNG\r\n\x1a\nscorpion ref")
+    frog = api.add_existing_project_reference(project_id, api.ProjectReferenceCreate(path=str(frog_path), name="Frog", category="character"))
+    scorpion = api.add_existing_project_reference(project_id, api.ProjectReferenceCreate(path=str(scorpion_path), name="Scorpion", category="character"))
+    continuity = api.save_scene_continuity(project_id, api.SceneContinuitySaveRequest(document={
+        "frog_reference_id":frog["id"], "scorpion_reference_id":scorpion["id"], "scenes":[{
+            "title":"River", "anchor_reference_ids":[frog["id"],scorpion["id"]], "anchor_frame_indices":[0,24]}]}))
+    api.approve_scene_continuity(project_id, api.SceneContinuityApproveRequest(revision=continuity["revision"]))
+    monkeypatch.setattr(api, "detect_integrations", lambda _: {"ltx":{"ready":True},"remotion":{"ready":True}})
+    style_revision = api.db.get_project(project_id)["style_bible_revision"]
+    project_output = str(api._project_output(api.db.get_project(project_id)))
+    story = api.db.create_storyboard(project_id, "Creative review fixture", [{
+        "scene_title":"River", "title":"One test shot", "prompt":"A single frog and scorpion cross a broad river.",
+        "reference_image":None, "preset":"Short", "seed":19,"width":448,"height":768,"fps":24,"output_location":project_output,
+    }])
+    shot = story["shots"][0]
+    story = api.db.update_storyboard(story["id"], story["revision"], story["title"], [shot | {
+        "prompt_reviewed":True, "reviewed_style_revision":style_revision,"width":448,"height":768,
+        "fps":24,"output_location":project_output}], story["story_text"])
+    shot = story["shots"][0]
+    job = api.queue_storyboard_shot(story["id"], shot["id"], api.ShotGenerateRequest(
+        continuity_revision=continuity["revision"], use_experimental_multi_anchor=True))
+    assert job["payload"]["conditioning_mode"] == "experimental-temporal-multi-image"
+    assert [anchor["reference_id"] for anchor in job["payload"]["reference_anchors"]] == [frog["id"],scorpion["id"]]
+    from app.adapters import build_ltx_command
+    args = build_ltx_command("local-ltx", job["payload"], "/out/test.partial.mp4")
+    assert args.count("--image") == 2 and args[args.index("--image") + 2] == "0"
+    assert api.db.claim_job(job["id"])
+    clip = api.settings.expanded(api.settings.output_root) / f"creative-{job['id']}.mp4"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(b"verified test fixture; no media generation")
+    assert api.db.complete_job(job["id"], progress=100, result_path=str(clip), exit_code=0,
+        verification_metadata={"verified_output":{"width":448,"height":768,"fps":24,"frames":49}})
+    with pytest.raises(HTTPException, match="current verified clip") as duplicate:
+        api.queue_storyboard_shot(story["id"], shot["id"])
+    assert duplicate.value.status_code == 409
+    rejected = api.review_shot_creatively(story["id"], shot["id"], api.CreativeReviewRequest(
+        decision="rejected", continuity_revision=continuity["revision"], checklist={"environment":False},
+        reason="The river reads as a puddle."))
+    assert rejected["decision"] == "rejected"
+    loaded = api.get_storyboard(story["id"])
+    assert loaded["shots"][0]["status"] == "verified"
+    assert loaded["shots"][0]["job"]["id"] == job["id"]
+    assert loaded["shots"][0]["creative_review_current"] is True
+    approved = api.review_shot_creatively(story["id"], shot["id"], api.CreativeReviewRequest(
+        decision="approved", continuity_revision=continuity["revision"],
+        checklist={key:True for key in ("identities","count","environment","framing","artifacts")}))
+    assert approved["decision"] == "approved"
+    with api.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM shot_creative_reviews WHERE shot_id=?", (shot["id"],)).fetchone()[0] == 2
+    assert api.db.get_job(job["id"])["result_path"] == str(clip)
+
+
+def test_unverified_clip_cannot_receive_creative_approval():
+    story = api.db.create_storyboard("scorpion-frog", "Pending review fixture", [{
+        "scene_title":"Scene", "title":"Unverified shot", "prompt":"A shot", "reference_image":None,
+        "preset":"Short", "seed":1, "prompt_reviewed":True, "reviewed_style_revision":0,
+    }])
+    shot = story["shots"][0]
+    with pytest.raises(HTTPException, match="technically verified") as rejected:
+        api.review_shot_creatively(story["id"], shot["id"], api.CreativeReviewRequest(
+            decision="approved", continuity_revision=1, checklist={"all":True}))
+    assert rejected.value.status_code == 409

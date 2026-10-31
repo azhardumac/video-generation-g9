@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
-import { Aperture, ArrowUpRight, BookOpen, Check, ChevronDown, Command, Film, FolderOpen, Gauge, HardDrive, History, Image, LayoutDashboard, ListVideo, LoaderCircle, Plus, Settings, SlidersHorizontal, Sparkles, WandSparkles, X, AlertTriangle } from 'lucide-react'
+import { Aperture, ArrowUpRight, BookOpen, Check, ChevronDown, Command, Film, FolderOpen, Gauge, HardDrive, History, Image, LayoutDashboard, ListVideo, LoaderCircle, Plus, Settings, SlidersHorizontal, Sparkles, WandSparkles, X, AlertTriangle, ShieldCheck } from 'lucide-react'
 import StoryboardPage from './StoryboardPage'
 import ProjectsPage, { type Project } from './ProjectsPage'
 import ProjectReferencesPage from './ProjectReferencesPage'
 import StyleBiblePage from './StyleBiblePage'
 import FilmPlanPage from './FilmPlanPage'
+import SceneContinuityPage from './SceneContinuityPage'
 
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
 type Asset = { id: string; category: string; relative_path: string; path: string; name: string; size_bytes: number; mime_type: string }
@@ -13,7 +14,7 @@ type Job = { id: string; kind?:string; status: string; progress: number; payload
 type Integration = { ltx: { root: string; installed: boolean; runner: string; runner_available: boolean; model: string; hf_home: string; cache_available: boolean; weights_cached: boolean; ready: boolean }; remotion: { root: string; installed: boolean; cli: string; cli_available: boolean; version: string | null; ready: boolean }; story_project: { root: string; available: boolean }; ffprobe: { available: boolean; path: string | null } }
 type Resources = { disk_free_bytes: number; memory: { total_bytes: number | null; available_bytes: number | null }; swap: { total_bytes: number | null; used_bytes: number | null }; memory_pressure: { free_percent: number; level: string } | null; warnings:string[] }
 const nav = [
-  { group: 'STUDIO', items: [['Overview', LayoutDashboard], ['Projects', FolderOpen], ['Storyboard', ListVideo], ['Story to Film', Film], ['Export / Remotion', Film], ['References', Image], ['Style bible', BookOpen]] },
+  { group: 'STUDIO', items: [['Overview', LayoutDashboard], ['Projects', FolderOpen], ['Storyboard', ListVideo], ['Story to Film', Film], ['Scene continuity', ShieldCheck], ['Export / Remotion', Film], ['References', Image], ['Style bible', BookOpen]] },
   { group: 'PRODUCTION', items: [['Generate video', WandSparkles], ['Job queue', Gauge], ['History & logs', History]] },
   { group: 'WORKSPACE', items: [['Settings', Settings]] },
 ] as const
@@ -144,6 +145,7 @@ export default function App() {
         {active === 'Projects' && <ProjectsPage projects={projects} activeId={activeProject?.id??null} onChanged={refreshProjects} onSelect={selectProject} onMessage={setNotice}/>}
         {active === 'References' && <ProjectReferencesPage projectId={activeProject?.id??null} onMessage={setNotice} onUse={path=>{setReferenceImage(path);setActive('Generate video')}}/>}
         {active === 'Style bible' && <StyleBiblePage projectId={activeProject?.id??null} onMessage={setNotice}/>}
+        {active === 'Scene continuity' && <SceneContinuityPage projectId={activeProject?.id??null} onMessage={setNotice}/>}
         {active === 'Storyboard' && <StoryboardPage projectId={activeProject?.id??null} project={activeProject} assets={assets} jobs={jobs} ltxReady={Boolean(integrations?.ltx.ready)} onMessage={setNotice} onDirtyChange={setUnsavedStoryboard}/>}
         {(active === 'Story to Film' || active === 'Export / Remotion') && <FilmPlanPage projectId={activeProject?.id??null} projectName={activeProject?.name??''} onMessage={setNotice} onNavigate={navigate} focusExport={active === 'Export / Remotion'}/>}
         <div hidden={active !== 'Overview' && active !== 'Generate video'}>

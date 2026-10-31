@@ -107,6 +107,47 @@ class ProjectReferenceUpdate(BaseModel):
     notes: str | None = Field(default=None, max_length=2000)
 
 
+class ContinuityScene(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    stage_layout: str = Field(default="", max_length=2000)
+    framing: str = Field(default="", max_length=500)
+    continuity_notes: str = Field(default="", max_length=3000)
+    expected_character_count: int = Field(default=2, ge=0, le=20)
+    character_identities: list[str] = Field(default_factory=list, max_length=20)
+    river_width_scale: str = Field(default="", max_length=500)
+    camera_orientation: str = Field(default="", max_length=500)
+    anchor_reference_ids: list[str] = Field(default_factory=list, max_length=8)
+    anchor_frame_indices: list[int] = Field(default_factory=list, max_length=8)
+
+
+class SceneContinuityDocument(BaseModel):
+    frog_reference_id: str = Field(min_length=1, max_length=160)
+    scorpion_reference_id: str = Field(min_length=1, max_length=160)
+    environment_reference_id: str | None = Field(default=None, max_length=160)
+    historical_reference_approval_id: str | None = Field(default=None, max_length=160)
+    scenes: list[ContinuityScene] = Field(default_factory=list, max_length=30)
+
+
+class SceneContinuitySaveRequest(BaseModel):
+    document: SceneContinuityDocument
+
+
+class SceneContinuityApproveRequest(BaseModel):
+    revision: int = Field(ge=1)
+
+
+class CreativeReviewRequest(BaseModel):
+    decision: Literal["approved", "rejected"]
+    continuity_revision: int = Field(ge=1)
+    checklist: dict[str, bool]
+    reason: str = Field(default="", max_length=2000)
+
+
+class ShotGenerateRequest(BaseModel):
+    continuity_revision: int | None = Field(default=None, ge=1)
+    use_experimental_multi_anchor: bool = False
+
+
 class CreateStoryboardRequest(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     story_text: str = Field(default="", max_length=20000)
@@ -247,6 +288,153 @@ def _reference_by_id(project_id: str, reference_id: str, character: str) -> dict
         raise HTTPException(400, f"The selected {character} reference must have the character category")
     path = _validate_project_reference(_project(project_id), reference["path"])
     return reference | {"path": str(path)}
+
+
+def _reference_details(project_id: str, reference_id: str, expected_category: str | None = None) -> dict:
+    item = db.get_project_reference(project_id, reference_id)
+    if not item:
+        raise HTTPException(400, "Reference must be linked to this project")
+    if expected_category and item["category"] != expected_category:
+        raise HTTPException(400, f"Select a {expected_category} reference")
+    if not str(item.get("mime_type", "")).startswith("image/"):
+        raise HTTPException(400, "Scene continuity references must be local image files; video clips cannot be used as image anchors")
+    path = _validate_project_reference(_project(project_id), item["path"])
+    if not path or not path.is_file():
+        raise HTTPException(400, f"Reference file is unavailable: {item['name']}")
+    return item | {"path": str(path)}
+
+
+def _is_historical_visual_reference(item: dict) -> bool:
+    path = Path(item["path"]).expanduser().resolve()
+    try:
+        output_root = settings.expanded(settings.output_root).resolve()
+        if path == output_root or output_root in path.parents:
+            return True
+    except OSError:
+        pass
+    name = f"{item.get('name', '')} {path.name}".casefold()
+    return any(token in name for token in ("riverbank-master", "benchmark", "storyboard", "generated", ".mp4", ".mov"))
+
+
+def _validated_continuity_document(project_id: str, document: SceneContinuityDocument) -> dict:
+    if document.frog_reference_id == document.scorpion_reference_id:
+        raise HTTPException(400, "Frog and scorpion must use two distinct character references")
+    frog = _reference_details(project_id, document.frog_reference_id, "character")
+    scorpion = _reference_details(project_id, document.scorpion_reference_id, "character")
+    if _is_historical_visual_reference(frog) or _is_historical_visual_reference(scorpion):
+        raise HTTPException(400, "Original character anchors must be linked character references, not old outputs or historical riverbank media")
+    env = None
+    if document.environment_reference_id:
+        env = _reference_details(project_id, document.environment_reference_id, "scene")
+        if _is_historical_visual_reference(env) and document.historical_reference_approval_id != env["id"]:
+            raise HTTPException(400, "This environment image looks historical or generated. Explicitly approve this exact reference before using it")
+    scene_titles: set[str] = set()
+    references = {frog["id"]: frog, scorpion["id"]: scorpion}
+    if env:
+        references[env["id"]] = env
+    scenes = []
+    for scene in document.scenes:
+        normalized = scene.model_dump()
+        title = normalized["title"].strip()
+        if not title or title.casefold() in scene_titles:
+            raise HTTPException(422, "Scene titles must be non-empty and unique")
+        scene_titles.add(title.casefold())
+        if len(set(normalized["anchor_reference_ids"])) != len(normalized["anchor_reference_ids"]):
+            raise HTTPException(422, "Scene anchor references must not be repeated")
+        if len(normalized["anchor_frame_indices"]) != len(normalized["anchor_reference_ids"]):
+            raise HTTPException(422, "Each reference anchor needs exactly one frame index")
+        if len(set(normalized["anchor_frame_indices"])) != len(normalized["anchor_frame_indices"]):
+            raise HTTPException(422, "Each temporal image anchor must use a distinct frame index")
+        if any(index < 0 or index > 192 for index in normalized["anchor_frame_indices"]):
+            raise HTTPException(422, "Reference anchor frame indices must be between 0 and 192")
+        for ref_id in normalized["anchor_reference_ids"]:
+            if ref_id not in references:
+                raise HTTPException(400, "A scene anchor must be one of the approved character references or environment reference")
+        normalized["title"] = title
+        scenes.append(normalized)
+    return {"frog_reference_id": frog["id"], "scorpion_reference_id": scorpion["id"],
+            "environment_reference_id": env["id"] if env else None,
+            "historical_reference_approval_id": (env["id"] if env and _is_historical_visual_reference(env) and
+                document.historical_reference_approval_id == env["id"] else None), "scenes": scenes}
+
+
+@app.get("/api/projects/{project_id}/scene-continuity")
+def get_scene_continuity(project_id: str):
+    _project(project_id)
+    state = db.get_scene_continuity(project_id)
+    ltx = detect_integrations(settings)["ltx"]
+    runner_available = bool(ltx.get("runner_available", ltx.get("ready", False)))
+    cache = settings.expanded(settings.hf_cache)
+    hub_cache = cache / "hub" if (cache / "hub").is_dir() else cache
+    try:
+        ic_lora_weights = any(path.is_dir() and "IC-LoRA" in path.name for path in hub_cache.glob("models--*"))
+    except OSError:
+        ic_lora_weights = False
+    references = {item["id"]: item for item in db.project_references(project_id)}
+    for field in ("frog_reference_id", "scorpion_reference_id", "environment_reference_id"):
+        reference_id = (state.get("document") or {}).get(field)
+        if reference_id:
+            try:
+                path = safe_local_path(references[reference_id]["path"], settings, must_exist=True) if references.get(reference_id) else None
+                state.setdefault("reference_availability", {})[field] = bool(path and path.is_file())
+            except (ValueError, FileNotFoundError):
+                state.setdefault("reference_availability", {})[field] = False
+    state["capabilities"] = {"independent_i2v": {"available": runner_available and bool(ltx.get("weights_cached", ltx.get("ready", False))), "status": "supported" if ltx.get("ready", False) else "not_ready", "description": "Existing single-image image-to-video generation; uses the configured local runner and offline Q8 cache."},
+        "multi_image_anchors": {"available": runner_available, "enabled": runner_available, "status": "experimental" if runner_available else "runner_missing", "description": "Installed CLI accepts repeated temporal --image anchors. These guide frames over time; they do not lock character identity or placement."},
+        "video_extension": {"available": runner_available, "enabled": False, "status": "experimental_blocked" if runner_available else "runner_missing", "description": "The installed CLI exposes extend, but this mode is experimental for this cached build, audio behavior is not safely compatible, and 16 GB source-encode memory has not been validated."},
+        "ic_lora": {"available": runner_available, "enabled": False, "status": "experimental_blocked" if ic_lora_weights else "weights_missing", "description": "The installed CLI subcommand exists, but compatible IC-LoRA/control weights are not in the existing local cache."}}
+    return state
+
+
+@app.put("/api/projects/{project_id}/scene-continuity")
+def save_scene_continuity(project_id: str, request: SceneContinuitySaveRequest):
+    _project(project_id)
+    document = _validated_continuity_document(project_id, request.document)
+    return db.save_scene_continuity(project_id, document)
+
+
+@app.post("/api/projects/{project_id}/scene-continuity/approve")
+def approve_scene_continuity(project_id: str, request: SceneContinuityApproveRequest):
+    _project(project_id)
+    current = db.get_scene_continuity(project_id)
+    if current["revision"] != request.revision or not current.get("document"):
+        raise HTTPException(409, "Save the current continuity package before approving it")
+    # Revalidate links and local file availability immediately before recording approval.
+    _validated_continuity_document(project_id, SceneContinuityDocument.model_validate(current["document"]))
+    try:
+        return db.approve_scene_continuity(project_id, request.revision)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/storyboards/{storyboard_id}/shots/{shot_id}/creative-review")
+def review_shot_creatively(storyboard_id: str, shot_id: str, request: CreativeReviewRequest):
+    story = db.get_storyboard(storyboard_id, include_events=False)
+    if not story:
+        raise HTTPException(404, "Storyboard not found")
+    shot = next((item for item in story["shots"] if item["id"] == shot_id), None)
+    if not shot:
+        raise HTTPException(404, "Shot not found")
+    job = shot.get("job")
+    try:
+        current_output = safe_local_path(job["result_path"], settings, must_exist=True) if job and job.get("result_path") else None
+    except (ValueError, FileNotFoundError):
+        current_output = None
+    verified = bool(job and job["status"] == "completed" and job.get("exit_code") == 0 and
+        (job.get("verification_metadata") or {}).get("verified_output") and current_output and current_output.is_file() and shot.get("settings_match"))
+    if not verified:
+        raise HTTPException(409, "Creative review requires the current shot output to remain technically verified")
+    continuity = db.get_scene_continuity(story["project_id"])
+    if continuity.get("approved_revision") != request.continuity_revision or continuity.get("revision") != request.continuity_revision:
+        raise HTTPException(409, "Approve the current project continuity package before reviewing this clip")
+    required_checks = {"identities", "count", "environment", "framing", "artifacts"}
+    if request.decision == "approved" and (set(request.checklist) != required_checks or not all(request.checklist.values())):
+        raise HTTPException(422, "Approve only after confirming every creative review checklist item")
+    if request.decision == "rejected" and not request.reason.strip():
+        raise HTTPException(422, "A clear rejection reason is required")
+    return db.add_creative_review(project_id=story["project_id"], storyboard_id=storyboard_id, shot_id=shot_id,
+        job_id=job["id"], storyboard_revision=story["revision"], continuity_revision=request.continuity_revision,
+        decision=request.decision, checklist=request.checklist, reason=request.reason.strip())
 
 
 def _validate_image_path(raw: str) -> tuple[Path, str, int, str]:
@@ -1141,13 +1329,16 @@ def archive_storyboard(storyboard_id: str):
 
 
 @app.post("/api/storyboards/{storyboard_id}/shots/{shot_id}/generate", status_code=201)
-def queue_storyboard_shot(storyboard_id: str, shot_id: str):
+def queue_storyboard_shot(storyboard_id: str, shot_id: str, request: ShotGenerateRequest | None = None):
+    request = request or ShotGenerateRequest()
     story = db.get_storyboard(storyboard_id)
     if not story:
         raise HTTPException(404, "Storyboard not found")
     shot = next((item for item in story["shots"] if item["id"] == shot_id), None)
     if not shot:
         raise HTTPException(404, "Shot not found")
+    if shot.get("status") == "verified":
+        raise HTTPException(409, "This shot already has a current verified clip. Edit and review its settings before creating a replacement.")
     if not shot.get("prompt_reviewed") or shot.get("reviewed_style_revision", 0) != story.get("style_bible_revision", 0):
         raise HTTPException(409, "Review and confirm the exact shot prompt and style context before queueing")
     if not detect_integrations(settings)["ltx"]["ready"]:
@@ -1169,6 +1360,26 @@ def queue_storyboard_shot(storyboard_id: str, shot_id: str):
                      "width": width, "height": height, "fps": fps, "output_location": payload["output_location"],
                      "framing": shot.get("framing", ""), "aspect_ratio": project.get("aspect_ratio")}
     payload.update(shot_prompt=shot["prompt"], style_context=style_context, shot_settings=shot_settings)
+    if request.use_experimental_multi_anchor:
+        continuity = db.get_scene_continuity(story["project_id"])
+        if request.continuity_revision is None or continuity.get("approved_revision") != request.continuity_revision or continuity.get("revision") != request.continuity_revision:
+            raise HTTPException(409, "Approve the current scene continuity package before using experimental multi-image anchors")
+        document = continuity.get("document") or {}
+        scene = next((item for item in document.get("scenes", []) if item["title"].casefold() == (shot.get("scene_title") or "").casefold()), None)
+        if not scene or not scene.get("anchor_reference_ids"):
+            raise HTTPException(409, "This shot's scene has no explicitly approved image anchors")
+        anchors = []
+        frame_indices = scene["anchor_frame_indices"]
+        for reference_id, frame_index in zip(scene["anchor_reference_ids"], frame_indices):
+            if frame_index >= payload["frames"]:
+                raise HTTPException(422, "A temporal anchor frame index must be inside the selected shot duration")
+            item = _reference_details(story["project_id"], reference_id)
+            if _is_historical_visual_reference(item) and document.get("historical_reference_approval_id") != item["id"]:
+                raise HTTPException(400, "Historical anchor requires explicit approval")
+            anchors.append({"path": item["path"], "frame_index": frame_index, "strength": 1.0, "reference_id": reference_id})
+        payload["reference_anchors"] = anchors
+        payload["continuity_revision"] = request.continuity_revision
+        payload["conditioning_mode"] = "experimental-temporal-multi-image"
     try:
         return db.create_shot_job(storyboard_id, shot_id, payload)
     except KeyError as exc:
