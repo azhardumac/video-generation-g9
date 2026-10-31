@@ -419,11 +419,60 @@ def test_approved_film_batch_is_sequential_pausable_cancellable_retryable_and_as
     assert len(api.db.list_jobs(project_id=project["id"])) == 23
     assert api.db.list_jobs(project_id=project["id"])[0]["kind"] == "generation"
     assert first_output.read_bytes() == b"test-only verified fixture"
+
+    # Simulate the user's second, paused batch without invoking any adapter.
+    from uuid import uuid4
+    duplicate_batch_id = str(uuid4())
+    with api.db.connect() as local_db:
+        local_db.execute("INSERT INTO film_batches(id,storyboard_id,project_id,storyboard_revision,style_bible_revision,status,created_at,updated_at) VALUES(?,?,?,?,?,'paused',?,?)",
+                         (duplicate_batch_id, plan["id"], project["id"], plan["revision"], plan["style_bible_revision"], "2026-01-01", "2026-01-01"))
+    source_first = api.db.get_job(initial_job_ids[0])
+    completed_extra_payload = source_first["payload"] | {"film_batch_id": duplicate_batch_id}
+    completed_extra = api.db.create_job("generation", completed_extra_payload, project_id=project["id"])
+    assert api.db.claim_job(completed_extra["id"])
+    completed_extra_path = output_dir / f"{completed_extra['id']}.completed-extra.mp4"
+    completed_extra_path.write_bytes(b"preserve completed extra")
+    assert api.db.complete_job(completed_extra["id"], progress=100, result_path=str(completed_extra_path), exit_code=0,
+                               verification_metadata={"verified_output": {"width": 448, "height": 768, "fps": 24, "frames": 49}})
+    with api.db.connect() as local_db:
+        local_db.execute("INSERT INTO film_batch_shots(batch_id,shot_id,position,status,job_id) VALUES(?,?,0,'completed',?)",
+                         (duplicate_batch_id, batch["shots"][0]["shot_id"], completed_extra["id"]))
+    duplicate_shot_id = batch["shots"][1]["shot_id"]
+    source_second = api.db.get_job(initial_job_ids[1])
+    queued_duplicate = api.db.create_job("generation", source_second["payload"] | {"film_batch_id": duplicate_batch_id}, project_id=project["id"])
+    with api.db.connect() as local_db:
+        local_db.execute("INSERT INTO film_batch_shots(batch_id,shot_id,position,status,job_id) VALUES(?,?,1,'queued',?)",
+                         (duplicate_batch_id, duplicate_shot_id, queued_duplicate["id"]))
+
+    export = api.film_plan_export_status(plan["id"])
+    assert export["all_verified"] and not export["reconciled"]
+    assert len(export["source_batches"]) == 1 and export["source_batches"][0]["id"] == batch["id"]
+    assert export["paused_batches"] == [{"id": duplicate_batch_id, "status": "paused",
+                                         "queued_jobs": [queued_duplicate["id"]],
+                                         "completed_jobs": [completed_extra["id"]]}]
+
+    async def fresh_probe(path, _settings, expected=None):
+        assert Path(path).is_file()
+        return {"verified_output": expected}
+
+    monkeypatch.setattr(api, "verify_video", fresh_probe)
+    reconciled = asyncio.run(api.reconcile_verified_shots(plan["id"], api.ReconcileVerifiedShotsRequest(
+        revision=plan["revision"], style_bible_revision=plan["style_bible_revision"], source_batch_id=batch["id"])))
+    assert reconciled["reconciled_shots"] == 12 and reconciled["cancelled_job_ids"] == [queued_duplicate["id"]]
+    assert api.db.get_job(queued_duplicate["id"])["status"] == "cancelled"
+    assert api.db.get_job(completed_extra["id"])["status"] == "completed"
+    assert completed_extra_path.read_bytes() == b"preserve completed extra"
+    assert api.db.get_film_batch(duplicate_batch_id)["status"] == "cancelled"
+    assert api.film_plan_export_status(plan["id"])["reconciled"]
+    assert all(shot["reconciled_job_id"] == shot["job"]["id"] for shot in reconciled["storyboard"]["shots"])
+    assembled = api.create_storyboard_manifest(plan["id"])
+    assert assembled["manifest"]["duration_in_frames"] == 548
+    assert Path(assembled["manifest_path"]).is_file()
     repeated = api.generate_film(plan["id"], api.GenerateFilmRequest(
         revision=plan["revision"], style_bible_revision=plan["style_bible_revision"]))
-    assert repeated["status"] == "completed" and repeated["queued_shots"] == 0
-    assert len(api.db.list_jobs(project_id=project["id"])) == 23
-    assert all(item["status"] == "completed" and item["job"] for item in repeated["shots"])
+    assert repeated["status"] == "ready_for_export" and repeated["queued_shots"] == 0
+    assert len(api.db.list_jobs(project_id=project["id"])) == 25
+    assert all(item["status"] == "verified" and item["job"] for item in api.get_storyboard(plan["id"])["shots"])
 
 
 def test_project_reference_validation_scoping_and_unlink_preserve_source():

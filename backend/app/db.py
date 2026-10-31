@@ -19,7 +19,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration(target_version=3)
+        self._backup_before_migration(target_version=4)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -130,6 +130,9 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_film_batch_jobs_job ON film_batch_shots(job_id);
             """)
             shot_columns = {row[1] for row in db.execute("PRAGMA table_info(storyboard_shots)")}
+            if "reconciled_job_id" not in shot_columns:
+                db.execute("ALTER TABLE storyboard_shots ADD COLUMN reconciled_job_id TEXT")
+                shot_columns.add("reconciled_job_id")
             if "scene_id" not in shot_columns:
                 db.execute("ALTER TABLE storyboard_shots ADD COLUMN scene_id TEXT")
             shot_job_columns = {row[1] for row in db.execute("PRAGMA table_info(shot_jobs)")}
@@ -213,6 +216,7 @@ class Database:
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO project_style_bible_revisions(project_id,revision,style_bible_json,created_at) "
                        "SELECT id,style_bible_revision,style_bible_json,? FROM projects", (now_iso(),))
             db.execute("UPDATE film_batches SET status='paused',updated_at=? WHERE status='running' AND EXISTS "
@@ -287,6 +291,12 @@ class Database:
 
     @staticmethod
     def generation_settings_snapshot(payload: dict) -> dict:
+        nested = payload.get("generation_payload") or payload.get("generation_payload_json") or {}
+        if isinstance(nested, str):
+            try:
+                nested = json.loads(nested)
+            except (TypeError, json.JSONDecodeError):
+                nested = {}
         snapshot = {
             "prompt": payload.get("shot_prompt", payload.get("prompt", "")),
             "reference_image": payload.get("reference_image") or None,
@@ -295,7 +305,7 @@ class Database:
         }
         shot_settings = payload.get("shot_settings", payload if "id" in payload else {})
         for key in ("style_context", "style_bible_revision", "width", "height", "fps", "output_location", "framing", "aspect_ratio"):
-            value = shot_settings.get(key)
+            value = shot_settings.get(key, payload.get(key, nested.get(key)))
             if value is not None and value != "" and not (key == "style_bible_revision" and value == 0):
                 snapshot[key] = value
         return snapshot
@@ -638,6 +648,11 @@ class Database:
                 raise KeyError("Film plan not found")
             if current["revision"] != expected_revision or plan["approved_revision"] != expected_revision or plan["approved_style_revision"] != style_revision:
                 raise RuntimeError("The saved film plan changed or its approval is stale")
+            active_paused = db.execute("SELECT 1 FROM film_batches b JOIN film_batch_shots bs ON bs.batch_id=b.id JOIN jobs j ON j.id=bs.job_id "
+                                       "WHERE b.storyboard_id=? AND b.status='paused' AND j.status IN ('queued','running') LIMIT 1",
+                                       (storyboard_id,)).fetchone()
+            if active_paused:
+                raise RuntimeError("A paused film batch still contains queued work. Reconcile verified shots or cancel the duplicate queue before generating missing shots.")
             db.execute("INSERT INTO film_batches(id,storyboard_id,project_id,storyboard_revision,style_bible_revision,status,created_at,updated_at) VALUES(?,?,?,?,?,'running',?,?)",
                        (batch_id, storyboard_id, current["project_id"], expected_revision, style_revision, timestamp, timestamp))
             new_jobs = 0
@@ -714,6 +729,70 @@ class Database:
             batch["running_shots"] = running
             batch["queued_shots"] = queued
             return batch
+
+    def reconcile_film_shots(self, storyboard_id: str, expected_revision: int, style_revision: int,
+                             source_batch_id: str, canonical_jobs: dict[str, str], duplicate_job_ids: list[str]):
+        """Persist verified shot associations and cancel only queued duplicates from paused batches."""
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            current = db.execute("SELECT b.revision,b.project_id,p.style_bible_revision,fp.approved_revision,fp.approved_style_revision "
+                                 "FROM storyboards b JOIN projects p ON p.id=b.project_id JOIN film_plans fp ON fp.storyboard_id=b.id "
+                                 "WHERE b.id=? AND b.archived_at IS NULL", (storyboard_id,)).fetchone()
+            if not current:
+                raise KeyError("Film plan not found")
+            if (current["revision"] != expected_revision or current["style_bible_revision"] != style_revision or
+                    current["approved_revision"] != expected_revision or current["approved_style_revision"] != style_revision):
+                raise RuntimeError("The plan changed after approval; review and approve its current revision before reconciling clips")
+            batch = db.execute("SELECT * FROM film_batches WHERE id=? AND storyboard_id=? AND project_id=?",
+                               (source_batch_id, storyboard_id, current["project_id"])).fetchone()
+            if not batch or batch["status"] != "completed" or batch["storyboard_revision"] != expected_revision or batch["style_bible_revision"] != style_revision:
+                raise RuntimeError("The selected source batch is not completed for this exact approved plan revision")
+            source = {row["shot_id"]: row["job_id"] for row in db.execute(
+                "SELECT shot_id,job_id FROM film_batch_shots WHERE batch_id=?", (source_batch_id,))}
+            shots = {row["id"]: dict(row) for row in db.execute(
+                "SELECT id,storyboard_id FROM storyboard_shots WHERE storyboard_id=? AND deleted_at IS NULL", (storyboard_id,))}
+            if set(source) != set(shots) or canonical_jobs != source:
+                raise RuntimeError("The selected completed batch does not map exactly one original job to every required shot")
+            for shot_id, job_id in canonical_jobs.items():
+                job = db.execute("SELECT kind,status,project_id,payload FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if not job or job["kind"] != "generation" or job["status"] != "completed" or job["project_id"] != current["project_id"]:
+                    raise RuntimeError("A selected verified shot job changed status or project scope; no associations were changed")
+                payload = json.loads(job["payload"] or "{}")
+                if payload.get("shot_id") != shot_id or payload.get("storyboard_id") != storyboard_id or payload.get("film_batch_id") != source_batch_id:
+                    raise RuntimeError("A selected job's immutable film payload does not match the source batch shot")
+                linked = db.execute("SELECT 1 FROM shot_jobs WHERE shot_id=? AND job_id=?", (shot_id, job_id)).fetchone()
+                if not linked:
+                    snapshot = self.generation_settings_snapshot(payload)
+                    db.execute("INSERT INTO shot_jobs(shot_id,job_id,settings_snapshot,created_at) VALUES(?,?,?,?)",
+                               (shot_id, job_id, json.dumps(snapshot, ensure_ascii=False, sort_keys=True), timestamp))
+                db.execute("UPDATE storyboard_shots SET reconciled_job_id=?,updated_at=? WHERE id=? AND storyboard_id=?",
+                           (job_id, timestamp, shot_id, storyboard_id))
+            cancelled = []
+            touched_paused_batches = set()
+            for job_id in dict.fromkeys(duplicate_job_ids):
+                row = db.execute("SELECT j.status,j.project_id,j.payload,b.id batch_id,b.status batch_status,b.storyboard_id "
+                                 "FROM jobs j JOIN film_batch_shots bs ON bs.job_id=j.id JOIN film_batches b ON b.id=bs.batch_id "
+                                 "WHERE j.id=? AND b.storyboard_id=? AND b.project_id=?",
+                                 (job_id, storyboard_id, current["project_id"])).fetchone()
+                if not row or row["batch_status"] != "paused" or row["status"] != "queued" or job_id in canonical_jobs.values():
+                    continue
+                payload = json.loads(row["payload"] or "{}")
+                if payload.get("film_batch_id") != row["batch_id"] or payload.get("storyboard_id") != storyboard_id:
+                    continue
+                db.execute("UPDATE jobs SET status='cancelled',updated_at=? WHERE id=? AND status='queued'", (timestamp, job_id))
+                db.execute("UPDATE film_batch_shots SET status='cancelled' WHERE batch_id=? AND job_id=?", (row["batch_id"], job_id))
+                db.execute("INSERT INTO events(job_id,time,level,message) VALUES(?,?,?,?)",
+                           (job_id, timestamp, "info", "Queued duplicate cancelled after verified existing shot was reconciled"))
+                cancelled.append(job_id)
+                touched_paused_batches.add(row["batch_id"])
+            for batch_id in touched_paused_batches:
+                remaining = db.execute("SELECT 1 FROM film_batch_shots bs JOIN jobs j ON j.id=bs.job_id "
+                                       "WHERE bs.batch_id=? AND j.status IN ('queued','running') LIMIT 1", (batch_id,)).fetchone()
+                if not remaining:
+                    db.execute("UPDATE film_batches SET status='cancelled',updated_at=? WHERE id=? AND status='paused'",
+                               (timestamp, batch_id))
+            db.execute("UPDATE storyboards SET manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?", (timestamp, storyboard_id))
+        return {"storyboard": self.get_storyboard(storyboard_id, include_events=False), "cancelled_job_ids": cancelled}
 
     def set_film_batch_status(self, batch_id: str, expected: set[str], status: str):
         with self.lock, self.connect() as db:
@@ -819,19 +898,38 @@ class Database:
                 shot = dict(item)
                 shot["style_context"] = style_context
                 shot["style_bible_revision"] = story["style_bible_revision"]
-                linked = db.execute("SELECT j.*,sj.settings_snapshot AS linked_settings_snapshot FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? ORDER BY sj.id DESC LIMIT 1",
-                                    (shot["id"],)).fetchone()
-                shot["job"] = self._job(linked)
+                linked_rows = db.execute("SELECT j.*,sj.settings_snapshot AS linked_settings_snapshot FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? ORDER BY sj.id DESC",
+                                         (shot["id"],)).fetchall()
+                current_settings = self.generation_settings_snapshot(shot)
+                candidates = []
+                for linked_row in linked_rows:
+                    candidate = self._job(linked_row)
+                    if not candidate:
+                        continue
+                    linked_snapshot = candidate.pop("linked_settings_snapshot", None)
+                    snapshot = json.loads(linked_snapshot) if linked_snapshot else {}
+                    payload_snapshot = self.generation_settings_snapshot(candidate["payload"])
+                    for key, value in payload_snapshot.items():
+                        if key not in snapshot and current_settings.get(key) == value:
+                            snapshot[key] = value
+                    candidate["settings_snapshot"] = snapshot or payload_snapshot
+                    candidate["settings_match"] = all(key in current_settings and current_settings[key] == value
+                                                       for key, value in candidate["settings_snapshot"].items())
+                    verified = (candidate["status"] == "completed" and candidate["exit_code"] == 0 and
+                                bool((candidate.get("verification_metadata") or {}).get("verified_output")) and
+                                bool(candidate.get("result_path")) and Path(candidate["result_path"]).is_file())
+                    candidates.append((candidate, verified and candidate["settings_match"]))
+                selected = next((item for item, _ in candidates if item["id"] == shot.get("reconciled_job_id")), None)
+                if selected is None:
+                    selected = next((item for item, valid in candidates if valid), None)
+                if selected is None and candidates:
+                    selected = candidates[0][0]
+                shot["job"] = selected
                 if shot["job"]:
-                    linked_snapshot = shot["job"].pop("linked_settings_snapshot", None)
-                    snapshot = json.loads(linked_snapshot) if linked_snapshot else self.generation_settings_snapshot(shot["job"]["payload"])
-                    current_settings = self.generation_settings_snapshot(shot)
-                    shot["job"]["settings_snapshot"] = snapshot
-                    shot["job"]["settings_match"] = snapshot == current_settings
-                    shot["settings_match"] = snapshot == current_settings
-                if include_events and linked:
+                    shot["settings_match"] = shot["job"]["settings_match"]
+                if include_events and shot["job"]:
                     shot["job"]["events"] = [dict(event) for event in db.execute(
-                        "SELECT * FROM events WHERE job_id=? ORDER BY id", (linked["id"],))]
+                        "SELECT * FROM events WHERE job_id=? ORDER BY id", (shot["job"]["id"],))]
                 if not shot["job"]:
                     shot["status"] = "missing"
                 elif not shot["job"].get("settings_match", True):
@@ -913,7 +1011,7 @@ class Database:
                 scene_title = (shot.get("scene_title") or "Scene 1").strip() or "Scene 1"
                 scene_id = scene_ids[scene_title]
                 if shot.get("id"):
-                    db.execute("UPDATE storyboard_shots SET scene_id=?,position=?,title=?,prompt=?,reference_image=?,preset=?,seed=?,caption=?,width=?,height=?,fps=?,output_location=?,framing=?,prompt_reviewed=?,reviewed_style_revision=?,visual_description=?,characters_json=?,reference_ids_json=?,estimated_seconds=?,dialogue=?,transition_after=?,generation_payload_json=?,updated_at=? WHERE id=?",
+                    db.execute("UPDATE storyboard_shots SET scene_id=?,position=?,title=?,prompt=?,reference_image=?,preset=?,seed=?,caption=?,width=?,height=?,fps=?,output_location=?,framing=?,prompt_reviewed=?,reviewed_style_revision=?,visual_description=?,characters_json=?,reference_ids_json=?,estimated_seconds=?,dialogue=?,transition_after=?,generation_payload_json=?,reconciled_job_id=NULL,updated_at=? WHERE id=?",
                                (scene_id, position, shot["title"], shot["prompt"], shot.get("reference_image"), shot["preset"], shot.get("seed"), shot.get("caption", ""),
                                 shot.get("width"), shot.get("height"), shot.get("fps"), shot.get("output_location"), shot.get("framing", ""), int(shot.get("prompt_reviewed", False)), shot.get("reviewed_style_revision", 0),
                                 shot.get("visual_description", ""), json.dumps(shot.get("characters", [])), json.dumps(shot.get("reference_ids", [])), shot.get("estimated_seconds", 0), shot.get("dialogue", ""), shot.get("transition_after", "dissolve"), json.dumps(shot.get("generation_payload", {}), ensure_ascii=False), timestamp, shot["id"]))
@@ -1012,8 +1110,10 @@ class Database:
             if db.execute("SELECT 1 FROM shot_jobs WHERE job_id=?", (job_id,)).fetchone():
                 raise RuntimeError("This generation job is already linked to a storyboard shot")
             snapshot = self.generation_settings_snapshot(job["payload"])
-            if snapshot != self.generation_settings_snapshot(dict(shot)):
+            current_snapshot = self.generation_settings_snapshot(dict(shot))
+            if any(key in current_snapshot and current_snapshot[key] != value for key, value in snapshot.items()):
                 raise RuntimeError("Existing output settings do not match this shot; copy the job settings into the shot and save first")
+            snapshot = {key: value for key, value in snapshot.items() if key in current_snapshot}
             db.execute("INSERT INTO shot_jobs(shot_id,job_id,settings_snapshot,created_at) VALUES(?,?,?,?)",
                        (shot_id, job_id, json.dumps(snapshot, ensure_ascii=False, sort_keys=True), timestamp))
             db.execute("UPDATE storyboards SET manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?",
