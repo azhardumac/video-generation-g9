@@ -61,9 +61,10 @@ def test_import_edit_queue_and_safe_delete_api_workflow(monkeypatch):
     first = story["shots"][0]
     edited = api.update_storyboard(story["id"], api.StoryboardUpdate(
         revision=story["revision"], title="Scorpion & Frog — River Crossing",
-        shots=[first | {"scene_title": "The Riverbank", "title": "Opening wide"},
+        shots=[first | {"scene_title": "The Riverbank", "title": "Opening wide", "prompt_reviewed": True},
                   {"scene_title": "The River", "title": "The crossing", "prompt": "A frog rows the scorpion across the moonlit river.",
-                   "reference_image": first["reference_image"], "preset": "Short", "seed": 7, "caption": "Across the water"}],
+                   "reference_image": first["reference_image"], "preset": "Short", "seed": 7, "caption": "Across the water",
+                   "prompt_reviewed": True, "reviewed_style_revision": story.get("style_bible_revision", 0)}],
     ))
     assert edited["revision"] == 2
     assert [scene["title"] for scene in edited["scenes"]] == ["The Riverbank", "The River"]
@@ -263,3 +264,91 @@ def test_existing_project_import_is_read_only_and_idempotent():
     assert imported_again["id"] == imported["id"]
     assert [asset["id"] for asset in api.db.project_assets(imported["id"])] == asset_ids
     assert source.read_bytes() == source_before
+
+
+def test_reviewed_shot_queues_exact_project_scoped_input_without_running_it(monkeypatch):
+    from uuid import uuid4
+    from app.adapters import build_ltx_command
+    root = _ROOT / f"reviewed-shot-{uuid4().hex[:8]}"
+    project = api.create_project(api.ProjectCreateRequest(
+        name="Claymation test", workspace_path=str(root), aspect_ratio="9:16",
+        frame_rate=24, production_type="handmade cinematic claymation",
+    ))
+    image = root / "approved-frog.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\noriginal frog character reference")
+    api.add_existing_project_reference(project["id"], api.ProjectReferenceCreate(
+        path=str(image), name="Original frog", category="character",
+    ))
+    style = api.update_project_style_bible(project["id"], api.StyleBibleRequest(
+        material="matte handmade clay", silhouettes="rounded frog silhouette",
+        proportions="keep character proportions stable", composition="medium close-up",
+        negative_constraints="no glossy plastic",
+    ))
+    story = api.create_project_storyboard(project["id"], api.CreateStoryboardRequest(
+        title="Opening", story_text="A story written by the user.",
+    ))
+    edited = api.update_storyboard(story["id"], api.StoryboardUpdate(
+        revision=story["revision"], title=story["title"], story_text=story["story_text"], shots=[{
+            "scene_title":"River crossing", "title":"Frog close-up", "prompt":"The frog studies a handmade clay map.",
+            "reference_image":str(image), "preset":"Short", "seed":314,
+            "width":448, "height":768, "fps":24, "output_location":None,
+            "framing":"medium close-up", "prompt_reviewed":True, "reviewed_style_revision":style["revision"],
+        }],
+    ))
+    monkeypatch.setattr(api, "detect_integrations", lambda _: {"ltx":{"ready":True}})
+    shot=edited["shots"][0]
+    queued=api.queue_storyboard_shot(story["id"],shot["id"])
+    assert queued["status"]=="queued"
+    assert queued["project_id"]==project["id"]
+    payload=queued["payload"]
+    assert payload["shot_prompt"]=="The frog studies a handmade clay map."
+    assert payload["style_context"].startswith("Material and finish: matte handmade clay")
+    assert payload["prompt"].endswith(payload["shot_prompt"])
+    assert payload["width"]==448 and payload["height"]==768 and payload["fps"]==24 and payload["frames"]==49
+    assert payload["output_location"]==str(api._project_output(project).resolve())
+    assert payload["reference_image"]==str(image.resolve())
+    assert payload["shot_settings"]["framing"]=="medium close-up"
+    command=build_ltx_command("local-ltx",payload,str(root/"exports"/"fixture.partial.mp4"),payload["reference_image"])
+    assert command[command.index("--image"):command.index("--image")+4]==["--image",str(image.resolve()),"0","1.0"]
+    assert api.db.get_job(queued["id"])["status"]=="queued"  # Command construction only; no subprocess starts.
+
+    api.update_project_style_bible(project["id"],api.StyleBibleRequest(
+        material="new material guidance",silhouettes="rounded frog silhouette",
+        proportions="keep character proportions stable",composition="medium close-up",
+        negative_constraints="no glossy plastic",
+    ))
+    stale=api.get_storyboard(story["id"])["shots"][0]
+    assert stale["status"]=="stale"
+    with pytest.raises(HTTPException) as review_error:
+        api.queue_storyboard_shot(story["id"],shot["id"])
+    assert review_error.value.status_code==409
+
+
+def test_reveal_output_uses_argument_vector_without_shell(monkeypatch):
+    import asyncio
+    output=api.settings.expanded(api.settings.output_root)/"clip with spaces.mp4"
+    output.parent.mkdir(parents=True,exist_ok=True)
+    output.write_bytes(b"preview fixture")
+    calls=[]
+    class Process:
+        returncode=0
+        async def communicate(self):return b"",b""
+    async def fake_exec(*args,**kwargs):
+        calls.append((args,kwargs));return Process()
+    monkeypatch.setattr(api.sys,"platform","darwin")
+    monkeypatch.setattr(api.asyncio,"create_subprocess_exec",fake_exec)
+    result=asyncio.run(api.reveal_output(api.RevealOutputRequest(path=str(output))))
+    assert result["revealed"] is True
+    assert calls==[(("open","-R",str(output.resolve())),{"stdout":asyncio.subprocess.DEVNULL,"stderr":asyncio.subprocess.PIPE})]
+
+
+def test_reveal_output_rejects_non_macos_and_non_video_paths(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(api.sys,"platform","linux")
+    with pytest.raises(HTTPException) as unsupported:
+        asyncio.run(api.reveal_output(api.RevealOutputRequest(path=str(_PROJECT))))
+    assert unsupported.value.status_code==501
+    monkeypatch.setattr(api.sys,"platform","darwin")
+    with pytest.raises(HTTPException) as nonvideo:
+        asyncio.run(api.reveal_output(api.RevealOutputRequest(path=str(_PROJECT))))
+    assert nonvideo.value.status_code==400

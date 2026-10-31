@@ -12,11 +12,27 @@ class ShotInput(BaseModel):
     preset: str = "Short"
     seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
     caption: str = Field(default="", max_length=240)
+    width: int | None = Field(default=None, ge=64, le=2048)
+    height: int | None = Field(default=None, ge=64, le=2048)
+    fps: int | None = Field(default=None, ge=1, le=60)
+    output_location: str | None = Field(default=None, max_length=4000)
+    framing: str = Field(default="", max_length=120)
+    prompt_reviewed: bool = False
+    reviewed_style_revision: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_dimensions(self):
+        if self.width is not None and self.width % 8:
+            raise ValueError("Shot width must be divisible by 8")
+        if self.height is not None and self.height % 8:
+            raise ValueError("Shot height must be divisible by 8")
+        return self
 
 
 class StoryboardUpdate(BaseModel):
     revision: int = Field(ge=1)
     title: str = Field(min_length=1, max_length=160)
+    story_text: str = Field(default="", max_length=20000)
     shots: list[ShotInput] = Field(min_length=1, max_length=40)
 
     @model_validator(mode="after")
@@ -45,12 +61,12 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
         size = (int(verified.get("width", 0)), int(verified.get("height", 0)))
         fps = int(verified.get("fps", 0))
         frames = int(verified.get("frames", 0))
-        if size[0] <= 0 or size[1] <= size[0] or fps != 24 or frames <= 0:
-            raise ValueError(f"Verified shot '{shot['title']}' must be portrait, 24 fps, and have a valid frame count")
+        if size[0] <= 0 or size[1] <= 0 or fps <= 0 or frames <= 0:
+            raise ValueError(f"Verified shot '{shot['title']}' must have positive dimensions, frame rate, and frame count")
         if canvas is None:
             canvas = (*size, fps)
         elif canvas != (*size, fps):
-            raise ValueError("Verified shots must share the same portrait dimensions and 24 fps frame rate")
+            raise ValueError("Verified shots must share the same dimensions and frame rate")
         try:
             relative = output.relative_to(public_root).as_posix()
         except ValueError as exc:

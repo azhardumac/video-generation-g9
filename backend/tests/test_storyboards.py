@@ -114,6 +114,19 @@ def test_manifest_single_verified_clip_has_no_transition_and_keeps_job_snapshot(
     assert manifest["shots"][0]["settings_snapshot"] == settings_snapshot
 
 
+def test_manifest_accepts_configured_landscape_aspect_and_frame_rate(tmp_path):
+    clip=tmp_path/"landscape.mp4"
+    clip.write_bytes(b"test-only fixture")
+    story={"id":"landscape","revision":1,"title":"Landscape production","shots":[{
+        "id":"shot-1","position":0,"title":"Wide","prompt":"User prompt",
+        "job":{"id":"job-1","status":"completed","result_path":str(clip),"settings_match":True,
+               "verification_metadata":{"verified_output":{"width":768,"height":432,"fps":30,"frames":49}}},
+    }]}
+    manifest=build_composition_manifest(story,tmp_path)
+    assert (manifest["width"],manifest["height"],manifest["fps"])==(768,432,30)
+    assert manifest["duration_in_frames"]==49
+
+
 def test_storyboard_revision_conflicts_are_rejected_without_overwriting_edits(tmp_path):
     db = _db(tmp_path)
     story = db.create_storyboard("scorpion-frog", "Scorpion & Frog", [_shot()])
@@ -157,7 +170,7 @@ def test_manifest_fails_for_missing_or_unverified_clips(tmp_path):
         build_composition_manifest(story, root)
     story["shots"][1]["job"]["status"] = "completed"
     story["shots"][1]["job"]["verification_metadata"]["verified_output"]["width"] = 512
-    with pytest.raises(ValueError, match="share the same portrait dimensions"):
+    with pytest.raises(ValueError, match="share the same dimensions and frame rate"):
         build_composition_manifest(story, root)
 
 

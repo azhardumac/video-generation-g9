@@ -19,7 +19,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration()
+        self._backup_before_migration(target_version=2)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -48,7 +48,8 @@ class Database:
                     created_at TEXT NOT NULL, imported_at TEXT NOT NULL,
                     description TEXT NOT NULL DEFAULT '', aspect_ratio TEXT,
                     frame_rate INTEGER, production_type TEXT NOT NULL DEFAULT '',
-                    workspace_kind TEXT NOT NULL DEFAULT 'imported', archived_at TEXT
+                    workspace_kind TEXT NOT NULL DEFAULT 'imported', archived_at TEXT,
+                    style_bible_json TEXT NOT NULL DEFAULT '{}', style_bible_revision INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS project_assets (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, category TEXT NOT NULL,
@@ -58,7 +59,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS storyboards (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL,
                     revision INTEGER NOT NULL DEFAULT 1, archived_at TEXT,
-                    manifest_json TEXT, manifest_path TEXT,
+                    manifest_json TEXT, manifest_path TEXT, story_text TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS storyboard_shots (
@@ -66,6 +67,9 @@ class Database:
                     scene_id TEXT, position INTEGER NOT NULL, title TEXT NOT NULL,
                     prompt TEXT NOT NULL, reference_image TEXT,
                     preset TEXT NOT NULL, seed INTEGER, caption TEXT NOT NULL DEFAULT '',
+                    width INTEGER, height INTEGER, fps INTEGER, output_location TEXT,
+                    framing TEXT NOT NULL DEFAULT '', prompt_reviewed INTEGER NOT NULL DEFAULT 0,
+                    reviewed_style_revision INTEGER NOT NULL DEFAULT 0,
                     deleted_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS storyboard_scenes (
@@ -114,9 +118,23 @@ class Database:
                 ("production_type", "TEXT NOT NULL DEFAULT ''"),
                 ("workspace_kind", "TEXT NOT NULL DEFAULT 'imported'"),
                 ("archived_at", "TEXT"),
+                ("style_bible_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("style_bible_revision", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column not in project_columns:
                     db.execute(f"ALTER TABLE projects ADD COLUMN {column} {declaration}")
+            storyboard_columns = {row[1] for row in db.execute("PRAGMA table_info(storyboards)")}
+            if "story_text" not in storyboard_columns:
+                db.execute("ALTER TABLE storyboards ADD COLUMN story_text TEXT NOT NULL DEFAULT ''")
+            shot_columns = {row[1] for row in db.execute("PRAGMA table_info(storyboard_shots)")}
+            for column, declaration in (
+                ("width", "INTEGER"), ("height", "INTEGER"), ("fps", "INTEGER"),
+                ("output_location", "TEXT"), ("framing", "TEXT NOT NULL DEFAULT ''"),
+                ("prompt_reviewed", "INTEGER NOT NULL DEFAULT 0"),
+                ("reviewed_style_revision", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in shot_columns:
+                    db.execute(f"ALTER TABLE storyboard_shots ADD COLUMN {column} {declaration}")
             existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             for column, declaration in (
                 ("exit_code", "INTEGER"),
@@ -153,6 +171,7 @@ class Database:
                 db.execute("INSERT INTO events(job_id,time,level,message) VALUES(?,?,?,?)",
                            (job["id"], now_iso(), "warning", message))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,?)", (now_iso(),))
 
     @staticmethod
     def _execute_schema_script(db: sqlite3.Connection, script: str):
@@ -168,7 +187,7 @@ class Database:
         if statement.strip():
             raise sqlite3.OperationalError("Incomplete database schema migration statement")
 
-    def _backup_before_migration(self):
+    def _backup_before_migration(self, target_version: int):
         if not self.path.is_file() or self.path.stat().st_size == 0:
             return
         try:
@@ -178,7 +197,7 @@ class Database:
                 ).fetchone()
                 if has_migrations:
                     current = source.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] or 0
-                    if current >= 1:
+                    if current >= target_version:
                         return
                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
                 backup = self.path.with_name(f"{self.path.name}.pre-migration-{stamp}.bak")
@@ -222,12 +241,18 @@ class Database:
 
     @staticmethod
     def generation_settings_snapshot(payload: dict) -> dict:
-        return {
-            "prompt": payload.get("prompt", ""),
+        snapshot = {
+            "prompt": payload.get("shot_prompt", payload.get("prompt", "")),
             "reference_image": payload.get("reference_image") or None,
             "seed": payload.get("seed"),
             "preset": payload.get("preset", "Short"),
         }
+        shot_settings = payload.get("shot_settings", payload if "id" in payload else {})
+        for key in ("style_context", "style_bible_revision", "width", "height", "fps", "output_location", "framing", "aspect_ratio"):
+            value = shot_settings.get(key)
+            if value is not None and value != "" and not (key == "style_bible_revision" and value == 0):
+                snapshot[key] = value
+        return snapshot
 
     def get_job(self, job_id: str):
         with self.connect() as db:
@@ -398,7 +423,19 @@ class Database:
     def get_project(self, project_id: str):
         with self.connect() as db:
             row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            project = dict(row)
+            project["style_bible"] = json.loads(project.pop("style_bible_json", "{}") or "{}")
+            return project
+
+    def update_project_style_bible(self, project_id: str, style_bible: dict):
+        with self.lock, self.connect() as db:
+            cursor = db.execute("UPDATE projects SET style_bible_json=?,style_bible_revision=style_bible_revision+1 WHERE id=? AND archived_at IS NULL",
+                                (json.dumps(style_bible, ensure_ascii=False), project_id))
+            if cursor.rowcount != 1:
+                raise KeyError("Project not found")
+        return self.get_project(project_id)
 
     def project_references(self, project_id: str):
         with self.connect() as db:
@@ -450,20 +487,23 @@ class Database:
 
     @staticmethod
     def _story_snapshot(db, storyboard_id: str, revision: int, title: str, timestamp: str):
+        story_text_row = db.execute("SELECT story_text FROM storyboards WHERE id=?", (storyboard_id,)).fetchone()
+        story_text = story_text_row[0] if story_text_row else ""
         scenes = [dict(row) for row in db.execute(
             "SELECT id,title,position FROM storyboard_scenes WHERE storyboard_id=? AND deleted_at IS NULL ORDER BY position,id", (storyboard_id,))]
         shots = [dict(row) for row in db.execute(
-            "SELECT s.id,s.scene_id,c.title AS scene_title,s.position,s.title,s.prompt,s.reference_image,s.preset,s.seed,s.caption "
+            "SELECT s.id,s.scene_id,c.title AS scene_title,s.position,s.title,s.prompt,s.reference_image,s.preset,s.seed,s.caption,"
+            "s.width,s.height,s.fps,s.output_location,s.framing,s.prompt_reviewed,s.reviewed_style_revision "
             "FROM storyboard_shots s LEFT JOIN storyboard_scenes c ON c.id=s.scene_id "
             "WHERE s.storyboard_id=? AND s.deleted_at IS NULL ORDER BY s.position,s.id", (storyboard_id,))]
         db.execute("INSERT INTO storyboard_revisions(storyboard_id,revision,title,snapshot_json,created_at) VALUES(?,?,?,?,?)",
-                   (storyboard_id, revision, title, json.dumps({"scenes": scenes, "shots": shots}, ensure_ascii=False, sort_keys=True), timestamp))
+                   (storyboard_id, revision, title, json.dumps({"story_text": story_text, "scenes": scenes, "shots": shots}, ensure_ascii=False, sort_keys=True), timestamp))
 
-    def create_storyboard(self, project_id: str, title: str, shots: list[dict]) -> dict:
+    def create_storyboard(self, project_id: str, title: str, shots: list[dict], story_text: str = "") -> dict:
         storyboard_id, timestamp = str(uuid4()), now_iso()
         with self.lock, self.connect() as db:
-            db.execute("INSERT INTO storyboards(id,project_id,title,revision,created_at,updated_at) VALUES(?,?,?,1,?,?)",
-                       (storyboard_id, project_id, title, timestamp, timestamp))
+            db.execute("INSERT INTO storyboards(id,project_id,title,revision,story_text,created_at,updated_at) VALUES(?,?,?,1,?,?,?)",
+                       (storyboard_id, project_id, title, story_text, timestamp, timestamp))
             scene_ids = {}
             for position, shot in enumerate(shots):
                 scene_title = (shot.get("scene_title") or "Scene 1").strip()
@@ -494,6 +534,17 @@ class Database:
                 return None
             story = dict(row)
             story["manifest"] = json.loads(story.pop("manifest_json")) if story.get("manifest_json") else None
+            project_row = db.execute("SELECT style_bible_json,style_bible_revision FROM projects WHERE id=?", (story["project_id"],)).fetchone()
+            style_bible = json.loads(project_row["style_bible_json"] or "{}") if project_row else {}
+            style_context = "\n".join(
+                f"{label}: {style_bible.get(key, '').strip()}" for key, label in (
+                    ("material", "Material and finish"), ("silhouettes", "Silhouettes"),
+                    ("proportions", "Character proportions"), ("composition", "Composition guidance"),
+                    ("negative_constraints", "Negative constraints"),
+                ) if style_bible.get(key, "").strip()
+            )
+            story["style_bible"] = style_bible
+            story["style_bible_revision"] = project_row["style_bible_revision"] if project_row else 0
             story["scenes"] = [dict(scene) for scene in db.execute(
                 "SELECT id,title,position FROM storyboard_scenes WHERE storyboard_id=? AND deleted_at IS NULL ORDER BY position,id", (storyboard_id,))]
             rows = db.execute("SELECT s.*,c.title AS scene_title FROM storyboard_shots s LEFT JOIN storyboard_scenes c ON c.id=s.scene_id "
@@ -502,6 +553,8 @@ class Database:
             shots = []
             for item in rows:
                 shot = dict(item)
+                shot["style_context"] = style_context
+                shot["style_bible_revision"] = story["style_bible_revision"]
                 linked = db.execute("SELECT j.*,sj.settings_snapshot AS linked_settings_snapshot FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? ORDER BY sj.id DESC LIMIT 1",
                                     (shot["id"],)).fetchone()
                 shot["job"] = self._job(linked)
@@ -515,13 +568,21 @@ class Database:
                 if include_events and linked:
                     shot["job"]["events"] = [dict(event) for event in db.execute(
                         "SELECT * FROM events WHERE job_id=? ORDER BY id", (linked["id"],))]
-                shot["status"] = shot["job"]["status"] if shot["job"] else "planned"
+                if not shot["job"]:
+                    shot["status"] = "missing"
+                elif not shot["job"].get("settings_match", True):
+                    shot["status"] = "stale"
+                elif shot["job"]["status"] == "completed":
+                    verified = (shot["job"].get("verification_metadata") or {}).get("verified_output")
+                    shot["status"] = "verified" if verified else "failed"
+                else:
+                    shot["status"] = shot["job"]["status"]
                 shots.append(shot)
             story["shots"] = shots
             story["shot_count"] = len(shots)
             return story
 
-    def update_storyboard(self, storyboard_id: str, expected_revision: int, title: str, shots: list[dict]):
+    def update_storyboard(self, storyboard_id: str, expected_revision: int, title: str, shots: list[dict], story_text: str = ""):
         timestamp = now_iso()
         with self.lock, self.connect() as db:
             story = db.execute("SELECT revision,title FROM storyboards WHERE id=? AND archived_at IS NULL", (storyboard_id,)).fetchone()
@@ -574,14 +635,16 @@ class Database:
                 scene_title = (shot.get("scene_title") or "Scene 1").strip() or "Scene 1"
                 scene_id = scene_ids[scene_title]
                 if shot.get("id"):
-                    db.execute("UPDATE storyboard_shots SET scene_id=?,position=?,title=?,prompt=?,reference_image=?,preset=?,seed=?,caption=?,updated_at=? WHERE id=?",
-                               (scene_id, position, shot["title"], shot["prompt"], shot.get("reference_image"), shot["preset"], shot.get("seed"), shot.get("caption", ""), timestamp, shot["id"]))
+                    db.execute("UPDATE storyboard_shots SET scene_id=?,position=?,title=?,prompt=?,reference_image=?,preset=?,seed=?,caption=?,width=?,height=?,fps=?,output_location=?,framing=?,prompt_reviewed=?,reviewed_style_revision=?,updated_at=? WHERE id=?",
+                               (scene_id, position, shot["title"], shot["prompt"], shot.get("reference_image"), shot["preset"], shot.get("seed"), shot.get("caption", ""),
+                                shot.get("width"), shot.get("height"), shot.get("fps"), shot.get("output_location"), shot.get("framing", ""), int(shot.get("prompt_reviewed", False)), shot.get("reviewed_style_revision", 0), timestamp, shot["id"]))
                 else:
-                    db.execute("INSERT INTO storyboard_shots(id,storyboard_id,scene_id,position,title,prompt,reference_image,preset,seed,caption,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                               (str(uuid4()), storyboard_id, scene_id, position, shot["title"], shot["prompt"], shot.get("reference_image"), shot["preset"], shot.get("seed"), shot.get("caption", ""), timestamp, timestamp))
+                    db.execute("INSERT INTO storyboard_shots(id,storyboard_id,scene_id,position,title,prompt,reference_image,preset,seed,caption,width,height,fps,output_location,framing,prompt_reviewed,reviewed_style_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                               (str(uuid4()), storyboard_id, scene_id, position, shot["title"], shot["prompt"], shot.get("reference_image"), shot["preset"], shot.get("seed"), shot.get("caption", ""),
+                                shot.get("width"), shot.get("height"), shot.get("fps"), shot.get("output_location"), shot.get("framing", ""), int(shot.get("prompt_reviewed", False)), shot.get("reviewed_style_revision", 0), timestamp, timestamp))
             revision = expected_revision + 1
-            db.execute("UPDATE storyboards SET title=?,revision=?,manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?",
-                       (title, revision, timestamp, storyboard_id))
+            db.execute("UPDATE storyboards SET title=?,story_text=?,revision=?,manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?",
+                       (title, story_text, revision, timestamp, storyboard_id))
             self._story_snapshot(db, storyboard_id, revision, title, timestamp)
         return self.get_storyboard(storyboard_id)
 
@@ -594,7 +657,7 @@ class Database:
         shots = [shot for shot in story["shots"] if shot["id"] != shot_id]
         if len(shots) == len(story["shots"]):
             raise KeyError("Shot not found")
-        return self.update_storyboard(storyboard_id, expected_revision, story["title"], shots)
+        return self.update_storyboard(storyboard_id, expected_revision, story["title"], shots, story.get("story_text", ""))
 
     def archive_storyboard(self, storyboard_id: str):
         timestamp = now_iso()

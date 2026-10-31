@@ -4,13 +4,15 @@ Private, local-first AI video studio for generating portrait video with **LTX-2.
 
 ## Current status (31 October 2026)
 
-**Phases 1, 2, 2.5, 3, and 3.2 are on `main`. Issue #11 Milestone A is implemented on the current feature branch and is not yet integrated.** Milestone A adds:
+**Phases 1, 2, 2.5, 3, and 3.2 are on `main`. Issue #11 Milestones A and B are implemented on stacked feature branches and are not yet integrated.** Milestone A adds:
 
 - Real local projects with create, open/switch, rename, archive/restore, and read-only import for allowed directories.
 - Project-scoped local reference links and uploads. References are explicitly selected, categorized, validated, editable, and removable without deleting source files.
 - Persisted active-project selection, per-project settings/jobs/assets/storyboards, and genuinely blank storyboards. New projects do not import or link historical media or story content.
 
-The current app still needs the remaining Issue #11 production workflow (style/character bible, expanded per-shot setup, stronger production preview/export flow) and complete placeholder/control audit before it can be described as fully usable.
+Milestone B adds project-specific story text and a revisioned visual style/character bible; editable per-shot framing, prompt review, reference, seed, frame preset, dimensions, frame rate and output path; stale/verified output state; project-scoped queued shot jobs; local composition preview; and safe output reveal. A new project remains empty until the user writes its story and explicitly selects references. LTX supports exactly one conditioning image per shot, and the review panel exposes the full prompt assembled from the saved style bible and shot text.
+
+Issue #11 is **not complete**: remaining usability, configuration accuracy, responsive/accessibility, and acceptance coverage work is tracked for Milestone C. Do not describe this app as fully operational until the full Issue #11 acceptance checklist passes.
 
 The `main` foundation includes:
 
@@ -146,7 +148,7 @@ Tests and builds do not require a GPU generation run.
 
 ## Roadmap
 
-**Phase 3 follow-up:** richer storyboard templates, scene-level narrative tools, and expanded transition/caption styling. Persistent storyboards, editable per-shot plans, individual LTX queue actions, and verified Remotion composition assembly are implemented in this phase. Preserve all local project media and model caches.
+**Issue #11 Milestone C:** remove or implement remaining controls, make render setup project-aware with no misleading production defaults, ensure settings and generation profiles stay synchronized, improve keyboard/screen-reader/mobile access, and add fresh-project plus legacy-data acceptance coverage. Preserve all local project media and model caches.
 
 ## Repository workflow
 
