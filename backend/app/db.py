@@ -19,7 +19,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration(target_version=4)
+        self._backup_before_migration(target_version=5)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -116,6 +116,22 @@ class Database:
                     style_bible_json TEXT NOT NULL, created_at TEXT NOT NULL,
                     PRIMARY KEY(project_id,revision)
                 );
+                CREATE TABLE IF NOT EXISTS project_scene_continuity (
+                    project_id TEXT PRIMARY KEY, current_revision INTEGER NOT NULL DEFAULT 0,
+                    approved_revision INTEGER, approved_at TEXT, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS project_scene_continuity_revisions (
+                    project_id TEXT NOT NULL, revision INTEGER NOT NULL, document_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL, PRIMARY KEY(project_id,revision)
+                );
+                CREATE TABLE IF NOT EXISTS shot_creative_reviews (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, storyboard_id TEXT NOT NULL,
+                    shot_id TEXT NOT NULL, job_id TEXT NOT NULL, storyboard_revision INTEGER NOT NULL,
+                    continuity_revision INTEGER NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('approved','rejected')),
+                    checklist_json TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_shot_creative_reviews_latest
+                    ON shot_creative_reviews(shot_id,created_at DESC,id DESC);
                 CREATE TABLE IF NOT EXISTS film_batches (
                     id TEXT PRIMARY KEY, storyboard_id TEXT NOT NULL, project_id TEXT NOT NULL,
                     storyboard_revision INTEGER NOT NULL, style_bible_revision INTEGER NOT NULL,
@@ -217,6 +233,7 @@ class Database:
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(5,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO project_style_bible_revisions(project_id,revision,style_bible_json,created_at) "
                        "SELECT id,style_bible_revision,style_bible_json,? FROM projects", (now_iso(),))
             db.execute("UPDATE film_batches SET status='paused',updated_at=? WHERE status='running' AND EXISTS "
@@ -304,7 +321,7 @@ class Database:
             "preset": payload.get("preset", "Short"),
         }
         shot_settings = payload.get("shot_settings", payload if "id" in payload else {})
-        for key in ("style_context", "style_bible_revision", "width", "height", "fps", "output_location", "framing", "aspect_ratio"):
+        for key in ("style_context", "style_bible_revision", "width", "height", "fps", "output_location", "framing"):
             value = shot_settings.get(key, payload.get(key, nested.get(key)))
             if value is not None and value != "" and not (key == "style_bible_revision" and value == 0):
                 snapshot[key] = value
@@ -536,6 +553,62 @@ class Database:
             cursor = db.execute("DELETE FROM project_references WHERE project_id=? AND id=?", (project_id, reference_id))
             if cursor.rowcount != 1:
                 raise KeyError("Project reference not found")
+
+    def get_scene_continuity(self, project_id: str):
+        with self.connect() as db:
+            current = db.execute("SELECT * FROM project_scene_continuity WHERE project_id=?", (project_id,)).fetchone()
+            if not current:
+                return {"project_id": project_id, "revision": 0, "approved_revision": None,
+                        "approved_at": None, "document": None}
+            item = dict(current)
+            row = db.execute("SELECT document_json FROM project_scene_continuity_revisions WHERE project_id=? AND revision=?",
+                             (project_id, item["current_revision"])).fetchone()
+            item["revision"] = item.pop("current_revision")
+            item["document"] = json.loads(row["document_json"]) if row else None
+            return item
+
+    def save_scene_continuity(self, project_id: str, document: dict):
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            current = db.execute("SELECT current_revision FROM project_scene_continuity WHERE project_id=?", (project_id,)).fetchone()
+            revision = (current["current_revision"] if current else 0) + 1
+            db.execute("INSERT INTO project_scene_continuity(project_id,current_revision,approved_revision,approved_at,updated_at) "
+                       "VALUES(?,?,NULL,NULL,?) ON CONFLICT(project_id) DO UPDATE SET current_revision=excluded.current_revision,"
+                       "approved_revision=NULL,approved_at=NULL,updated_at=excluded.updated_at", (project_id, revision, timestamp))
+            db.execute("INSERT INTO project_scene_continuity_revisions(project_id,revision,document_json,created_at) VALUES(?,?,?,?)",
+                       (project_id, revision, json.dumps(document, ensure_ascii=False), timestamp))
+        return self.get_scene_continuity(project_id)
+
+    def approve_scene_continuity(self, project_id: str, revision: int):
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            cursor = db.execute("UPDATE project_scene_continuity SET approved_revision=?,approved_at=?,updated_at=? "
+                                "WHERE project_id=? AND current_revision=?", (revision, timestamp, timestamp, project_id, revision))
+            if cursor.rowcount != 1:
+                raise RuntimeError("Scene continuity changed; save or reload before approval")
+        return self.get_scene_continuity(project_id)
+
+    def add_creative_review(self, *, project_id: str, storyboard_id: str, shot_id: str, job_id: str,
+                            storyboard_revision: int, continuity_revision: int, decision: str,
+                            checklist: dict, reason: str):
+        review_id, timestamp = str(uuid4()), now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("INSERT INTO shot_creative_reviews(id,project_id,storyboard_id,shot_id,job_id,storyboard_revision,"
+                       "continuity_revision,decision,checklist_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                       (review_id, project_id, storyboard_id, shot_id, job_id, storyboard_revision,
+                        continuity_revision, decision, json.dumps(checklist), reason, timestamp))
+        return {"id": review_id, "project_id": project_id, "storyboard_id": storyboard_id, "shot_id": shot_id,
+                "job_id": job_id, "storyboard_revision": storyboard_revision, "continuity_revision": continuity_revision,
+                "decision": decision, "checklist": checklist, "reason": reason, "created_at": timestamp}
+
+    def latest_creative_review(self, shot_id: str):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM shot_creative_reviews WHERE shot_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (shot_id,)).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result["checklist"] = json.loads(result.pop("checklist_json"))
+            return result
 
     def project_assets(self, project_id: str):
         with self.connect() as db:
@@ -939,6 +1012,21 @@ class Database:
                     shot["status"] = "verified" if verified else "failed"
                 else:
                     shot["status"] = shot["job"]["status"]
+                review_row = db.execute("SELECT * FROM shot_creative_reviews WHERE shot_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+                                        (shot["id"],)).fetchone()
+                shot["creative_review"] = None
+                shot["creative_review_current"] = False
+                if review_row:
+                    review = dict(review_row)
+                    review["checklist"] = json.loads(review.pop("checklist_json"))
+                    shot["creative_review"] = review
+                    continuity_row = db.execute("SELECT approved_revision FROM project_scene_continuity WHERE project_id=?",
+                                                 (story["project_id"],)).fetchone()
+                    approved_continuity = continuity_row["approved_revision"] if continuity_row else None
+                    shot["creative_review_current"] = bool(
+                        shot["job"] and review["job_id"] == shot["job"]["id"] and
+                        review["storyboard_revision"] == story["revision"] and
+                        approved_continuity == review["continuity_revision"])
                 shots.append(shot)
             story["shots"] = shots
             for shot in story["shots"]:
