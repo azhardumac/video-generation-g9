@@ -263,3 +263,27 @@ weights are available. See [the installed runtime audit](docs/LOCAL_LTX_2_3_CAPA
 
 Backend tests do not invoke LTX or Remotion. This release does not run GPU
 generation, video continuation, model downloads, or a Remotion render.
+
+
+## Prompt-first orchestration (Issue #25 · Milestone A)
+
+The **Create Film** landing page records project-scoped prompts, approved image
+references, explicit generation authorization, output/time limits, and resumable
+stage checkpoints in SQLite. Request keys are idempotent; the browser retains a
+keyed prompt fingerprint across refresh without storing the prompt in local
+storage, and repeated submissions with the same key and payload return the same
+run. A read-only preview uses
+only matching benchmark history and verified project output sizes. If no matching
+measurement exists, it says so instead of inventing a cost estimate. An interrupted
+run resumes only from a persisted paused checkpoint; it does not re-submit queued
+LTX jobs automatically. Existing independent local queue jobs retain their
+pre-existing worker behavior.
+
+This milestone does not yet provide a general story-understanding model. The
+existing deterministic planner remains limited to the approved Scorpion & Frog
+fable. An arbitrary prompt is saved as **waiting for planner**, with zero LTX
+jobs, rather than being represented as a completed plan. Technical ffprobe
+verification remains distinct from creative review, and no automatic visual
+quality detector is claimed. The existing manual Story to Film and Export /
+Remotion workflows remain available. General story planning, measured visual QA,
+and selective automated repair are follow-on milestones.

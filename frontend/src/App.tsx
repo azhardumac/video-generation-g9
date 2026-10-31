@@ -7,6 +7,7 @@ import StyleBiblePage from './StyleBiblePage'
 import FilmPlanPage from './FilmPlanPage'
 import SetupPage from './SetupPage'
 import SceneContinuityPage from './SceneContinuityPage'
+import CreateFilmPage from './CreateFilmPage'
 
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
 type Asset = { id: string; category: string; relative_path: string; path: string; name: string; size_bytes: number; mime_type: string }
@@ -15,7 +16,7 @@ type Job = { id: string; kind?:string; status: string; progress: number; payload
 type Integration = { ltx: { root: string; installed: boolean; runner: string; runner_available: boolean; model: string; hf_home: string; cache_available: boolean; weights_cached: boolean; ready: boolean }; remotion: { root: string; installed: boolean; cli: string; cli_available: boolean; version: string | null; ready: boolean }; story_project: { root: string; available: boolean }; ffprobe: { available: boolean; path: string | null } }
 type Resources = { disk_free_bytes: number; memory: { total_bytes: number | null; available_bytes: number | null }; swap: { total_bytes: number | null; used_bytes: number | null }; memory_pressure: { free_percent: number; level: string } | null; warnings:string[] }
 const nav = [
-  { group: 'STUDIO', items: [['Overview', LayoutDashboard], ['Projects', FolderOpen], ['Storyboard', ListVideo], ['Story to Film', Film], ['Scene continuity', ShieldCheck], ['Export / Remotion', Film], ['References', Image], ['Style bible', BookOpen]] },
+  { group: 'STUDIO', items: [['Create Film', WandSparkles], ['Overview', LayoutDashboard], ['Projects', FolderOpen], ['Storyboard', ListVideo], ['Story to Film', Film], ['Scene continuity', ShieldCheck], ['Export / Remotion', Film], ['References', Image], ['Style bible', BookOpen]] },
   { group: 'PRODUCTION', items: [['Generate video', WandSparkles], ['Job queue', Gauge], ['History & logs', History]] },
   { group: 'WORKSPACE', items: [['Setup', Download], ['Settings', Settings]] },
 ] as const
@@ -24,7 +25,7 @@ const jobTitle = (job:Job) => job.payload.job_label || (job.kind === 'render' ? 
 const jobTypeLabel = (job:Job) => job.kind === 'render' ? `Remotion · ${job.payload.composition_id || 'StoryboardAssembly'}` : job.payload.preset || 'Generation'
 
 export default function App() {
-  const [active, setActive] = useState('Overview')
+  const [active, setActive] = useState('Create Film')
   const [presets, setPresets] = useState<Preset[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
   const [assets, setAssets] = useState<Asset[]>([])
@@ -149,6 +150,7 @@ export default function App() {
       <div className="page-scroll"><div className="page-container">
         <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> {dateLabel}</div><h1>{active === 'Overview' ? activeProject?.name??'Local video studio' : active}</h1><p className="subtitle">{active === 'Overview' ? activeProject?.description||'Create or select a project to start planning.' : 'A local-first production workspace.'}</p></div>{activeProject&&<button className="button primary" onClick={() => navigate('Generate video')}><Plus size={16}/> New generation</button>}</div>
         {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={14}/></button></div>}
+        {active === 'Create Film' && <CreateFilmPage project={activeProject} presets={presets} onMessage={setNotice} onNavigate={navigate}/>}
         {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onSaved={()=>activeProject?loadProjectSettings(activeProject.id):Promise.resolve()} onRecheck={recheckLocalStatus} onMessage={setNotice} integrations={integrations} resources={resources} projectId={activeProject?.id??null}/>}
         {active === 'Setup' && <SetupPage onMessage={setNotice} onContinue={()=>setActive('Overview')}/>}
         {active === 'Job queue' && <JobsPage title="Local job queue" jobs={jobs.filter(j=>j.status==='queued'||j.status==='running'||j.status==='failed')} onChanged={refresh} onMessage={setNotice}/>}
