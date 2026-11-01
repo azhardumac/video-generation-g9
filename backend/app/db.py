@@ -12,8 +12,6 @@ from .paths import safe_local_path
 from .film_orchestrator import FilmRunConflict, FilmRunTransitionError
 
 MAX_GEMINI_ATTEMPTS_PER_REVISION = 3
-MAX_GEMINI_REVISIONS_PER_RUN = 3
-MAX_GEMINI_ATTEMPTS_PER_HOUR = 5
 
 
 def now_iso() -> str:
@@ -25,7 +23,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration(target_version=9)
+        self._backup_before_migration(target_version=10)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -174,11 +172,11 @@ class Database:
                 );
                 CREATE TABLE IF NOT EXISTS film_run_planner_attempts (
                     run_id TEXT NOT NULL, revision INTEGER NOT NULL, provider TEXT NOT NULL,
-                    model TEXT NOT NULL DEFAULT '', schema_version TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '', schema_version TEXT NOT NULL, response_mode TEXT NOT NULL DEFAULT 'schema',
                     idempotency_key TEXT NOT NULL, request_hash TEXT NOT NULL DEFAULT '', scope_hash TEXT NOT NULL DEFAULT '',
                     consent_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0, result_json TEXT, usage_json TEXT, provenance_json TEXT,
-                    error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    error_code TEXT, error_details_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     PRIMARY KEY(run_id,revision), UNIQUE(run_id,idempotency_key)
                 );
                 CREATE INDEX IF NOT EXISTS idx_film_planner_attempts_hourly
@@ -309,7 +307,13 @@ class Database:
                            (legacy["run_id"], legacy["provider"], legacy["model"], legacy["request_hash"], legacy["request_hash"],
                             json.dumps(consent, sort_keys=True), legacy["status"], legacy["attempts"], legacy["result_json"],
                             legacy["usage_json"], legacy["provenance_json"], legacy["error_code"], legacy["created_at"], legacy["updated_at"]))
+            attempt_columns = {row[1] for row in db.execute("PRAGMA table_info(film_run_planner_attempts)")}
+            if "response_mode" not in attempt_columns:
+                db.execute("ALTER TABLE film_run_planner_attempts ADD COLUMN response_mode TEXT NOT NULL DEFAULT 'schema'")
+            if "error_details_json" not in attempt_columns:
+                db.execute("ALTER TABLE film_run_planner_attempts ADD COLUMN error_details_json TEXT")
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(9,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(10,?)", (now_iso(),))
             for run in db.execute("SELECT id,revision,stage FROM film_runs WHERE status='running'"):
                 message = "Application restarted during orchestration; the run was paused at its last durable checkpoint."
                 db.execute("UPDATE film_runs SET status='paused',error=?,revision=revision+1,updated_at=? WHERE id=? AND status='running'",
@@ -824,7 +828,7 @@ class Database:
         if not row:
             return None
         item = dict(row)
-        for field in ("result_json", "usage_json", "provenance_json", "consent_json"):
+        for field in ("result_json", "usage_json", "provenance_json", "consent_json", "error_details_json"):
             raw = item.pop(field, None)
             item[field.removesuffix("_json")] = json.loads(raw) if raw else None
         if not include_result:
@@ -836,12 +840,6 @@ class Database:
         with self.connect() as db:
             rows = db.execute("SELECT * FROM film_run_planner_attempts WHERE run_id=? ORDER BY revision", (run_id,))
             return [self._planner_attempt(row, include_result=include_result) for row in rows]
-
-    def gemini_planner_attempts_last_hour(self) -> int:
-        with self.connect() as db:
-            return int(db.execute("SELECT COALESCE(SUM(attempts),0) FROM film_run_planner_attempts "
-                                  "WHERE provider='gemini' AND julianday(updated_at)>=julianday('now','-1 hour')").fetchone()[0])
-
 
     def film_run_planner_request(self, run_id: str, *, include_result: bool = True, revision: int | None = None):
         """Compatibility accessor returning the selected revision or latest attempt."""
@@ -856,7 +854,8 @@ class Database:
             return self._planner_attempt(legacy, include_result=include_result)
 
     def reserve_film_run_planner_request(self, run_id: str, provider: str, model: str, request_hash: str, *,
-                                         revision: int = 1, schema_version: str = "storyplan-json-v3"):
+                                         revision: int = 1, schema_version: str = "storyplan-json-v3",
+                                         response_mode: str = "schema"):
         """Reserve an attempt before network I/O; no restart can resubmit silently."""
         timestamp = now_iso()
         with self.lock, self.connect() as db:
@@ -874,8 +873,9 @@ class Database:
             existing = db.execute("SELECT * FROM film_run_planner_attempts WHERE run_id=? AND revision=?",
                                   (run_id, revision)).fetchone()
             if existing:
-                if existing["provider"] != provider or existing["model"] != model or existing["schema_version"] != schema_version:
-                    raise FilmRunConflict("This run already has a different model or schema for the selected planning revision")
+                if (existing["provider"] != provider or existing["model"] != model or
+                        existing["schema_version"] != schema_version or existing["response_mode"] != response_mode):
+                    raise FilmRunConflict("This run already has a different model, schema, or response format for the selected planning revision")
                 if existing["request_hash"] not in {"", "pending", request_hash}:
                     raise FilmRunConflict("This planning revision already reserved a different prompt and project scope")
                 if existing["status"] in {"started", "completed", "failed"}:
@@ -886,22 +886,14 @@ class Database:
                     raise FilmRunConflict("This story-planning revision is already reserved")
                 if existing["attempts"] >= 3:
                     raise FilmRunTransitionError("This planning revision has used all three explicit attempts. Switch to a new authorized model or schema revision to continue.")
-                current_attempts = int(db.execute("SELECT COALESCE(SUM(attempts),0) FROM film_run_planner_attempts "
-                    "WHERE provider='gemini' AND julianday(updated_at)>=julianday('now','-1 hour')").fetchone()[0])
-                if current_attempts >= 5:
-                    raise FilmRunTransitionError("Gemini planning reached FRAMEWORK's limit of five attempts per hour. Wait before authorizing another request.")
                 db.execute("UPDATE film_run_planner_attempts SET request_hash=?,status='started',attempts=attempts+1,error_code=NULL,updated_at=? WHERE run_id=? AND revision=?",
                            (request_hash, timestamp, run_id, revision))
                 item = db.execute("SELECT * FROM film_run_planner_attempts WHERE run_id=? AND revision=?", (run_id, revision)).fetchone()
                 return self._planner_attempt(item) | {"created": True}
-            current_attempts = int(db.execute("SELECT COALESCE(SUM(attempts),0) FROM film_run_planner_attempts "
-                "WHERE provider='gemini' AND julianday(updated_at)>=julianday('now','-1 hour')").fetchone()[0])
-            if current_attempts >= 5:
-                raise FilmRunTransitionError("Gemini planning reached FRAMEWORK's limit of five attempts per hour. Wait before starting another request.")
             consent = request.get("planner_replan_consent", {}) if revision > 1 else request.get("remote_processing_consent", {})
-            db.execute("INSERT INTO film_run_planner_attempts(run_id,revision,provider,model,schema_version,idempotency_key,request_hash,scope_hash,consent_json,status,attempts,created_at,updated_at) "
-                       "VALUES(?,?,?,?,?,?,?,? ,?,'started',1,?,?)",
-                       (run_id, revision, provider, model or "", schema_version, f"revision-{revision}-{request_hash[:16]}", request_hash,
+            db.execute("INSERT INTO film_run_planner_attempts(run_id,revision,provider,model,schema_version,response_mode,idempotency_key,request_hash,scope_hash,consent_json,status,attempts,created_at,updated_at) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,?,'started',1,?,?)",
+                       (run_id, revision, provider, model or "", schema_version, response_mode, f"revision-{revision}-{request_hash[:16]}", request_hash,
                         hashlib.sha256(json.dumps({"project_id": run["project_id"], "prompt": json.loads(run["request_json"]).get("prompt"),
                             "reference_ids": json.loads(run["request_json"]).get("reference_ids", []), "budget": json.loads(run["request_json"]).get("budget")},
                             ensure_ascii=False, sort_keys=True).encode()).hexdigest(), json.dumps(consent, sort_keys=True), timestamp, timestamp))
@@ -920,10 +912,11 @@ class Database:
                         json.dumps(result.get("provenance", {}), ensure_ascii=False, sort_keys=True), timestamp, run_id, revision))
         return self.film_run_planner_request(run_id, revision=revision)
 
-    def fail_film_run_planner_request(self, run_id: str, error_code: str, *, revision: int = 1):
+    def fail_film_run_planner_request(self, run_id: str, error_code: str, *, revision: int = 1,
+                                      error_details: dict | None = None):
         with self.lock, self.connect() as db:
-            db.execute("UPDATE film_run_planner_attempts SET status='failed',error_code=?,updated_at=? WHERE run_id=? AND revision=? AND status='started'",
-                       (error_code[:80], now_iso(), run_id, revision))
+            db.execute("UPDATE film_run_planner_attempts SET status='failed',error_code=?,error_details_json=?,updated_at=? WHERE run_id=? AND revision=? AND status='started'",
+                       (error_code[:80], json.dumps(error_details, sort_keys=True) if error_details else None, now_iso(), run_id, revision))
 
     def authorize_film_run_planner_retry(self, run_id: str):
         """Only explicit user resume authorizes another request in this revision."""
@@ -937,15 +930,20 @@ class Database:
 
     def create_film_run_planner_revision(self, run_id: str, expected_revision: int, model: str,
                                          idempotency_key: str, scope_hash: str, schema_version: str,
+                                         response_mode: str,
                                          consent: dict):
         """Create a separately billed, explicitly consented revision without altering the film budget."""
         timestamp = now_iso()
         with self.lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            duplicate = db.execute("SELECT r.* FROM film_run_planner_attempts a JOIN film_runs r ON r.id=a.run_id "
-                                   "WHERE a.run_id=? AND a.idempotency_key=?", (run_id, idempotency_key)).fetchone()
+            duplicate = db.execute("SELECT a.*,r.revision AS run_revision,r.id AS film_run_id FROM film_run_planner_attempts a "
+                                   "JOIN film_runs r ON r.id=a.run_id WHERE a.run_id=? AND a.idempotency_key=?",
+                                   (run_id, idempotency_key)).fetchone()
             if duplicate:
-                result = self._film_run(duplicate)
+                if (duplicate["model"] != model or duplicate["schema_version"] != schema_version or
+                        duplicate["response_mode"] != response_mode or duplicate["scope_hash"] != scope_hash):
+                    raise FilmRunConflict("This planner idempotency key was already used for a different model, schema, response format, or run scope")
+                result = self._film_run(db.execute("SELECT * FROM film_runs WHERE id=?", (run_id,)).fetchone())
                 result["replan_deduplicated"] = True
                 return result
             run = db.execute("SELECT * FROM film_runs WHERE id=?", (run_id,)).fetchone()
@@ -960,29 +958,25 @@ class Database:
                 raise FilmRunTransitionError("This run is not authorized for remote Gemini planning")
             if not consent.get("confirmed"):
                 raise FilmRunTransitionError("Explicit consent is required for each potentially billable planning revision")
+            if response_mode not in {"schema", "json_only"}:
+                raise FilmRunTransitionError("Unsupported Gemini response format")
             if db.execute("SELECT 1 FROM film_run_shots WHERE run_id=? LIMIT 1", (run_id,)).fetchone() or \
                     db.execute("SELECT 1 FROM film_batches WHERE film_run_id=? LIMIT 1", (run_id,)).fetchone():
                 raise FilmRunTransitionError("This run has existing shot jobs; planner recovery cannot alter a generated film")
             latest = db.execute("SELECT * FROM film_run_planner_attempts WHERE run_id=? ORDER BY revision DESC LIMIT 1", (run_id,)).fetchone()
             if latest and latest["status"] not in {"failed", "started"}:
                 raise FilmRunTransitionError("Only a failed or interrupted planning attempt can be replaced")
-            revision_count = int(db.execute("SELECT COUNT(*) FROM film_run_planner_attempts WHERE run_id=?", (run_id,)).fetchone()[0])
-            if revision_count >= 3:
-                raise FilmRunTransitionError("This film run reached its limit of three planning revisions. Preserve its history and create a new film request only after reviewing usage.")
-            recent_attempts = int(db.execute("SELECT COALESCE(SUM(attempts),0) FROM film_run_planner_attempts "
-                "WHERE provider='gemini' AND julianday(updated_at)>=julianday('now','-1 hour')").fetchone()[0])
-            if recent_attempts >= 5:
-                raise FilmRunTransitionError("Gemini planning reached FRAMEWORK's limit of five attempts per hour. Wait before authorizing another request.")
             next_revision = (latest["revision"] + 1) if latest else 1
             old_model = latest["model"] if latest else ""
             request["planner_model"] = model
             request["planner_revision"] = next_revision
             request["planner_schema_version"] = schema_version
+            request["planner_response_mode"] = response_mode
             request["planner_replan_consent"] = consent | {"previous_model": old_model, "new_model": model,
-                "scope_hash": scope_hash, "schema_version": schema_version, "confirmed_at": timestamp}
-            db.execute("INSERT INTO film_run_planner_attempts(run_id,revision,provider,model,schema_version,idempotency_key,request_hash,scope_hash,consent_json,status,attempts,created_at,updated_at) "
-                       "VALUES(?,?, 'gemini',?,?,?,'pending',?,?,'retry_authorized',0,?,?)",
-                       (run_id, next_revision, model, schema_version, idempotency_key, scope_hash,
+                "scope_hash": scope_hash, "schema_version": schema_version, "response_mode": response_mode, "confirmed_at": timestamp}
+            db.execute("INSERT INTO film_run_planner_attempts(run_id,revision,provider,model,schema_version,response_mode,idempotency_key,request_hash,scope_hash,consent_json,status,attempts,created_at,updated_at) "
+                       "VALUES(?,?, 'gemini',?,?,?,?, 'pending',?,?, 'retry_authorized',0,?,?)",
+                       (run_id, next_revision, model, schema_version, response_mode, idempotency_key, scope_hash,
                         json.dumps(request["planner_replan_consent"], sort_keys=True), timestamp, timestamp))
             message = f"Explicit Gemini replan authorized as revision {next_revision}: {old_model or 'unselected'} → {model}; prior attempts and film budget were preserved."
             db.execute("UPDATE film_runs SET request_json=?,status='waiting_for_planner',error=NULL,revision=revision+1,updated_at=? WHERE id=? AND revision=?",

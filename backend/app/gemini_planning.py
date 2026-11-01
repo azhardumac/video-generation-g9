@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from typing import Any
 
 from pydantic import ValidationError
@@ -17,17 +16,18 @@ OUTPUT_TOKENS_PER_SHOT = 640
 MAX_STORY_SCENES = 40
 MAX_SHOTS_PER_SCENE = 40
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-MAX_TRANSIENT_ATTEMPTS = 2  # Includes the first request; one bounded retry at most.
 MAX_SCHEMA_REPAIR_REQUESTS = 1
 STORY_PLAN_SCHEMA_VERSION = "storyplan-budgeted-v1"
 _FLASH_ALLOWLIST = re.compile(r"^(?:models/)?gemini-[a-z0-9][a-z0-9.-]*flash[a-z0-9.-]*$", re.IGNORECASE)
 
 
 class GeminiPlanningError(RuntimeError):
-    def __init__(self, code: str, message: str, *, retryable_by_user: bool = False):
+    def __init__(self, code: str, message: str, *, retryable_by_user: bool = False,
+                 diagnostics: dict[str, Any] | None = None):
         super().__init__(message)
         self.code = code
         self.retryable_by_user = retryable_by_user
+        self.diagnostics = diagnostics or {}
 
 
 def _client(api_key: str, timeout_seconds: int):
@@ -137,12 +137,10 @@ def _output_token_limit(shot_budget: int) -> int:
 class GeminiStoryPlanner(StoryPlanner):
     provider = "gemini"
 
-    def __init__(self, api_key: str | None, model: str | None, timeout_seconds: int = 120, client_factory=None,
-                 sleeper=time.sleep):
+    def __init__(self, api_key: str | None, model: str | None, timeout_seconds: int = 120, client_factory=None):
         self.api_key, self.model = api_key, model
         self.timeout_seconds = timeout_seconds
         self.client_factory = client_factory or _client
-        self.sleeper = sleeper
 
     @staticmethod
     def available_models(client) -> list[dict[str, str]]:
@@ -160,7 +158,7 @@ class GeminiStoryPlanner(StoryPlanner):
             raise GeminiStoryPlanner._classify_error(exc, "connection") from None
 
     @classmethod
-    def _classify_error(cls, exc: Exception, context: str) -> GeminiPlanningError:
+    def _classify_error(cls, exc: Exception, context: str, *, response_mode: str = "schema") -> GeminiPlanningError:
         code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
         if hasattr(code, "value"):
             code = code.value
@@ -170,25 +168,100 @@ class GeminiStoryPlanner(StoryPlanner):
             status = None
         class_name = type(exc).__name__.casefold()
         safe_context = "Gemini connection test" if context == "connection" else "Gemini story planning"
+        diagnostics = cls._safe_provider_diagnostics(exc, status)
+        if context != "connection":
+            diagnostics["response_mode"] = response_mode
         if status in (401, 403):
-            return GeminiPlanningError("auth_denied", f"{safe_context} was denied. Check the Gemini API key, API access, and account permissions.")
+            return GeminiPlanningError("auth_denied", f"{safe_context} was denied. Check the Gemini API key, API access, and account permissions.", diagnostics=diagnostics)
         if status == 429:
-            return GeminiPlanningError("rate_limit", f"Gemini rate or quota limit reached during {context}. Wait or review the account's current quota; no automatic retry was made.", retryable_by_user=True)
+            return GeminiPlanningError("rate_limit", f"Gemini rate or quota limit reached during {context}. Review the provider account quota; no application cooldown is imposed and no automatic retry was made.", retryable_by_user=True, diagnostics=diagnostics)
         if status in (502, 503, 504):
-            return GeminiPlanningError("service_unavailable", f"Gemini is temporarily unavailable during {context}; the bounded transient retry limit was reached.", retryable_by_user=True)
+            return GeminiPlanningError("service_unavailable", f"Gemini is temporarily unavailable during {context}; no automatic retry was made.", retryable_by_user=True, diagnostics=diagnostics)
         if status == 400:
-            return GeminiPlanningError("invalid_request", "Gemini rejected the structured StoryPlan request. The selected model may not support this JSON schema.", retryable_by_user=True)
+            fields = diagnostics.get("field_paths", [])
+            model_field = any("model" in field.casefold() for field in fields)
+            schema_field = any(any(term in field.casefold() for term in ("schema", "responsejsonschema", "response_json_schema")) for field in fields)
+            if model_field:
+                diagnostics["category"] = "model_or_endpoint_rejected"
+                message = "Gemini rejected the selected model or model parameter (HTTP 400). Check the model listed by this account."
+                error_code = "model_parameter_rejected"
+            elif response_mode == "schema" and (schema_field or not fields):
+                diagnostics["category"] = "response_schema_rejected"
+                message = "Gemini rejected the structured JSON Schema request (HTTP 400). The model may be valid while a schema element or schema-mode parameter is unsupported. Select JSON-only format to retry explicitly without provider-side schema enforcement."
+                error_code = "schema_rejected"
+            else:
+                diagnostics["category"] = "request_parameter_rejected"
+                message = "Gemini rejected a request parameter (HTTP 400). The sanitized field path below identifies the rejected parameter when Google provided one."
+                error_code = "invalid_request"
+            message += cls._diagnostic_suffix(diagnostics)
+            return GeminiPlanningError(error_code, message, retryable_by_user=True, diagnostics=diagnostics)
         if status == 404:
+            diagnostics["category"] = "model_or_endpoint_incompatible"
             return GeminiPlanningError("model_or_endpoint_incompatible",
-                "Gemini returned 404 for structured generation. The selected model may not support the generateContent API, may no longer be available, or may be incompatible with this API version. Test the connection and choose an account-listed Flash model that supports generateContent.",
-                retryable_by_user=True)
+                "Gemini returned 404 for structured generation. The selected model may not support the generateContent API, may no longer be available, or may be incompatible with this API version. Test the connection and choose an account-listed Flash model that supports generateContent." + cls._diagnostic_suffix(diagnostics),
+                retryable_by_user=True, diagnostics=diagnostics)
         if "timeout" in class_name or isinstance(exc, TimeoutError):
             return GeminiPlanningError("timeout", "Gemini did not finish before the configured request timeout. Its remote outcome is unknown; the run will not resend automatically.", retryable_by_user=True)
         if "blocked" in class_name or "safety" in class_name:
             return GeminiPlanningError("blocked_content", "Gemini blocked this story-planning request under its safety policy. Review the prompt and retry only if appropriate.", retryable_by_user=True)
         if "connection" in class_name or "transport" in class_name:
-            return GeminiPlanningError("service_unavailable", f"Gemini could not be reached during {context}. Check network access; the run will not resend automatically after restart.", retryable_by_user=True)
-        return GeminiPlanningError("provider_error", f"Gemini {context} failed ({type(exc).__name__}). Details were omitted to protect prompt and credential privacy.", retryable_by_user=True)
+            return GeminiPlanningError("service_unavailable", f"Gemini could not be reached during {context}. Check network access; the run will not resend automatically after restart.", retryable_by_user=True, diagnostics=diagnostics)
+        return GeminiPlanningError("provider_error", f"Gemini {context} failed ({type(exc).__name__}). Provider response text was omitted to protect prompt and credential privacy.", retryable_by_user=True, diagnostics=diagnostics)
+
+    @staticmethod
+    def _safe_provider_diagnostics(exc: Exception, http_status: int | None) -> dict[str, Any]:
+        """Extract only whitelisted machine-readable fields; never expose body text."""
+        details = getattr(exc, "details", None)
+        error = details.get("error", details) if isinstance(details, dict) else {}
+        if not isinstance(error, dict):
+            error = {}
+        status = error.get("status") or getattr(exc, "status", None)
+        safe_token = re.compile(r"^[A-Za-z0-9_.:/-]{1,96}$")
+        safe_reason = re.compile(r"^[A-Z][A-Z0-9_]{1,80}$")
+        provider_status = status if isinstance(status, str) and safe_reason.fullmatch(status) else None
+        reasons: list[str] = []
+        fields: list[str] = []
+        nested = error.get("details", [])
+        if isinstance(nested, list):
+            for item in nested:
+                if not isinstance(item, dict):
+                    continue
+                reason = item.get("reason")
+                if isinstance(reason, str) and safe_reason.fullmatch(reason):
+                    reasons.append(reason)
+                violations = item.get("fieldViolations", item.get("field_violations", []))
+                if isinstance(violations, list):
+                    for violation in violations:
+                        if not isinstance(violation, dict):
+                            continue
+                        field = violation.get("field") or violation.get("fieldPath") or violation.get("field_path")
+                        known_field_path = isinstance(field, str) and field.startswith((
+                            "generationConfig.", "generation_config.", "generateContentRequest.",
+                            "contents", "model", "tools.", "systemInstruction.", "system_instruction."))
+                        if known_field_path and safe_token.fullmatch(field):
+                            fields.append(field)
+        reason = reasons[0] if reasons else (provider_status if provider_status and provider_status != "INVALID_ARGUMENT" else None)
+        result: dict[str, Any] = {}
+        if http_status is not None:
+            result["http_status"] = http_status
+        if provider_status:
+            result["provider_status"] = provider_status
+        if reason:
+            result["reason"] = reason
+        if fields:
+            result["field_paths"] = sorted(set(fields))[:8]
+        return result
+
+    @staticmethod
+    def _diagnostic_suffix(diagnostics: dict[str, Any]) -> str:
+        parts = []
+        if diagnostics.get("provider_status"):
+            parts.append(f"status={diagnostics['provider_status']}")
+        if diagnostics.get("reason"):
+            parts.append(f"reason={diagnostics['reason']}")
+        if diagnostics.get("field_paths"):
+            parts.append("fields=" + ", ".join(diagnostics["field_paths"]))
+        return (" Safe provider diagnostics: " + "; ".join(parts) + ".") if parts else ""
 
     def _require_key(self):
         if not self.api_key:
@@ -258,40 +331,38 @@ class GeminiStoryPlanner(StoryPlanner):
             prompt += "\n\nThe prior response failed local validation. Repair it, preserving story facts. Validation error: " + repair["error"] + "\nINVALID_RESPONSE_JSON:\n" + repair["output"][:MAX_RESPONSE_BYTES]
         return prompt
 
-    def _call(self, client, request_text: str, shot_budget: int):
-        for attempt in range(MAX_TRANSIENT_ATTEMPTS):
-            try:
-                response = client.models.generate_content(
-                    model=self.model,
-                    contents=request_text,
-                    # The pinned google-genai SDK accepts a raw JSON Schema in
-                    # response_json_schema; response_schema is not this field.
-                    config={"response_mime_type": "application/json",
-                            "response_json_schema": gemini_story_schema(shot_budget),
-                            "max_output_tokens": _output_token_limit(shot_budget)},
-                )
-                prompt_feedback = getattr(response, "prompt_feedback", None)
-                block_reason = getattr(prompt_feedback, "block_reason", None) if prompt_feedback else None
-                block_reason = getattr(block_reason, "name", block_reason)
-                if block_reason and str(block_reason).upper() not in {"UNSPECIFIED", "BLOCK_REASON_UNSPECIFIED", "0"}:
-                    raise GeminiPlanningError("blocked_content", "Gemini blocked this story-planning request under its safety policy. Review the prompt and retry only if appropriate.", retryable_by_user=True)
-                candidates = getattr(response, "candidates", None) or []
-                finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
-                finish_reason = getattr(finish_reason, "name", finish_reason)
-                if str(finish_reason).upper() in {"MAX_TOKENS", "MAX_TOKENS_REACHED"}:
-                    raise GeminiPlanningError("incomplete_output", "Gemini reached its output-token limit before completing the StoryPlan. Increase the story budget or simplify the request.", retryable_by_user=True)
-                if str(finish_reason).upper() in {"SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT"}:
-                    raise GeminiPlanningError("blocked_content", "Gemini blocked this story-planning request under its safety policy. Review the prompt and retry only if appropriate.", retryable_by_user=True)
-                return response
-            except GeminiPlanningError:
-                raise
-            except Exception as exc:
-                classified = self._classify_error(exc, "story planning")
-                raw_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-                if attempt + 1 < MAX_TRANSIENT_ATTEMPTS and str(raw_code) in {"502", "503", "504"}:
-                    self.sleeper(0.5 * (2 ** attempt))
-                    continue
-                raise classified from None
+    def _call(self, client, request_text: str, shot_budget: int, response_mode: str):
+        config = {"response_mime_type": "application/json",
+                  "max_output_tokens": _output_token_limit(shot_budget)}
+        if response_mode == "schema":
+            config["response_json_schema"] = gemini_story_schema(shot_budget)
+        elif response_mode != "json_only":
+            raise GeminiPlanningError("invalid_response_mode", "Unsupported Gemini response format")
+        try:
+            response = client.models.generate_content(
+                model=self.model,
+                contents=request_text,
+                # JSON-only mode omits the provider schema when a model
+                # rejects it; strict local StoryPlan validation is unchanged.
+                config=config,
+            )
+            prompt_feedback = getattr(response, "prompt_feedback", None)
+            block_reason = getattr(prompt_feedback, "block_reason", None) if prompt_feedback else None
+            block_reason = getattr(block_reason, "name", block_reason)
+            if block_reason and str(block_reason).upper() not in {"UNSPECIFIED", "BLOCK_REASON_UNSPECIFIED", "0"}:
+                raise GeminiPlanningError("blocked_content", "Gemini blocked this story-planning request under its safety policy. Review the prompt and retry only if appropriate.", retryable_by_user=True)
+            candidates = getattr(response, "candidates", None) or []
+            finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+            finish_reason = getattr(finish_reason, "name", finish_reason)
+            if str(finish_reason).upper() in {"MAX_TOKENS", "MAX_TOKENS_REACHED"}:
+                raise GeminiPlanningError("incomplete_output", "Gemini reached its output-token limit before completing the StoryPlan. Increase the story budget or simplify the request.", retryable_by_user=True)
+            if str(finish_reason).upper() in {"SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT"}:
+                raise GeminiPlanningError("blocked_content", "Gemini blocked this story-planning request under its safety policy. Review the prompt and retry only if appropriate.", retryable_by_user=True)
+            return response
+        except GeminiPlanningError:
+            raise
+        except Exception as exc:
+            raise self._classify_error(exc, "story planning", response_mode=response_mode) from None
 
     def plan(self, request: dict[str, Any]) -> PlannerResult:
         self._require_key()
@@ -306,7 +377,8 @@ class GeminiStoryPlanner(StoryPlanner):
         except Exception as exc:
             raise self._classify_error(exc, "story planning") from None
         shot_budget = int(request["shot_budget"])
-        response = self._call(client, self._prompt(request), shot_budget)
+        response_mode = request.get("response_mode", "schema")
+        response = self._call(client, self._prompt(request), shot_budget, response_mode)
         usages = [_safe_usage(response)]
         output = getattr(response, "text", None)
         output = output if isinstance(output, str) else ""
@@ -316,7 +388,7 @@ class GeminiStoryPlanner(StoryPlanner):
             # Exactly one bounded schema repair, charged against this run's two-call cap.
             if len(output.encode("utf-8")) > MAX_RESPONSE_BYTES:
                 raise GeminiPlanningError("invalid_output", "Gemini returned malformed or oversized JSON. No shot jobs were queued.", retryable_by_user=True) from None
-            repaired = self._call(client, self._prompt(request, {"error": str(first_error)[:2000], "output": output}), shot_budget)
+            repaired = self._call(client, self._prompt(request, {"error": str(first_error)[:2000], "output": output}), shot_budget, response_mode)
             usages.append(_safe_usage(repaired))
             try:
                 plan = self._validate_output(getattr(repaired, "text", None), request)
@@ -325,7 +397,8 @@ class GeminiStoryPlanner(StoryPlanner):
         usage = {key: sum((item[key] or 0) for item in usages) if any(item[key] is not None for item in usages) else None
                  for key in ("input_tokens", "output_tokens", "total_tokens")}
         return PlannerResult(plan=plan, provenance={"provider": "gemini", "model": self.model,
-            "api": "Gemini generateContent API structured JSON", "sdk": "google-genai", "request_count": len(usages),
+            "api": "Gemini generateContent API JSON Schema" if response_mode == "schema" else "Gemini generateContent API JSON-only fallback",
+            "response_mode": response_mode, "sdk": "google-genai", "request_count": len(usages),
             "output_token_limit": _output_token_limit(shot_budget),
             "usage": usage, "cost_estimate": None,
             "billing_note": "Gemini billing/free-tier data policy varies by account and tier; review current Google AI Studio pricing.",

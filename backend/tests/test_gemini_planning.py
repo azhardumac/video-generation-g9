@@ -63,8 +63,9 @@ class FakeClient:
 
 
 class FakeAPIError(Exception):
-    def __init__(self, code):
+    def __init__(self, code, details=None):
         self.code = code
+        self.details = details
         super().__init__(f"private response body {code}")
 
 
@@ -82,8 +83,8 @@ def fixture_request(refs=None, shot_budget=5):
             "preset": "Short", "model_capabilities": {"audio_generation": False, "video_continuation": False}}
 
 
-def make_planner(client, *, model="gemini-3.8-flash", sleeper=lambda _delay: None):
-    return GeminiStoryPlanner("not-a-real-test-secret", model, client_factory=lambda _key, _timeout: client, sleeper=sleeper)
+def make_planner(client, *, model="gemini-3.8-flash"):
+    return GeminiStoryPlanner("not-a-real-test-secret", model, client_factory=lambda _key, _timeout: client)
 
 
 def test_account_model_selection_is_limited_to_flash_models_returned_by_account():
@@ -109,9 +110,27 @@ def test_structured_plan_uses_supported_schema_and_always_validates_with_storypl
     assert result.plan.title == "The Lighthouse Keeper"
     assert result.provenance["provider"] == "gemini"
     assert result.provenance["usage"]["total_tokens"] == 325
-    assert result.provenance["api"] == "Gemini generateContent API structured JSON"
+    assert result.provenance["api"] == "Gemini generateContent API JSON Schema"
     assert result.provenance["output_token_limit"] == 3712
     assert result.provenance["cost_estimate"] is None
+
+
+def test_pinned_google_genai_sdk_serializes_schema_and_json_only_configs():
+    from importlib.metadata import version
+    from google.genai import types
+
+    assert version("google-genai") == "2.33.0"
+    schema_config = types.GenerateContentConfig.model_validate({
+        "response_mime_type": "application/json", "response_json_schema": gemini_story_schema(1),
+        "max_output_tokens": _output_token_limit(1),
+    }).model_dump(by_alias=True, exclude_none=True)
+    json_config = types.GenerateContentConfig.model_validate({
+        "response_mime_type": "application/json", "max_output_tokens": _output_token_limit(1),
+    }).model_dump(by_alias=True, exclude_none=True)
+    assert schema_config["responseMimeType"] == "application/json"
+    assert schema_config["responseJsonSchema"]["properties"]["scenes"]["maxItems"] == 1
+    assert json_config == {"responseMimeType": "application/json", "maxOutputTokens": 3712}
+    assert "responseJsonSchema" not in json_config
 
 
 def test_opaque_reference_metadata_only_and_scope_rejection_repair():
@@ -177,8 +196,8 @@ def test_missing_key_invalid_model_auth_quota_and_empty_output_are_classified_wi
     client = FakeClient([FakeAPIError(400)])
     with pytest.raises(GeminiPlanningError) as rejected:
         make_planner(client).plan(fixture_request())
-    assert rejected.value.code == "invalid_request"
-    assert "JSON schema" in str(rejected.value)
+    assert rejected.value.code == "schema_rejected"
+    assert "JSON Schema" in str(rejected.value)
     assert "private response body" not in str(rejected.value)
     assert len(client.models.calls) == 1
 
@@ -187,13 +206,13 @@ def test_missing_key_invalid_model_auth_quota_and_empty_output_are_classified_wi
     assert len(client.models.calls) == 2
 
 
-def test_only_bounded_503_retry_and_timeout_does_not_automatically_resend():
+def test_transient_provider_error_is_not_automatically_retried():
     client = FakeClient([FakeAPIError(503), response(StoryPlan.model_validate(valid_plan()).model_dump_json())])
-    delays = []
-    result = make_planner(client, sleeper=delays.append).plan(fixture_request())
-    assert result.plan.title == "The Lighthouse Keeper"
-    assert len(client.models.calls) == 2
-    assert delays == [0.5]
+    with pytest.raises(GeminiPlanningError) as unavailable:
+        make_planner(client).plan(fixture_request())
+    assert unavailable.value.code == "service_unavailable"
+    assert unavailable.value.retryable_by_user
+    assert len(client.models.calls) == 1
 
     client = FakeClient([TimeoutError("key and prompt must not be included")])
     with pytest.raises(GeminiPlanningError) as timeout:
@@ -213,6 +232,46 @@ def test_404_identifies_model_or_endpoint_incompatibility_without_private_text()
     assert "not-a-real-test-secret" not in str(missing.value)
     assert "A lighthouse keeper guides a lost boat" not in str(missing.value)
     assert len(client.models.calls) == 1
+
+
+def test_schema_400_exposes_only_sanitized_provider_status_reason_and_field_path():
+    details = {"error": {"code": 400, "status": "INVALID_ARGUMENT",
+        "message": "PRIVATE_PROMPT_AND_PROVIDER_RESPONSE_BODY",
+        "details": [
+            {"@type": "type.googleapis.com/google.rpc.BadRequest", "fieldViolations": [
+                {"field": "generationConfig.responseJsonSchema.properties.scenes", "description": "PRIVATE_PROMPT_AND_SCHEMA_CONTENT"}]},
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "SCHEMA_VALIDATION_FAILED",
+             "metadata": {"private": "PRIVATE_RESPONSE_METADATA"}},
+        ]}}
+    client = FakeClient([FakeAPIError(400, details)])
+    with pytest.raises(GeminiPlanningError) as error:
+        make_planner(client).plan(fixture_request(shot_budget=1))
+    assert error.value.code == "schema_rejected"
+    assert error.value.diagnostics == {"http_status": 400, "provider_status": "INVALID_ARGUMENT",
+        "reason": "SCHEMA_VALIDATION_FAILED", "field_paths": ["generationConfig.responseJsonSchema.properties.scenes"],
+        "response_mode": "schema", "category": "response_schema_rejected"}
+    assert "generationConfig.responseJsonSchema.properties.scenes" in str(error.value)
+    assert "PRIVATE_" not in str(error.value)
+    assert "PRIVATE_" not in str(error.value.diagnostics)
+
+
+def test_json_only_mode_omits_provider_schema_and_still_validates_storyplan_locally():
+    request = fixture_request(shot_budget=1) | {"response_mode": "json_only"}
+    valid = StoryPlan.model_validate(valid_plan()).model_dump_json()
+    client = FakeClient([response(valid)])
+    result = make_planner(client).plan(request)
+    config = client.models.calls[0]["config"]
+    assert config == {"response_mime_type": "application/json", "max_output_tokens": 3712}
+    assert result.plan.title == "The Lighthouse Keeper"
+    assert result.provenance["response_mode"] == "json_only"
+
+    invalid = valid_plan(["not-approved"])
+    client = FakeClient([response(StoryPlan.model_validate(invalid).model_dump_json()), response("still invalid")])
+    with pytest.raises(GeminiPlanningError) as rejected:
+        make_planner(client).plan(request | {"allowed_reference_ids": ["approved"],
+            "project_reference_catalog": [{"id": "approved", "category": "character"}]})
+    assert rejected.value.code == "invalid_output"
+    assert all("response_json_schema" not in call["config"] for call in client.models.calls)
 
 
 def test_invalid_json_uses_one_bounded_schema_repair():

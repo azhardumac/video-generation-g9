@@ -142,9 +142,9 @@ class FilmOrchestrator:
 
     def replan_with_gemini(self, run_id: str, expected_revision: int, model: str,
                            idempotency_key: str, scope_hash: str, schema_version: str,
-                           consent: dict[str, Any]):
+                           response_mode: str, consent: dict[str, Any]):
         return self.db.create_film_run_planner_revision(run_id, expected_revision, model,
-            idempotency_key, scope_hash, schema_version, consent)
+            idempotency_key, scope_hash, schema_version, response_mode, consent)
 
     def cancel(self, run_id: str, expected_revision: int):
         run = self.get(run_id)

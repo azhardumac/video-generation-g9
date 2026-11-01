@@ -108,6 +108,7 @@ class FilmRunEngine:
                 "project_reference_catalog": [{"id": item["id"], "category": item["category"]} for item in catalog],
                 "reference_privacy": "IDs and categories only; no filenames, notes, paths, or media are included.",
                 "budget": {key: run["budget"][key] for key in ("max_shots", "max_generation_seconds", "max_output_bytes")},
+                "response_mode": request.get("planner_response_mode", "schema"),
             }
             key, _source = self.secret_store.get()
             model = run.get("request", {}).get("planner_model") or ""
@@ -122,11 +123,12 @@ class FilmRunEngine:
             schema_version = (request.get("planner_schema_version") or
                               (prior_attempt.get("schema_version") if prior_attempt else None) or
                               STORY_PLAN_SCHEMA_VERSION)
+            response_mode = request.get("planner_response_mode", "schema")
             fingerprint = hashlib.sha256(json.dumps({"provider": provider, "model": model, "input": remote_request,
-                    "schema_version": schema_version, "revision": planner_revision},
+                    "schema_version": schema_version, "response_mode": response_mode, "revision": planner_revision},
                     ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
             reservation = self.db.reserve_film_run_planner_request(run["id"], provider, model, fingerprint,
-                revision=planner_revision, schema_version=schema_version)
+                revision=planner_revision, schema_version=schema_version, response_mode=response_mode)
             if reservation["status"] == "completed":
                 stored = reservation.get("result") or {}
                 try:
@@ -151,7 +153,8 @@ class FilmRunEngine:
                     planned.validate_project_scope(selected_ids, categories)
                     self.db.complete_film_run_planner_request(run["id"], {"plan": planned.model_dump(mode="json"), "provenance": provenance}, revision=planner_revision)
                 except GeminiPlanningError as exc:
-                    self.db.fail_film_run_planner_request(run["id"], exc.code, revision=planner_revision)
+                    self.db.fail_film_run_planner_request(run["id"], exc.code, revision=planner_revision,
+                        error_details=exc.diagnostics)
                     raise
                 except (PlannerOutputError, ValueError) as exc:
                     self.db.fail_film_run_planner_request(run["id"], "invalid_output", revision=planner_revision)
@@ -188,6 +191,10 @@ class FilmRunEngine:
         checkpoint["estimated_generation_seconds"] = round(float(benchmark["elapsed_seconds"]) * count) if benchmark else None
         if checkpoint["estimated_generation_seconds"] is not None and checkpoint["estimated_generation_seconds"] > run["budget"]["max_generation_seconds"]:
             raise FilmRunTransitionError("The measured local generation estimate exceeds this run's time budget")
+        if run.get("request", {}).get("plan_only"):
+            return self.db.checkpoint_film_run(run["id"], run["revision"], "understand_story", "define_visual_bible",
+                checkpoint, status="awaiting_authorization",
+                message=f"Plan Only validated and saved '{plan.title}' with {count} shot(s). No LTX jobs were created; authorize local generation separately when ready.")
         return self.db.checkpoint_film_run(run["id"], run["revision"], "understand_story", "define_visual_bible",
                                            checkpoint, status="waiting_for_planner",
                                            message=f"Structured story validated: {len(plan.scenes)} scenes and {count} shots.")

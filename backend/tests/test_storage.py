@@ -92,7 +92,7 @@ def test_legacy_schema_migration_is_backed_up_additive_and_idempotent(tmp_path):
     assert migrated.get_job("job")["payload"]["prompt"] == "historical"
     assert migrated.get_project_asset("legacy", "asset")["relative_path"] == "frog.png"
     with migrated.connect() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"project_scene_continuity", "project_scene_continuity_revisions", "shot_creative_reviews", "film_runs", "film_run_events", "film_run_shots", "film_run_shot_attempts", "film_run_planner_requests", "film_run_planner_attempts"}.issubset(tables)
         assert "project_id" in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
@@ -102,6 +102,40 @@ def test_legacy_schema_migration_is_backed_up_additive_and_idempotent(tmp_path):
     assert len(backups) == 1
     Database(settings)
     assert len(list(tmp_path.glob("legacy.sqlite3.pre-migration-*.bak"))) == 1
+
+
+def test_planner_attempt_history_survives_additive_v10_migration(tmp_path):
+    from app.film_orchestrator import FilmOrchestrator
+
+    path = tmp_path / "planner-history.sqlite3"
+    settings = Settings(_env_file=None, database_path=str(path), allowed_path_roots=str(tmp_path))
+    db = Database(settings)
+    project = db.create_project({"id": "planner-project", "name": "Planner test", "root": str(tmp_path),
+        "aspect_ratio": "9:16", "frame_rate": 24, "production_type": "short"})
+    request = {"prompt": "A fox follows a moonlit path.", "reference_ids": [], "preset": "Short",
+        "planner_provider": "gemini", "planner_model": "gemini-2.5-flash",
+        "remote_processing_consent": {"confirmed": True},
+        "authorization": {"confirmed": True},
+        "budget": {"max_shots": 1, "max_retries_per_shot": 0, "max_generation_seconds": 60, "max_output_bytes": 1024}}
+    run = FilmOrchestrator(db).create(project["id"], "planner-history-key", request, authorized=True)
+    claimed = db.update_film_run(run["id"], run["revision"], status="running", message="claim planning")
+    db.reserve_film_run_planner_request(run["id"], "gemini", "gemini-2.5-flash", "before-v10",
+        schema_version="storyplan-budgeted-v1")
+    db.fail_film_run_planner_request(run["id"], "schema_rejected", error_details={"http_status": 400})
+    with db.connect() as connection:
+        connection.execute("ALTER TABLE film_run_planner_attempts DROP COLUMN response_mode")
+        connection.execute("ALTER TABLE film_run_planner_attempts DROP COLUMN error_details_json")
+        connection.execute("DELETE FROM schema_migrations WHERE version=10")
+
+    migrated = Database(settings)
+    attempt = migrated.film_run_planner_request(run["id"], include_result=False)
+    assert attempt["status"] == "failed" and attempt["attempts"] == 1
+    assert attempt["error_code"] == "schema_rejected"
+    assert attempt["response_mode"] == "schema"
+    assert migrated.get_film_run(run["id"])["prompt"] == request["prompt"]
+    with migrated.connect() as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
+    assert list(tmp_path.glob("planner-history.sqlite3.pre-migration-*.bak"))
 
 
 def test_failed_migration_rolls_back_schema_and_keeps_backup(tmp_path):
@@ -120,14 +154,14 @@ def test_failed_migration_rolls_back_schema_and_keeps_backup(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 1
 
 
-def test_ninth_additive_migration_backs_up_version_eight_database(tmp_path):
+def test_tenth_additive_migration_backs_up_version_nine_database(tmp_path):
     path = tmp_path / "version-two.sqlite3"
     settings = Settings(_env_file=None,database_path=str(path),allowed_path_roots=str(tmp_path))
     first = Database(settings)
     with first.connect() as db:
-        db.execute("DELETE FROM schema_migrations WHERE version=9")
+        db.execute("DELETE FROM schema_migrations WHERE version=10")
     migrated = Database(settings)
     assert migrated is not None
     with migrated.connect() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
     assert len(list(tmp_path.glob("version-two.sqlite3.pre-migration-*.bak"))) == 1
