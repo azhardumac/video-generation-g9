@@ -196,8 +196,12 @@ key in a protected local file (`GEMINI_SECRET_PATH`, mode 0600) or reads
 `GEMINI_API_KEY` from the backend environment. The key is never returned to the
 browser or written to SQLite, film-run checkpoints, or logs. FRAMEWORK uses the
 official pinned `google-genai` SDK and the `generateContent` structured JSON API.
-Only account-listed Flash models advertising `generateContent` support are
-selectable. FRAMEWORK validates every result against the strict Pydantic `StoryPlan` schema, project
+Only account-listed Flash models advertising `generateContent` and eligible
+for text output are selectable. Output-modality metadata is preferred when
+available; model-family exclusions filter TTS/audio, image, embedding, live,
+video, and other non-story variants. The pinned SDK's model-list schema does
+not currently expose output modalities, so name-based filtering is used there.
+FRAMEWORK validates every result against the strict Pydantic `StoryPlan` schema, project
 references, story order, identity/count consistency, shot limits, and generation
 budgets. The provider schema's scene, per-scene shot, and location caps and the
 response-token ceiling scale with the authorized shot budget. New film runs
@@ -228,6 +232,10 @@ shows the HTTP status and sanitized SDK route. With the pinned
 base URL and `v1beta` API version; `generateContent` is routed as
 `/v1beta/models/{account-listed-model}:generateContent`. A connection test
 only lists account models and is not a substitute for this generation probe.
+A probe's 503 is reported as transient and can be retried only by explicitly
+confirming another short probe; 404 indicates model/project access or endpoint
+availability, while HTTP 200 audio-only output is reported as a modality
+mismatch. No application cooldown or automatic paid retry is added.
 
 **Create Film** requires an explicit per-run cloud-processing opt-in for Gemini.
 Only prompt and disclosed metadata are sent; all image/video media work remains

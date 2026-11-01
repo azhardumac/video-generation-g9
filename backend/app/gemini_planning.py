@@ -48,19 +48,112 @@ def _client(api_key: str, timeout_seconds: int):
 
 
 def _model_fields(model) -> tuple[str, str, tuple[str, ...]]:
-    if isinstance(model, dict):
-        name = model.get("name") or model.get("model") or ""
-        display = model.get("display_name") or model.get("displayName") or name
-        actions = (model.get("supported_actions") or model.get("supportedActions") or
-                   model.get("supported_generation_methods") or model.get("supportedGenerationMethods") or [])
-    else:
-        name = getattr(model, "name", "") or getattr(model, "model", "")
-        display = getattr(model, "display_name", None) or getattr(model, "displayName", None) or name
-        actions = (getattr(model, "supported_actions", None) or getattr(model, "supportedActions", None) or
-                   getattr(model, "supported_generation_methods", None) or
-                   getattr(model, "supportedGenerationMethods", None) or [])
+    name = _model_value(model, "name", "model") or ""
+    display = _model_value(model, "display_name", "displayName") or name
+    actions = (_model_value(model, "supported_actions", "supportedActions") or
+               _model_value(model, "supported_generation_methods", "supportedGenerationMethods") or [])
     normalized = str(name).removeprefix("models/")
     return normalized, str(display), tuple(str(item) for item in actions)
+
+
+def _model_value(model, *names):
+    """Read snake/camel metadata from dicts, SDK objects, or future SDK fields."""
+    for name in names:
+        if isinstance(model, dict) and name in model:
+            return model[name]
+        value = getattr(model, name, None)
+        if value is not None:
+            return value
+    if hasattr(model, "model_dump"):
+        try:
+            dumped = model.model_dump(by_alias=True, exclude_none=True)
+        except Exception:
+            dumped = {}
+        for name in names:
+            if name in dumped:
+                return dumped[name]
+    extras = getattr(model, "__pydantic_extra__", None)
+    if isinstance(extras, dict):
+        for name in names:
+            if name in extras:
+                return extras[name]
+    return None
+
+
+def _output_modalities(model) -> tuple[str, ...] | None:
+    value = _model_value(model, "output_modalities", "outputModalities", "supported_output_modalities",
+                         "supportedOutputModalities", "response_modalities", "responseModalities")
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = re.split(r"[,\s]+", value.strip())
+    if not isinstance(value, (list, tuple, set)):
+        return None
+    modalities = []
+    for item in value:
+        normalized = getattr(item, "value", None) or getattr(item, "name", None) or item
+        if isinstance(normalized, str) and normalized.strip():
+            modalities.append(normalized.strip().upper().replace("MODALITY_", ""))
+    return tuple(sorted(set(modalities)))
+
+
+def _text_output_eligibility(model_id: str, modalities: tuple[str, ...] | None) -> tuple[bool, str]:
+    """Reject non-story model families; prefer explicit text output metadata."""
+    tokens = set(re.split(r"[^a-z0-9]+", model_id.casefold()))
+    unsuitable = {"tts", "image", "imagen", "audio", "live", "embedding", "embed",
+                  "video", "veo", "music", "lyria", "robotics"}
+    if tokens & unsuitable:
+        return False, "name_exclusion"
+    if modalities is not None:
+        return ("TEXT" in modalities, "output_modalities")
+    return True, "name_fallback"
+
+
+def _stored_model_is_text_eligible(model: dict) -> bool:
+    model_id = str(model.get("id") or model.get("name") or "")
+    modality_value = model.get("output_modalities")
+    modalities = (tuple(str(item).upper() for item in modality_value)
+                  if isinstance(modality_value, list) and model.get("text_output_source") != "name_fallback" else None)
+    return _text_output_eligibility(model_id, modalities)[0]
+
+
+def _response_output_modalities(response) -> tuple[str, ...]:
+    modalities: set[str] = set()
+
+    def value(obj, *keys):
+        for key in keys:
+            if isinstance(obj, dict) and key in obj:
+                return obj[key]
+            item = getattr(obj, key, None)
+            if item is not None:
+                return item
+        return None
+
+    candidates = value(response, "candidates") or []
+    for candidate in candidates:
+        content = value(candidate, "content")
+        for part in value(content, "parts") or []:
+            text = value(part, "text")
+            if isinstance(text, str) and text.strip():
+                modalities.add("TEXT")
+            inline = value(part, "inline_data", "inlineData")
+            mime_type = value(inline, "mime_type", "mimeType")
+            if isinstance(mime_type, str):
+                kind = mime_type.partition("/")[0].upper()
+                if kind in {"AUDIO", "IMAGE", "VIDEO", "TEXT"}:
+                    modalities.add(kind)
+            for key, kind in (("audio", "AUDIO"), ("output_audio", "AUDIO"),
+                              ("outputAudio", "AUDIO"), ("image", "IMAGE"), ("video", "VIDEO")):
+                if value(part, key) is not None:
+                    modalities.add(kind)
+    if not modalities:
+        try:
+            text = response.text
+        except Exception:
+            text = None
+        if isinstance(text, str) and text.strip():
+            modalities.add("TEXT")
+    return tuple(sorted(modalities))
 
 
 def _safe_usage(response) -> dict[str, int | None]:
@@ -146,16 +239,19 @@ class GeminiStoryPlanner(StoryPlanner):
         self.client_factory = client_factory or _client
 
     @staticmethod
-    def available_models(client) -> list[dict[str, str]]:
+    def available_models(client) -> list[dict[str, Any]]:
         try:
             models = client.models.list()
             result = []
             for model in models:
                 name, display, actions = _model_fields(model)
+                modalities = _output_modalities(model)
+                text_eligible, eligibility_source = _text_output_eligibility(name, modalities)
                 compatible = {action.replace("_", "").replace("-", "").casefold() for action in actions}
-                if (name and _FLASH_ALLOWLIST.fullmatch(name) and "generatecontent" in compatible
-                        and "image" not in name.casefold()):
-                    result.append({"id": name, "display_name": display})
+                if name and _FLASH_ALLOWLIST.fullmatch(name) and "generatecontent" in compatible and text_eligible:
+                    result.append({"id": name, "display_name": display,
+                                   "output_modalities": list(modalities) if modalities is not None else [],
+                                   "text_output_source": eligibility_source})
             return sorted(result, key=lambda item: item["id"].casefold())
         except Exception as exc:
             raise GeminiStoryPlanner._classify_error(exc, "connection") from None
@@ -180,7 +276,10 @@ class GeminiStoryPlanner(StoryPlanner):
         if status == 429:
             return GeminiPlanningError("rate_limit", f"Gemini rate or quota limit reached during {context}. Review the provider account quota; no application cooldown is imposed and no automatic retry was made.", retryable_by_user=True, diagnostics=diagnostics)
         if status in (502, 503, 504):
-            return GeminiPlanningError("service_unavailable", f"Gemini is temporarily unavailable during {context}; no automatic retry was made.", retryable_by_user=True, diagnostics=diagnostics)
+            diagnostics["category"] = "transient_provider_service"
+            return GeminiPlanningError("service_unavailable",
+                f"Gemini returned a temporary HTTP {status} service/capacity error during {context}. This does not indicate a schema or model-access failure. No automatic retry was made; you may explicitly repeat the short endpoint test later.",
+                retryable_by_user=True, diagnostics=diagnostics)
         if status == 400:
             fields = diagnostics.get("field_paths", [])
             model_field = any("model" in field.casefold() for field in fields)
@@ -200,7 +299,7 @@ class GeminiStoryPlanner(StoryPlanner):
             message += cls._diagnostic_suffix(diagnostics)
             return GeminiPlanningError(error_code, message, retryable_by_user=True, diagnostics=diagnostics)
         if status == 404:
-            diagnostics["category"] = "model_or_endpoint_incompatible"
+            diagnostics["category"] = "model_access_or_endpoint"
             if context == "generation endpoint probe":
                 message = ("The basic Gemini generateContent request returned HTTP 404. This request contained only "
                            "the fixed diagnostic text and no schema or media. Check the API key's Google project, "
@@ -282,7 +381,7 @@ class GeminiStoryPlanner(StoryPlanner):
         if not _FLASH_ALLOWLIST.fullmatch(self.model):
             raise GeminiPlanningError("model_invalid", "The selected Gemini model is not a supported Flash-class model from the verified account model list.")
 
-    def test_connection(self) -> list[dict[str, str]]:
+    def test_connection(self) -> list[dict[str, Any]]:
         self._require_key_for_test()
         try:
             return self.available_models(self.client_factory(self.api_key, self.timeout_seconds))
@@ -320,17 +419,29 @@ class GeminiStoryPlanner(StoryPlanner):
                                   "Check that the Gemini API is enabled for the API key's project and confirm "
                                   "the listed model is available to this key." + self._diagnostic_suffix(error.diagnostics),)
                 raise error from None
-            text = getattr(response, "text", None)
+            modalities = _response_output_modalities(response)
+            try:
+                text = response.text
+            except Exception:
+                text = None
             if not isinstance(text, str) or not text.strip():
-                raise GeminiPlanningError("empty_generation_response",
-                    "Gemini accepted the basic generateContent request but returned no text. Check provider safety feedback and account access.",
+                has_audio = "AUDIO" in modalities and "TEXT" not in modalities
+                code = "non_text_response" if has_audio else "no_text_response"
+                category = "unsupported_response_modality" if has_audio else "missing_text_output"
+                message = ("Gemini returned HTTP 200 with audio output and no text. This is a successful audio response, "
+                           "but audio-only output cannot be used for StoryPlan generation. Choose a text-output model.") if has_audio else (
+                    "Gemini returned HTTP 200 but no usable text. The response did not prove an audio-only model; inspect "
+                    "the reported output modality or provider safety result before changing models.")
+                raise GeminiPlanningError(code, message,
                     retryable_by_user=True,
                     diagnostics={"http_status": 200, "model": model_id, "api_version": api_version,
                                  "endpoint_host": host, "endpoint_path": route,
-                                 "request_shape": "text_only_no_schema_no_media"})
+                                 "request_shape": "text_only_no_schema_no_media",
+                                 "output_modalities": list(modalities) or ["UNKNOWN"], "category": category})
             return {"success": True, "http_status": 200, "model": model_id,
                     "api_version": api_version, "endpoint_host": host,
                     "endpoint_path": route, "request_shape": "text_only_no_schema_no_media",
+                    "output_modalities": list(modalities),
                     "response_text": text.strip()[:240]}
         except GeminiPlanningError:
             raise

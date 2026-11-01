@@ -24,7 +24,8 @@ class FakeGeminiProbe:
         pass
 
     def test_connection(self):
-        return [{"id": "gemini-3.8-flash", "display_name": "Gemini Flash"}]
+        return [{"id": "gemini-3.8-flash", "display_name": "Gemini Flash",
+                 "output_modalities": [], "text_output_source": "name_fallback"}]
 
     def test_generation_endpoint(self):
         return {"success": True, "http_status": 200, "model": "gemini-3.8-flash",
@@ -70,6 +71,7 @@ def test_api_key_backend_storage_connection_test_and_model_selection_never_retur
     assert tested["connected"] is True
     assert tested["model"] == "gemini-3.8-flash"
     assert fake_key not in json.dumps(tested)
+    assert api.story_planner_config()["gemini"]["model"] == "gemini-3.8-flash"
     selected = api.select_gemini_model(api.GeminiModelRequest(model="gemini-3.8-flash"))
     assert selected["model"] == "gemini-3.8-flash"
     endpoint_test = api.test_gemini_generation_endpoint(
@@ -123,6 +125,25 @@ def test_generation_endpoint_probe_requires_a_recently_account_listed_model(tmp_
     assert arbitrary.value.status_code == 400
 
 
+def test_stale_tts_selection_is_not_offered_and_text_candidate_is_available_without_rewriting_history(tmp_path, monkeypatch):
+    from app import main as api
+    db = SettingsDB()
+    monkeypatch.setattr(api, "db", db)
+    monkeypatch.setattr(api, "gemini_secret_store", GeminiSecretStore(tmp_path / "secret.json", env={"GEMINI_API_KEY": "selection-test-key"}))
+    prior = {"run_id": "old-failed-run", "error_code": "service_unavailable", "prompt": "preserve this run"}
+    db.put_setting("historical_test_record", prior)
+    db.put_setting("story_planner_gemini", {"status": "connected", "model": "gemini-3.8-flash-lite-tts",
+        "models": [{"id": "gemini-3.8-flash-lite-tts", "display_name": "Flash-Lite TTS"},
+                   {"id": "gemini-3.8-flash", "display_name": "Flash"}]})
+    config = api._gemini_planner_config()
+    assert config["status"] == "connected"
+    assert config["model"] == "gemini-3.8-flash"
+    assert [item["id"] for item in config["models"]] == ["gemini-3.8-flash"]
+    assert "not eligible for text story output" in config["detail"]
+    assert db.get_setting("historical_test_record") == prior
+    assert db.get_setting("story_planner_gemini")["model"] == "gemini-3.8-flash-lite-tts"
+
+
 def test_generation_endpoint_probe_returns_safe_route_error_without_persisting_it(tmp_path, monkeypatch):
     from app import main as api
     db = SettingsDB()
@@ -168,3 +189,25 @@ def test_gemini_provider_requires_per_run_remote_consent(monkeypatch):
     legacy = api.CreateFilmRunRequest(prompt="A local story.", idempotency_key="legacy-local")
     assert legacy.planner_provider == "local"
     assert legacy.remote_processing_consent is False
+
+
+def test_account_with_only_audio_or_tts_variants_is_not_connected_for_story_planning(tmp_path, monkeypatch):
+    from app import main as api
+    db = SettingsDB()
+    monkeypatch.setattr(api, "db", db)
+    monkeypatch.setattr(api, "gemini_secret_store", GeminiSecretStore(tmp_path / "secret.json", env={"GEMINI_API_KEY": "no-text-key"}))
+
+    class AudioOnlyAccount:
+        def __init__(self, *_args):
+            pass
+
+        def test_connection(self):
+            return []
+
+    monkeypatch.setattr(api, "GeminiStoryPlanner", AudioOnlyAccount)
+    with pytest.raises(HTTPException) as no_text:
+        api.test_gemini_connection()
+    assert no_text.value.status_code == 409
+    assert "no text-output Flash model" in no_text.value.detail
+    assert db.get_setting("story_planner_gemini")["status"] == "no_text_models"
+    assert api.story_planner_config()["gemini"]["status"] == "no_text_models"
