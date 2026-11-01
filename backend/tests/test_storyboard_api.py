@@ -817,7 +817,7 @@ def test_unverified_clip_cannot_receive_creative_approval():
     assert rejected.value.status_code == 409
 
 
-def test_generic_gemini_run_review_uses_verified_storyboard_contract_without_fable_metadata():
+def test_generic_gemini_run_review_uses_authoritative_job_when_batch_job_and_shot_status_are_missing(monkeypatch):
     from uuid import uuid4
     from app.film_orchestrator import FilmOrchestrator
 
@@ -850,7 +850,6 @@ def test_generic_gemini_run_review_uses_verified_storyboard_contract_without_fab
     story = api.db.create_film_run_plan(run["id"],"Sunrise on the Hill",prompt,[shot],
         [{"title":"01. Dawn by the cottage","visual_description":"The fox finds a lantern.","estimated_seconds":2.04,"transition_after":"cut"}],
         "9:16","Short",generic_metadata)
-    needs_review = api.db.update_film_run(run["id"],running["revision"],status="needs_review",message="fixture clip ready")
     job = api.db.create_shot_job(story["id"],shot["id"],dict(shot["generation_payload"]))
     assert api.db.claim_job(job["id"])
     clip = root / "outputs" / "fox-first-shot.mp4"
@@ -858,6 +857,35 @@ def test_generic_gemini_run_review_uses_verified_storyboard_contract_without_fab
     clip.write_bytes(b"verified Gemini storyboard fixture; no inference")
     assert api.db.complete_job(job["id"],progress=100,result_path=str(clip),exit_code=0,
         verification_metadata={"verified_output":{"width":448,"height":768,"fps":24,"frames":49}})
+
+    # Reproduce the persisted mismatch: a completed batch slot has no job_id/job,
+    # while the storyboard's shot_jobs association still points to the verified MP4.
+    batch_id = f"generic-review-batch-{uuid4().hex}"
+    with api.db.connect() as conn:
+        conn.execute("INSERT INTO film_batches(id,storyboard_id,project_id,storyboard_revision,style_bible_revision,status,created_at,updated_at,film_run_id) "
+            "VALUES(?,?,?,?,?,'completed','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00',?)",
+            (batch_id,story["id"],project_id,story["revision"],story["style_bible_revision"],run["id"]))
+        conn.execute("INSERT INTO film_batch_shots(batch_id,shot_id,position,status,job_id) VALUES(?,?,0,'completed',NULL)",
+            (batch_id,shot["id"]))
+        conn.execute("UPDATE film_runs SET film_batch_id=? WHERE id=?",(batch_id,run["id"]))
+    needs_review = api.db.update_film_run(run["id"],running["revision"],status="needs_review",message="fixture clip ready")
+
+    original_get_storyboard = api.db.get_storyboard
+    def storyboard_without_derived_status(storyboard_id, *, include_events=True):
+        value=original_get_storyboard(storyboard_id,include_events=include_events)
+        if value:
+            for item in value["shots"]:
+                item.pop("status",None)
+        return value
+    monkeypatch.setattr(api.db,"get_storyboard",storyboard_without_derived_status)
+    monkeypatch.setattr(api,"_gemini_planner_config",lambda:{"status":"missing_key","models":[]})
+
+    status = api._film_run_status(api.db.get_film_run(run["id"]))
+    assert status["generation_progress"]["total"] == 1
+    assert status["generation_progress"]["verified"] == 1
+    assert status["generation_progress"]["shots"][0]["verified"] is True
+    assert status["generation_progress"]["shots"][0]["job_id"] == job["id"]
+    assert api.db.get_film_batch(batch_id)["completed_shots"] == 1
 
     review_page = api.get_film_run_review(project_id,run["id"])
     assert review_page["title"] == "Sunrise on the Hill"
@@ -877,7 +905,7 @@ def test_generic_gemini_run_review_uses_verified_storyboard_contract_without_fab
     assert after_approval["creative_review_status"] == "approved"
     assert after_approval["shots"][0]["creative_review_current"] is True
     assert after_approval["shots"][0]["creative_review"]["notes"] == "Identity, framing, and story beat read clearly."
-    assert api.get_film_run(run["id"])["creative_review_status"] == "approved"
+    assert api._film_run_status(api.db.get_film_run(run["id"]))["creative_review_status"] == "approved"
 
     with pytest.raises(HTTPException,match="changed before the review was saved") as stale:
         api.review_film_run_shot(project_id,run["id"],shot["id"],api.FilmRunShotReviewRequest(
@@ -900,3 +928,11 @@ def test_generic_gemini_run_review_uses_verified_storyboard_contract_without_fab
     assert api.db.get_job(job["id"])["result_path"] == str(clip)
     assert len(api.db.list_jobs(project_id=project_id)) == 1
     assert len(api.db.film_run_shot_reviews(run["id"])) == 2
+
+    def missing_file(*args,**kwargs):
+        raise FileNotFoundError("fixture output is missing")
+    monkeypatch.setattr(api,"safe_local_path",missing_file)
+    blocked = api.get_film_run_review(project_id,run["id"])["shots"][0]
+    assert blocked["verified"] is False
+    assert blocked["job"] is None
+    assert "saved video is missing" in blocked["reviewability_reason"]

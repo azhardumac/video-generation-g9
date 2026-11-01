@@ -41,6 +41,7 @@ const { filmRunReviewTarget, activateFilmRunReview } = loadTs(path.join(frontend
 const { storyToFilmDisplayMode } = loadTs(path.join(frontendRoot, 'src/filmPlanCompatibility.ts'))
 const { default: ReviewVerifiedClipButton } = loadTs(path.join(frontendRoot, 'src/ReviewVerifiedClipButton.tsx'))
 const { default: FilmPlanSummary } = loadTs(path.join(frontendRoot, 'src/GenericRunPlanSummary.tsx'))
+const { default: FilmRunReviewAction } = loadTs(path.join(frontendRoot, 'src/FilmRunReviewAction.tsx'))
 
 // Mirrors GET /api/storyboards/{storyboard_id} after FilmRunEngine persistence:
 // planner_mode belongs to film_plans; generated metadata contains the normalized
@@ -100,6 +101,7 @@ test('generic clip review renders verified video, safe empty-reference state, an
   const html = renderToStaticMarkup(React.createElement(FilmRunReviewView, {
     data, shotId: 'shot-gemini-1', notes: '', onNotesChange() {}, busy: false, error: '',
     onBack() {}, onSelectShot() {}, onReview() {}, onContinueExport() {},
+    onRefreshVerification() {},
   }))
   assert.match(html, /api\/media\/file\?path=%2Ftmp%2Ffox%20first%20shot.mp4/)
   assert.match(html, /No available reference images are attached/)
@@ -158,6 +160,53 @@ test('Story to Film review CTA routes its verified Gemini shot to Clip Review di
   button.props.onClick()
   assert.equal(route,'Clip review')
   assert.deepEqual(opened, [{projectId:'project-fox',runId:'run-fox-api',shotId:'shot-fox-api'}])
+})
+
+test('Film Runs keep Open clip review visible and explain an unreviewable clip instead of hiding the action', () => {
+  const opened=[]
+  let route=''
+  const shots=[{shot_id:'shot-missing-job',status:'completed',verified:false,job_id:null,
+    reviewability_reason:'The job has no recorded ffprobe-verified video metadata.'}]
+  const markup=renderToStaticMarkup(React.createElement(FilmRunReviewAction,{runId:'run-missing-job',shots,
+    onReview:(runId,shotId)=>activateFilmRunReview('project-fox',runId,shotId,target=>opened.push(target),page=>{route=page})}))
+  assert.match(markup,/Open clip review/)
+  assert.match(markup,/The job has no recorded ffprobe-verified video metadata/)
+  assert.match(markup,/data-review-run-id="run-missing-job"/)
+  assert.match(markup,/data-review-shot-id="shot-missing-job"/)
+  const element=ReviewVerifiedClipButton({runId:'run-missing-job',shotId:shots[0].shot_id,
+    onReview:(runId,shotId)=>activateFilmRunReview('project-fox',runId,shotId,target=>opened.push(target),page=>{route=page}),label:'Open clip review'})
+  element.props.onClick()
+  assert.equal(route,'Clip review')
+  assert.deepEqual(opened,[{projectId:'project-fox',runId:'run-missing-job',shotId:'shot-missing-job'}])
+})
+
+test('1/1 completed verified run renders Review verified clips with the authoritative shot ID', () => {
+  const opened=[]
+  const shots=[{shot_id:'shot-fox-verified',status:'verified',verified:true,job_id:'job-fox-verified',reviewability_reason:null}]
+  const element=FilmRunReviewAction({runId:'run-fox-completed',shots,
+    onReview:(runId,shotId)=>opened.push(filmRunReviewTarget('project-fox',runId,shotId))})
+  const markup=renderToStaticMarkup(element)
+  assert.match(markup,/Review verified clips/)
+  assert.match(markup,/data-review-run-id="run-fox-completed"/)
+  assert.match(markup,/data-review-shot-id="shot-fox-verified"/)
+  const button=ReviewVerifiedClipButton({runId:'run-fox-completed',shotId:shots[0].shot_id,
+    onReview:(runId,shotId)=>opened.push(filmRunReviewTarget('project-fox',runId,shotId))})
+  button.props.onClick()
+  assert.deepEqual(opened,[{projectId:'project-fox',runId:'run-fox-completed',shotId:'shot-fox-verified'}])
+})
+
+test('Clip Review shows the backend blocker and a refresh-verification action for missing media', () => {
+  const data={run_id:'run-missing-media',project_id:'project-fox',run_revision:3,status:'needs_review',
+    storyboard_id:'storyboard-missing-media',storyboard_revision:1,title:'Fox film',creative_review_status:'pending',
+    shots:[{id:'shot-missing-media',title:'Lantern',scene_title:'Dawn',prompt:'Fox finds a lantern.',framing:'Close-up',
+      characters:['Fox'],expected_character_count:1,reference_ids:[],references:[],verified:false,job_id:'job-missing-media',
+      reviewability_reason:'The saved video is missing or outside the configured local output roots.',job:null,
+      creative_review:null,creative_review_current:false}]}
+  const html=renderToStaticMarkup(React.createElement(FilmRunReviewView,{data,shotId:'shot-missing-media',notes:'',
+    onNotesChange(){},busy:false,error:'',onBack(){},onSelectShot(){},onReview(){},onContinueExport(){},onRefreshVerification(){}}))
+  assert.match(html,/The saved video is missing or outside the configured local output roots/)
+  assert.match(html,/Refresh verification/)
+  assert.match(html,/button class="button primary" disabled=""[\s\S]*?Approve clip/)
 })
 
 test('error boundary fallback gives a safe recovery action', () => {
