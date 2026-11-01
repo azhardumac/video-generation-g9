@@ -23,7 +23,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration(target_version=11)
+        self._backup_before_migration(target_version=12)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -134,6 +134,15 @@ class Database:
                     continuity_revision INTEGER NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('approved','rejected')),
                     checklist_json TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS film_run_shot_reviews (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, run_id TEXT NOT NULL,
+                    storyboard_id TEXT NOT NULL, shot_id TEXT NOT NULL, job_id TEXT NOT NULL,
+                    run_revision INTEGER NOT NULL, storyboard_revision INTEGER NOT NULL,
+                    decision TEXT NOT NULL CHECK(decision IN ('approved','rejected')),
+                    notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_film_run_shot_reviews_latest
+                    ON film_run_shot_reviews(run_id,shot_id,created_at DESC,id DESC);
                 CREATE INDEX IF NOT EXISTS idx_shot_creative_reviews_latest
                     ON shot_creative_reviews(shot_id,created_at DESC,id DESC);
                 CREATE TABLE IF NOT EXISTS film_batches (
@@ -318,6 +327,7 @@ class Database:
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(9,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(10,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(11,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(12,?)", (now_iso(),))
             for run in db.execute("SELECT id,revision,stage FROM film_runs WHERE status='running'"):
                 message = "Application restarted during orchestration; the run was paused at its last durable checkpoint."
                 db.execute("UPDATE film_runs SET status='paused',error=?,revision=revision+1,updated_at=? WHERE id=? AND status='running'",
@@ -701,6 +711,51 @@ class Database:
             result = dict(row)
             result["checklist"] = json.loads(result.pop("checklist_json"))
             return result
+
+    def film_run_shot_reviews(self, run_id: str):
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM film_run_shot_reviews WHERE run_id=? ORDER BY created_at,id", (run_id,))
+            return [dict(row) for row in rows]
+
+    def add_film_run_shot_review(self, *, project_id: str, run_id: str, storyboard_id: str,
+                                 shot_id: str, job_id: str, expected_run_revision: int,
+                                 expected_storyboard_revision: int, decision: str, notes: str):
+        review_id, timestamp = str(uuid4()), now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = db.execute("SELECT project_id,storyboard_id,revision,status,archived_at FROM film_runs WHERE id=?",
+                             (run_id,)).fetchone()
+            if not run or run["project_id"] != project_id or run["storyboard_id"] != storyboard_id or run["archived_at"]:
+                raise KeyError("Film run is not available in this project")
+            if run["revision"] != expected_run_revision or run["status"] != "needs_review":
+                raise RuntimeError("Film run changed or is no longer awaiting creative review; refresh before saving")
+            story = db.execute("SELECT project_id,revision FROM storyboards WHERE id=? AND archived_at IS NULL",
+                               (storyboard_id,)).fetchone()
+            if not story or story["project_id"] != project_id or story["revision"] != expected_storyboard_revision:
+                raise RuntimeError("Storyboard changed before the review was saved; refresh and compare the current clip")
+            shot = db.execute("SELECT id FROM storyboard_shots WHERE id=? AND storyboard_id=? AND deleted_at IS NULL",
+                              (shot_id, storyboard_id)).fetchone()
+            if not shot:
+                raise KeyError("Shot is not part of this film run")
+            job = db.execute("SELECT j.kind,j.project_id,j.status,j.exit_code,j.verification_metadata FROM jobs j "
+                             "JOIN shot_jobs sj ON sj.job_id=j.id WHERE sj.shot_id=? AND j.id=?",
+                             (shot_id, job_id)).fetchone()
+            verified = False
+            if job and job["kind"] == "generation" and job["project_id"] == project_id and job["status"] == "completed" and job["exit_code"] == 0:
+                try:
+                    verified = bool(json.loads(job["verification_metadata"] or "{}").get("verified_output"))
+                except (TypeError, json.JSONDecodeError):
+                    verified = False
+            if not verified:
+                raise RuntimeError("Creative review requires this shot's current technically verified generation job")
+            db.execute("INSERT INTO film_run_shot_reviews(id,project_id,run_id,storyboard_id,shot_id,job_id,run_revision,"
+                       "storyboard_revision,decision,notes,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                       (review_id, project_id, run_id, storyboard_id, shot_id, job_id, expected_run_revision,
+                        expected_storyboard_revision, decision, notes, timestamp))
+        return {"id": review_id, "project_id": project_id, "run_id": run_id,
+                "storyboard_id": storyboard_id, "shot_id": shot_id, "job_id": job_id,
+                "run_revision": expected_run_revision, "storyboard_revision": expected_storyboard_revision,
+                "decision": decision, "notes": notes, "created_at": timestamp}
 
     def project_assets(self, project_id: str):
         with self.connect() as db:

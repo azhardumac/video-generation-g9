@@ -9,6 +9,9 @@ import SetupPage from './SetupPage'
 import SceneContinuityPage from './SceneContinuityPage'
 import CreateFilmPage from './CreateFilmPage'
 import GeminiConnectionPanel from './GeminiConnectionPanel'
+import FilmRunReviewPage from './FilmRunReviewPage'
+import ErrorBoundary from './ErrorBoundary'
+import { filmRunReviewTarget, type FilmRunReviewTarget } from './filmRunReviewNavigation'
 
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
 type Asset = { id: string; category: string; relative_path: string; path: string; name: string; size_bytes: number; mime_type: string }
@@ -41,6 +44,9 @@ export default function App() {
   const [outputPath, setOutputPath] = useState('')
   const [generationProfile, setGenerationProfile] = useState({model:'dgrauet/ltx-2.3-mlx-q8',width:448,height:768,fps:24,distilled_two_stage:true,low_ram:true,audio:false})
   const [notice, setNotice] = useState('')
+  const [errorBoundaryRevision, setErrorBoundaryRevision] = useState(0)
+  const [reviewTarget, setReviewTarget] = useState<FilmRunReviewTarget|null>(null)
+  const [exportStoryboardId, setExportStoryboardId] = useState<string|null>(null)
   const [connected, setConnected] = useState(false)
   const [loading, setLoading] = useState(false)
   const [unsavedStoryboard, setUnsavedStoryboard] = useState(false)
@@ -126,7 +132,7 @@ export default function App() {
     if(unsavedStoryboard&&!window.confirm('Discard unsaved storyboard changes and switch projects?'))return
     const response=await fetch('/api/projects/active',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:projectId||null})})
     const data=await response.json();if(!response.ok)throw new Error(data.detail??'Could not switch project')
-    setActiveProject(data.project);setActive('Overview');await refresh()
+    setActiveProject(data.project);setReviewTarget(null);setExportStoryboardId(null);setActive('Overview');await refresh()
   }
 
   function selectPreset(name: string, warning?: boolean) {
@@ -151,7 +157,9 @@ export default function App() {
       <div className="page-scroll"><div className="page-container">
         <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> {dateLabel}</div><h1>{active === 'Overview' ? activeProject?.name??'Local video studio' : active}</h1><p className="subtitle">{active === 'Overview' ? activeProject?.description||'Create or select a project to start planning.' : 'A local-first production workspace.'}</p></div>{activeProject&&<button className="button primary" onClick={() => navigate('Generate video')}><Plus size={16}/> New generation</button>}</div>
         {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={14}/></button></div>}
-        {active === 'Create Film' && <CreateFilmPage project={activeProject} presets={presets} onMessage={setNotice} onNavigate={navigate}/>}
+        <ErrorBoundary key={`${active}:${errorBoundaryRevision}`} onReset={()=>{setReviewTarget(null);setActive('Create Film');setErrorBoundaryRevision(value=>value+1)}}>
+        {active === 'Create Film' && <CreateFilmPage project={activeProject} presets={presets} onMessage={setNotice} onNavigate={navigate} onReview={(runId,shotId)=>{if(activeProject){setReviewTarget(filmRunReviewTarget(activeProject.id,runId,shotId));setActive('Clip review')}}}/>}
+        {active === 'Clip review' && <FilmRunReviewPage target={reviewTarget} onBack={()=>setActive('Create Film')} onContinueExport={storyboardId=>{setExportStoryboardId(storyboardId);setActive('Export / Remotion')}}/>}
         {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onSaved={()=>activeProject?loadProjectSettings(activeProject.id):Promise.resolve()} onRecheck={recheckLocalStatus} onMessage={setNotice} integrations={integrations} resources={resources} projectId={activeProject?.id??null}/>}
         {active === 'Setup' && <SetupPage onMessage={setNotice} onContinue={()=>setActive('Overview')}/>}
         {active === 'Job queue' && <JobsPage title="Local job queue" jobs={jobs.filter(j=>j.status==='queued'||j.status==='running'||j.status==='failed')} onChanged={refresh} onMessage={setNotice}/>}
@@ -161,7 +169,7 @@ export default function App() {
         {active === 'Style bible' && <StyleBiblePage projectId={activeProject?.id??null} onMessage={setNotice}/>}
         {active === 'Scene continuity' && <SceneContinuityPage projectId={activeProject?.id??null} onMessage={setNotice}/>}
         {active === 'Storyboard' && <StoryboardPage projectId={activeProject?.id??null} project={activeProject} assets={assets} jobs={jobs} ltxReady={Boolean(integrations?.ltx.ready)} onMessage={setNotice} onDirtyChange={setUnsavedStoryboard}/>}
-        {(active === 'Story to Film' || active === 'Export / Remotion') && <FilmPlanPage projectId={activeProject?.id??null} projectName={activeProject?.name??''} onMessage={setNotice} onNavigate={navigate} focusExport={active === 'Export / Remotion'}/>}
+        {(active === 'Story to Film' || active === 'Export / Remotion') && <FilmPlanPage projectId={activeProject?.id??null} projectName={activeProject?.name??''} onMessage={setNotice} onNavigate={navigate} focusExport={active === 'Export / Remotion'} initialStoryboardId={active==='Export / Remotion'?exportStoryboardId:null}/>}
         <div hidden={active !== 'Overview' && active !== 'Generate video'}>
         <section className="stats-grid"><Stat icon={<Film size={16}/>} label="TOTAL GENERATIONS" value={String(jobs.filter(j=>j.kind==='generation').length).padStart(2,'0')} delta="Selected project"/><Stat icon={<LoaderCircle size={16}/>} label="IN THE QUEUE" value={String(jobs.filter(j=>j.status==='queued'||j.status==='running').length).padStart(2,'0')} delta={running ? `${running} running now` : 'No active jobs'} accent/><Stat icon={<Check size={16}/>} label="COMPLETED GENERATIONS" value={String(jobs.filter(j=>j.kind==='generation'&&j.status==='completed').length).padStart(2,'0')} delta="Selected project"/><Stat icon={<HardDrive size={16}/>} label="OUTPUT DESTINATION" value={outputPath||'Configured default'} delta="Local path"/></section>
         <div className="content-grid">
@@ -175,11 +183,12 @@ export default function App() {
           </section>
           <section className="panel presets-panel"><div className="panel-heading compact"><div><div className="section-kicker">TUNED TO YOUR MACHINE</div><h2>Generation presets</h2></div><button className="text-button" onClick={()=>setActive('Settings')}>All presets <ArrowUpRight size={13}/></button></div><div className="preset-list">{presets.map(p=><button key={p.name} onClick={()=>selectPreset(p.name,p.visual_drift_warning)} className={`preset-item ${preset===p.name?'selected':''}`}><div className="preset-mark"><span style={{height: `${Math.min(30,10+p.frames/8)}px`}}/></div><div className="preset-info"><b>{p.name}{p.name==='Standard'&&<span className="default-label">DEFAULT</span>}</b><small>{p.frames} frames <i/> {p.fps} fps <i/> {p.duration.toFixed(2)}s</small></div><span className={`preset-status ${p.visual_drift_warning?'warning':''}`}>{p.status}</span></button>)}</div><div className="benchmark-note"><Gauge size={14}/><span>Experimental 193f requires confirmation; it may show visual drift.</span></div></section>
         </div>
+        </div></ErrorBoundary>
         <div className="lower-grid"><section className="panel queue-panel"><div className="panel-heading compact"><div><div className="section-kicker">UP NEXT</div><h2>Recent activity</h2></div><button className="text-button" onClick={()=>setActive('Job queue')}>View queue <ArrowUpRight size={13}/></button></div>{jobs.length ? <div className="job-list">{jobs.slice(0,4).map(j=><div className="job-row" key={j.id}><div className={`job-icon ${j.status}`}><Film size={16}/></div><div className="job-copy"><b>{jobTitle(j)}</b><small>{jobTypeLabel(j)} · {new Date(j.created_at).toLocaleString()}</small></div><span className={`job-status ${j.status}`}>{j.status}</span>{j.status==='running'&&<div className="mini-progress"><span style={{width:`${j.progress}%`}}/></div>}</div>)}</div> : <div className="empty-state"><div className="empty-icon"><Film size={20}/></div><b>No jobs yet</b><span>Your creations and renders will show up here.</span><button className="text-button" onClick={()=>setActive('Generate video')}>Create your first video <ArrowUpRight size={13}/></button></div>}</section>
             <section className="panel project-panel"><div className="panel-heading compact"><div><div className="section-kicker">YOUR WORKSPACE</div><h2>Projects</h2></div><button className="text-button" onClick={()=>setActive('Projects')}>Manage projects <ArrowUpRight size={13}/></button></div>{activeProject?<div className="empty-state"><div className="empty-icon"><FolderOpen size={20}/></div><b>{activeProject.name}</b><span>{activeProject.reference_count} references · {activeProject.shot_count} shots · {activeProject.job_count} jobs</span><button className="text-button" onClick={()=>setActive('Projects')}>Project settings <ArrowUpRight size={13}/></button></div>:<div className="empty-state"><b>No project selected</b><span>Create or open a project to see its production data.</span><button className="text-button" onClick={()=>setActive('Projects')}>Create or import a project <ArrowUpRight size={13}/></button></div>}</section></div>
         <footer className="footer"><span><span className="status-dot online"/> Everything runs locally</span><span><BookOpen size={13}/> Studio v0.1.0 <i/> <span>Made for the frames in your head.</span></span></footer>
         </div>
-      </div></div>
+      </div>
     </main>
   </div>
 }

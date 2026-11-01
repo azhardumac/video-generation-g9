@@ -153,6 +153,20 @@ class CreativeReviewRequest(BaseModel):
     reason: str = Field(default="", max_length=2000)
 
 
+class FilmRunShotReviewRequest(BaseModel):
+    expected_run_revision: int = Field(ge=1)
+    expected_storyboard_revision: int = Field(ge=1)
+    job_id: str = Field(min_length=1, max_length=128)
+    decision: Literal["approved", "rejected"]
+    notes: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def rejection_requires_notes(self):
+        if self.decision == "rejected" and not self.notes.strip():
+            raise ValueError("Add review notes explaining why this clip was rejected")
+        return self
+
+
 class ShotGenerateRequest(BaseModel):
     continuity_revision: int | None = Field(default=None, ge=1)
     use_experimental_multi_anchor: bool = False
@@ -1224,6 +1238,104 @@ def restore_film_run(project_id: str, run_id: str, request: FilmRunArchiveReques
     return _set_film_run_archived(project_id, run_id, request, archived=False)
 
 
+def _film_run_review_payload(project_id: str, run_id: str):
+    _project(project_id)
+    run = db.get_film_run(run_id)
+    if not run or run["project_id"] != project_id or run.get("archived_at"):
+        raise HTTPException(404, "Film run not found in this project")
+    if run["status"] != "needs_review" or not run.get("storyboard_id"):
+        raise HTTPException(409, "This film run is not currently awaiting creative review")
+    story = db.get_storyboard(run["storyboard_id"], include_events=False)
+    if not story or story["project_id"] != project_id:
+        raise HTTPException(404, "The film run storyboard is unavailable in this project")
+
+    linked_references = {item["id"]: item for item in db.project_references(project_id)}
+    prior_reviews = db.film_run_shot_reviews(run_id)
+    latest_reviews = {}
+    for review in prior_reviews:
+        latest_reviews[review["shot_id"]] = review
+    result_shots = []
+    for shot in story["shots"]:
+        job = shot.get("job") or {}
+        recorded = (job.get("verification_metadata") or {}).get("verified_output") or {}
+        try:
+            output = safe_local_path(job.get("result_path", ""), settings, must_exist=True) if job.get("result_path") else None
+        except (ValueError, FileNotFoundError):
+            output = None
+        verified = bool(job and job.get("kind") == "generation" and job.get("status") == "completed" and
+            job.get("exit_code") == 0 and recorded and output and output.is_file() and shot.get("settings_match"))
+        review = latest_reviews.get(shot["id"])
+        current_review = bool(verified and review and review["run_revision"] == run["revision"] and
+            review["storyboard_revision"] == story["revision"] and review["job_id"] == job.get("id"))
+        character_roster = shot.get("characters") if isinstance(shot.get("characters"), list) else []
+        references = []
+        for reference_id in shot.get("reference_ids") or []:
+            item = linked_references.get(reference_id)
+            if not item:
+                continue
+            try:
+                reference_path = safe_local_path(item["path"], settings, must_exist=True)
+                available = reference_path.is_file() and item.get("mime_type", "").startswith("image/")
+            except (ValueError, FileNotFoundError):
+                available = False
+            if available:
+                references.append({"id": item["id"], "name": item["name"], "category": item["category"],
+                                   "mime_type": item["mime_type"], "available": True})
+        result_shots.append({
+            "id": shot["id"], "title": shot.get("title") or "Untitled shot",
+            "scene_title": shot.get("scene_title") or "Scene", "prompt": shot.get("prompt") or "",
+            "visual_description": shot.get("visual_description") or "",
+            "framing": shot.get("framing") or "Not specified", "characters": character_roster,
+            "expected_character_count": len(character_roster), "reference_ids": [item["id"] for item in references],
+            "references": references, "verified": verified,
+            "job": ({"id": job["id"], "status": job["status"], "exit_code": job.get("exit_code"),
+                     "result_path": str(output), "verification_metadata": {"verified_output": recorded}}
+                    if verified and output else None),
+            "creative_review": ({key: review[key] for key in ("id", "decision", "notes", "created_at")}
+                                if review else None),
+            "creative_review_current": current_review,
+        })
+    verified_shots = [item for item in result_shots if item["verified"]]
+    current_decisions = [item["creative_review"]["decision"] for item in verified_shots if item["creative_review_current"]]
+    if verified_shots and len(current_decisions) == len(verified_shots) and all(item == "approved" for item in current_decisions):
+        review_status = "approved"
+    elif "rejected" in current_decisions:
+        review_status = "rejected"
+    else:
+        review_status = "pending"
+    return {"run_id": run_id, "project_id": project_id, "run_revision": run["revision"],
+            "status": run["status"], "storyboard_id": story["id"],
+            "storyboard_revision": story["revision"], "title": story["title"],
+            "creative_review_status": review_status, "shots": result_shots}
+
+
+@app.get("/api/projects/{project_id}/film-runs/{run_id}/review")
+def get_film_run_review(project_id: str, run_id: str):
+    return _film_run_review_payload(project_id, run_id)
+
+
+@app.post("/api/projects/{project_id}/film-runs/{run_id}/shots/{shot_id}/review")
+def review_film_run_shot(project_id: str, run_id: str, shot_id: str, request: FilmRunShotReviewRequest):
+    payload = _film_run_review_payload(project_id, run_id)
+    shot = next((item for item in payload["shots"] if item["id"] == shot_id), None)
+    if not shot:
+        raise HTTPException(404, "Shot is not part of this film run")
+    if not shot["verified"] or not shot.get("job"):
+        raise HTTPException(409, "Creative review requires the current shot output to remain technically verified")
+    if request.expected_run_revision != payload["run_revision"] or request.expected_storyboard_revision != payload["storyboard_revision"]:
+        raise HTTPException(409, "Film run or storyboard changed before the review was saved; refresh and compare the current clip")
+    try:
+        return db.add_film_run_shot_review(project_id=project_id, run_id=run_id,
+            storyboard_id=payload["storyboard_id"], shot_id=shot_id, job_id=request.job_id,
+            expected_run_revision=request.expected_run_revision,
+            expected_storyboard_revision=request.expected_storyboard_revision,
+            decision=request.decision, notes=request.notes.strip())
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 def _film_run_status(run: dict) -> dict:
     provider = run.get("request", {}).get("planner_provider", "local")
     if provider == "gemini":
@@ -1247,15 +1359,33 @@ def _film_run_status(run: dict) -> dict:
     batch_id = run.get("film_batch_id") or run.get("checkpoint", {}).get("generate_shots", {}).get("film_batch_id")
     batch = db.get_film_batch(batch_id) if batch_id else None
     run["generation_jobs_created"] = db.film_run_generation_job_count(run["id"])
+    storyboard = db.get_storyboard(run["storyboard_id"], include_events=False) if run.get("storyboard_id") else None
+    storyboard_shots = {shot["id"]: shot for shot in (storyboard or {}).get("shots", [])}
     run["generation_progress"] = ({"total": batch["total_shots"], "verified": batch["completed_shots"],
                                     "queued": batch["queued_shots"], "failed": batch["failed_shots"],
                                     "progress": batch["progress"],
-                                    "shots": [{"title": shot["title"], "scene_title": shot["scene_title"],
-                                               "status": shot["status"], "progress": shot.get("progress", 0),
+                                    "shots": [{"shot_id": shot["shot_id"], "title": shot["title"],
+                                               "scene_title": shot["scene_title"], "status": shot["status"],
+                                               "progress": shot.get("progress", 0),
+                                               "job_id": (shot.get("job") or {}).get("id"),
+                                               "verified": bool((storyboard_shots.get(shot["shot_id"]) or {}).get("status") == "verified"),
                                                "events": (shot.get("job") or {}).get("events", [])[-8:]}
                                               for shot in batch["shots"]]}
                                    if batch else None)
-    run["creative_review_status"] = "pending" if run["status"] == "needs_review" else None
+    run["creative_review_status"] = None
+    if run["status"] == "needs_review" and storyboard:
+        prior_reviews = {item["shot_id"]: item for item in db.film_run_shot_reviews(run["id"])}
+        verified_shots = [shot for shot in storyboard["shots"] if shot.get("status") == "verified"]
+        current_decisions = [prior_reviews[shot["id"]]["decision"] for shot in verified_shots
+            if shot["id"] in prior_reviews and prior_reviews[shot["id"]]["run_revision"] == run["revision"]
+            and prior_reviews[shot["id"]]["storyboard_revision"] == storyboard["revision"]
+            and prior_reviews[shot["id"]]["job_id"] == (shot.get("job") or {}).get("id")]
+        if verified_shots and len(current_decisions) == len(verified_shots) and all(item == "approved" for item in current_decisions):
+            run["creative_review_status"] = "approved"
+        elif "rejected" in current_decisions:
+            run["creative_review_status"] = "rejected"
+        else:
+            run["creative_review_status"] = "pending"
     return run
 
 

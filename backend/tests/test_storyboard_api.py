@@ -815,3 +815,88 @@ def test_unverified_clip_cannot_receive_creative_approval():
         api.review_shot_creatively(story["id"], shot["id"], api.CreativeReviewRequest(
             decision="approved", continuity_revision=1, checklist={"all":True}))
     assert rejected.value.status_code == 409
+
+
+def test_generic_gemini_run_review_uses_verified_storyboard_contract_without_fable_metadata():
+    from uuid import uuid4
+    from app.film_orchestrator import FilmOrchestrator
+
+    root = _ROOT / f"generic-review-{uuid4().hex}"
+    root.mkdir()
+    project_id = f"generic-review-project-{uuid4().hex}"
+    project = api.db.create_project({"id":project_id,"name":"Fox film","root":str(root),
+        "aspect_ratio":"9:16","frame_rate":24,"production_type":"short"})
+    prompt = "A fox discovers a lantern at dawn and carries it back to a sleepy village."
+    request = {"prompt":prompt,"reference_ids":[],"preset":"Short",
+        "budget":{"max_shots":1,"max_retries_per_shot":1,"max_generation_seconds":3600,"max_output_bytes":8*1024**3},
+        "authorization":{"confirmed":True,"scope":"test only"},"planner_provider":"gemini"}
+    run = FilmOrchestrator(api.db).create(project_id,"generic-run",request,authorized=True)
+    running = api.db.update_film_run(run["id"],run["revision"],status="running",message="persist fixture plan")
+    output = str(root / "outputs")
+    shot = {"id":str(uuid4()),"scene_title":"01. Dawn by the cottage","title":"Finds the lantern",
+        "prompt":"A small red fox finds a brass lantern in the dawn grass.","visual_description":"The fox notices a glow.",
+        "reference_image":None,"reference_ids":[],"characters":["Fox"],"framing":"Medium close-up",
+        "preset":"Short","seed":37,"caption":"A warm light in the grass.","dialogue":"","width":448,"height":768,
+        "fps":24,"output_location":output,"estimated_seconds":2.04,"transition_after":"cut",
+        "generation_payload":{"prompt":"A small red fox finds a brass lantern in the dawn grass.",
+            "shot_prompt":"A small red fox finds a brass lantern in the dawn grass.","reference_image":None,
+            "seed":37,"preset":"Short","width":448,"height":768,"fps":24,"frames":49,
+            "output_location":output,"shot_settings":{"width":448,"height":768,"fps":24,
+                "output_location":output,"framing":"Medium close-up"}}}
+    generic_metadata = {"planner_mode":"gemini","planner_provenance":{"provider":"gemini","model":"gemini-3.5-flash-lite"},
+        "story_plan":{"title":"Sunrise on the Hill","characters":[{"name":"Fox"}],"scenes":[]},
+        "shot_count":1,"preset":"Short","frames_per_shot":49,"fps":24,"width":448,"height":768,
+        "approved_reference_ids":[],"creative_quality_status":"pending_manual_review"}
+    story = api.db.create_film_run_plan(run["id"],"Sunrise on the Hill",prompt,[shot],
+        [{"title":"01. Dawn by the cottage","visual_description":"The fox finds a lantern.","estimated_seconds":2.04,"transition_after":"cut"}],
+        "9:16","Short",generic_metadata)
+    needs_review = api.db.update_film_run(run["id"],running["revision"],status="needs_review",message="fixture clip ready")
+    job = api.db.create_shot_job(story["id"],shot["id"],dict(shot["generation_payload"]))
+    assert api.db.claim_job(job["id"])
+    clip = root / "outputs" / "fox-first-shot.mp4"
+    clip.parent.mkdir(parents=True,exist_ok=True)
+    clip.write_bytes(b"verified Gemini storyboard fixture; no inference")
+    assert api.db.complete_job(job["id"],progress=100,result_path=str(clip),exit_code=0,
+        verification_metadata={"verified_output":{"width":448,"height":768,"fps":24,"frames":49}})
+
+    review_page = api.get_film_run_review(project_id,run["id"])
+    assert review_page["title"] == "Sunrise on the Hill"
+    assert len(review_page["shots"]) == 1
+    item = review_page["shots"][0]
+    assert item["verified"] is True and item["prompt"].startswith("A small red fox")
+    assert item["framing"] == "Medium close-up" and item["characters"] == ["Fox"]
+    assert item["expected_character_count"] == 1 and item["references"] == []
+    assert Path(item["job"]["result_path"]).resolve() == clip.resolve()
+    assert "scenes" not in generic_metadata and "expected_workload" not in generic_metadata
+
+    approved = api.review_film_run_shot(project_id,run["id"],shot["id"],api.FilmRunShotReviewRequest(
+        expected_run_revision=needs_review["revision"],expected_storyboard_revision=story["revision"],
+        job_id=job["id"],decision="approved",notes="Identity, framing, and story beat read clearly."))
+    assert approved["decision"] == "approved"
+    after_approval = api.get_film_run_review(project_id,run["id"])
+    assert after_approval["creative_review_status"] == "approved"
+    assert after_approval["shots"][0]["creative_review_current"] is True
+    assert after_approval["shots"][0]["creative_review"]["notes"] == "Identity, framing, and story beat read clearly."
+    assert api.get_film_run(run["id"])["creative_review_status"] == "approved"
+
+    with pytest.raises(HTTPException,match="changed before the review was saved") as stale:
+        api.review_film_run_shot(project_id,run["id"],shot["id"],api.FilmRunShotReviewRequest(
+            expected_run_revision=needs_review["revision"],expected_storyboard_revision=story["revision"]+1,
+            job_id=job["id"],decision="rejected",notes="Stale decision"))
+    assert stale.value.status_code == 409
+    other_id = f"generic-review-other-{uuid4().hex}"
+    api.db.create_project({"id":other_id,"name":"Other project","root":str(root),
+        "aspect_ratio":"9:16","frame_rate":24,"production_type":"short"})
+    with pytest.raises(HTTPException,match="not found in this project"):
+        api.get_film_run_review(other_id,run["id"])
+
+    rejected = api.review_film_run_shot(project_id,run["id"],shot["id"],api.FilmRunShotReviewRequest(
+        expected_run_revision=needs_review["revision"],expected_storyboard_revision=story["revision"],
+        job_id=job["id"],decision="rejected",notes="The lantern shape is not consistent with the scene reference."))
+    assert rejected["decision"] == "rejected"
+    rejected_state = api.get_film_run_review(project_id,run["id"])
+    assert rejected_state["creative_review_status"] == "rejected"
+    assert rejected_state["shots"][0]["creative_review"]["notes"].startswith("The lantern shape")
+    assert api.db.get_job(job["id"])["result_path"] == str(clip)
+    assert len(api.db.list_jobs(project_id=project_id)) == 1
+    assert len(api.db.film_run_shot_reviews(run["id"])) == 2

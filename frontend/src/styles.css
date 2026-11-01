@@ -78,6 +78,48 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
   .integration-grid{grid-template-columns:minmax(0,1fr)}
 }
 
+/* Generic Gemini clip review and recoverable page failures */
+.app-error-boundary{display:flex;align-items:flex-start;gap:12px;border-color:#674538;color:#e5c7b6;min-height:180px}
+.app-error-boundary>svg{flex:none;color:#e5a77d;margin-top:3px}
+.app-error-boundary h2{font:600 16px Manrope,sans-serif;margin:7px 0}
+.app-error-boundary p{max-width:680px;color:#b6b2b0;font-size:11px;line-height:1.6}
+.run-review-page{max-width:none;padding:20px}
+.run-review-top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+.run-review-top h2{font:600 19px Manrope,sans-serif;margin:7px 0 3px}
+.run-review-top p{margin:0;color:#93949e;font-size:10px}
+.run-review-technical{display:flex;align-items:center;gap:8px;margin-top:16px;padding:10px;border:1px solid #2b5748;border-radius:6px;background:#13231d;color:#9cdec0;font-size:10px}
+.run-review-player{width:min(100%,448px);aspect-ratio:7/12;margin:16px auto;background:#08090b;border:1px solid #2b2c33;border-radius:7px;overflow:hidden}
+.run-review-player video{display:block;width:100%;height:100%;object-fit:contain;background:#08090b}
+.run-review-shot-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:9px;margin-top:14px}
+.run-review-shot-details article{min-width:0;padding:12px;border:1px solid #2b2c33;border-radius:6px;background:#101115}
+.run-review-shot-details article>span,.generic-run-shot-list small{font:8px 'DM Mono',monospace;color:#91939d;letter-spacing:.35px}
+.run-review-shot-details article>p{margin:8px 0 0;color:#dedfe5;font-size:11px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
+.run-review-references{display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-top:16px;padding-top:13px;border-top:1px solid #292a30}
+.run-review-references>div:first-child{flex:1 1 100%}
+.run-review-references>div:first-child p{margin:4px 0 0;color:#898b95;font-size:9px}
+.run-review-references figure{width:150px;margin:0;padding:7px;border:1px solid #2b2c33;border-radius:6px;background:#101115}
+.run-review-references figure img{display:block;width:100%;height:130px;object-fit:contain;background:#08090b}
+.run-review-references figcaption{margin-top:6px;color:#bfc0c7;font-size:8px;overflow-wrap:anywhere}
+.run-review-no-reference{padding:10px 12px;border:1px dashed #373841;border-radius:5px;color:#9b9da6;font-size:9px}
+.run-review-notes{margin-top:14px}
+.run-review-actions{justify-content:flex-start;margin-top:10px}
+.run-review-next{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:15px;padding:13px;border:1px solid #3b3b49;border-radius:6px;background:#17171e}
+.run-review-next>b,.run-review-next p{color:#c5c5ce}
+.run-review-next p{font-size:9px;margin:5px 0 0}
+.run-review-shot-nav{display:flex;gap:6px;overflow-x:auto;margin-top:14px;padding:6px 0}
+.run-review-shot-nav button{flex:none;padding:7px 9px;border:1px solid #33343d;border-radius:5px;background:#121318;color:#aeb0bb;font-size:9px}
+.run-review-shot-nav button.selected{border-color:#7867ae;color:#d4c7ff}
+.run-review-disclosure{display:block;margin-top:14px;color:#858792;font-size:8px;line-height:1.5}
+.generic-run-plan-summary{margin:15px 0;padding:14px;border:1px solid #2b2c33;border-radius:7px;background:#101115}
+.generic-run-plan-summary h3{font:600 16px Manrope,sans-serif;margin:8px 0}
+.generic-run-plan-summary>p{color:#afb0b9;font-size:10px;line-height:1.5;white-space:pre-wrap}
+.generic-run-shot-list{display:grid;gap:8px;margin:12px 0}
+.generic-run-shot-list article{padding:11px;border:1px solid #292a30;border-radius:5px;background:#14151a}
+.generic-run-shot-list article>b{font-size:10px;color:#e2e2e8}
+.generic-run-shot-list article>p{font-size:10px;line-height:1.5;color:#bfc0c7;white-space:pre-wrap;overflow-wrap:anywhere}
+.generic-run-shot-list .film-clip-preview{display:block;width:min(100%,210px);aspect-ratio:7/12;margin:10px auto 0;object-fit:contain;background:#08090b}
+@media(max-width:520px){.run-review-page{padding:13px}.run-review-top{flex-direction:column}.run-review-next{align-items:flex-start;flex-direction:column}}
+
 /* Phase 3 persistent storyboard and Remotion assembly */
 .storyboard-page{max-width:none;padding:22px;overflow:hidden}
 .storyboard-title-row,.timeline-title{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
