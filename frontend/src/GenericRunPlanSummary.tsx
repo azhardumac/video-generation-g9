@@ -1,10 +1,13 @@
 import { Film } from 'lucide-react'
+import ReviewVerifiedClipButton from './ReviewVerifiedClipButton'
 
 type GenericShot = {id:string;scene_title?:string|null;title?:string|null;prompt?:string|null;framing?:string|null;characters?:unknown;status?:string;job?:{result_path?:string|null}|null}
-type GenericPlan = {title?:string|null;story_text?:string|null;shots?:GenericShot[]}
+type GenericPlan = {id:string;project_id:string;title?:string|null;story_text?:string|null;shots?:GenericShot[];film_plan?:{film_run_id?:string|null}|null}
 
-export default function GenericRunPlanSummary({plan,onOpenStoryboard}:{plan:GenericPlan;onOpenStoryboard:()=>void}){
+export default function GenericRunPlanSummary({plan,onOpenStoryboard,onReview}:{plan:GenericPlan;onOpenStoryboard:()=>void;onReview?:(runId:string,shotId:string)=>void}){
   const shots=Array.isArray(plan.shots)?plan.shots:[]
+  const verifiedShot=shots.find(shot=>shot.status==='verified'&&typeof shot.job?.result_path==='string')
+  const runId=plan.film_plan?.film_run_id
   return <section className="generic-run-plan-summary" aria-label="Generic Gemini story plan">
     <div className="section-kicker">GEMINI STORY PLAN · READ ONLY IN THIS VIEW</div>
     <h3>{plan.title||'Untitled story plan'}</h3>
@@ -20,6 +23,7 @@ export default function GenericRunPlanSummary({plan,onOpenStoryboard}:{plan:Gene
       </article>
     })}</div>
     {!shots.length&&<div className="model-caution">No shot details were returned by the saved plan. Review the run directly from Create Film.</div>}
+    {runId&&verifiedShot&&onReview&&<ReviewVerifiedClipButton runId={runId} shotId={verifiedShot.id} onReview={onReview}/>}
     <button className="button secondary" onClick={onOpenStoryboard}><Film size={13}/> Open generic storyboard</button>
   </section>
 }
