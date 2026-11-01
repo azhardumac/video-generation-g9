@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .story_planning import PlannerOutputError, PlannerResult, StoryPlan, StoryPlanner
 
@@ -18,11 +18,75 @@ MAX_STORY_SCENES = 40
 MAX_SHOTS_PER_SCENE = 40
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_SCHEMA_REPAIR_REQUESTS = 1
-STORY_PLAN_SCHEMA_VERSION = "storyplan-budgeted-v1"
+STORY_PLAN_SCHEMA_VERSION = "storyplan-budgeted-v2-creative-outline"
 GEMINI_API_VERSION = "v1beta"
 GENERATION_ENDPOINT_PROBE_PROMPT = "Reply with exactly: FRAMEWORK Gemini endpoint check passed."
 _SUPPORTED_THINKING_MODEL = re.compile(r"^gemini-(?:3(?:\.\d+)?|2\.5)-", re.IGNORECASE)
 _FLASH_ALLOWLIST = re.compile(r"^(?:models/)?gemini-[a-z0-9][a-z0-9.-]*flash[a-z0-9.-]*$", re.IGNORECASE)
+
+
+class _CreativeOutlineModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class _CreativeCharacter(_CreativeOutlineModel):
+    name: str = Field(min_length=1, max_length=120, description="Stable character name used in scene and shot rosters.")
+    identity: str = Field(min_length=12, max_length=1200, description="Visual identity to preserve across every shot.")
+    distinguishing_traits: list[str] = Field(min_length=1, max_length=12)
+    reference_ids: list[str] = Field(default_factory=list, max_length=16,
+        description="Only exact approved character reference IDs from input; use [] when no suitable ID is certain.")
+
+
+class _CreativeLocation(_CreativeOutlineModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=12, max_length=1200)
+    scale: str = Field(min_length=3, max_length=300)
+    continuity_requirements: list[str] = Field(min_length=1, max_length=12)
+
+
+class _CreativeShot(_CreativeOutlineModel):
+    title: str = Field(min_length=1, max_length=160)
+    beat: str = Field(min_length=8, max_length=1000)
+    prompt: str = Field(min_length=20, max_length=4000)
+    framing: str = Field(min_length=3, max_length=240)
+    character_layout: str = Field(min_length=5, max_length=500)
+    characters_present: list[str] = Field(min_length=1, max_length=20,
+        description="Names copied exactly from the top-level characters array.")
+    reference_ids: list[str] = Field(default_factory=list, max_length=1,
+        description="Only approved IDs already assigned to a character present in this shot; otherwise [].")
+    caption: str = Field(default="", max_length=1000)
+    transition_after: str = Field(default="cut", pattern="^(cut|dissolve|fade)$")
+
+
+class _CreativeScene(_CreativeOutlineModel):
+    title: str = Field(min_length=1, max_length=160)
+    story_beat: str = Field(min_length=8, max_length=1000)
+    location_name: str = Field(min_length=1, max_length=120,
+        description="Must exactly match one top-level location name.")
+    characters_present: list[str] = Field(min_length=1, max_length=20,
+        description="Distinct character names copied exactly from the top-level characters array.")
+    visual_description: str = Field(min_length=20, max_length=2000)
+    framing: str = Field(min_length=3, max_length=240)
+    character_layout: str = Field(min_length=5, max_length=800)
+    continuity_requirements: list[str] = Field(min_length=1, max_length=16)
+    shots: list[_CreativeShot] = Field(min_length=1, max_length=40,
+        description="Ordered shots for this story scene.")
+
+
+class _CreativeOutline(_CreativeOutlineModel):
+    title: str = Field(min_length=1, max_length=160)
+    logline: str = Field(min_length=12, max_length=1000)
+    visual_style: str = Field(min_length=12, max_length=1200)
+    characters: list[_CreativeCharacter] = Field(min_length=1, max_length=20)
+    locations: list[_CreativeLocation] = Field(min_length=1, max_length=20)
+    scenes: list[_CreativeScene] = Field(min_length=1, max_length=40)
+
+
+class _CreativeOutputError(ValueError):
+    def __init__(self, path: str, error_type: str):
+        self.path = path
+        self.error_type = error_type
+        super().__init__(f"Creative outline validation failed at {path} ({error_type})")
 
 
 class GeminiPlanningError(RuntimeError):
@@ -225,6 +289,164 @@ def gemini_story_schema(shot_budget: int = MAX_STORY_SCENES) -> dict[str, Any]:
                 "characters": array(character, 20, 1), "locations": array(location, location_limit, 1), "scenes": array(scene, scene_limit, 1)},
                ["title", "logline", "visual_style", "audio_requested", "video_continuation_requested", "ic_lora_requested",
                 "characters", "locations", "scenes"])
+
+
+def gemini_creative_schema(shot_budget: int = MAX_STORY_SCENES) -> dict[str, Any]:
+    """Compact Gemini-facing outline schema; server code derives IDs and counts."""
+    try:
+        budget = max(1, min(int(shot_budget), MAX_STORY_SCENES * MAX_SHOTS_PER_SCENE))
+    except (TypeError, ValueError):
+        budget = 1
+    schema = _CreativeOutline.model_json_schema()
+    schema["properties"]["scenes"]["maxItems"] = min(MAX_STORY_SCENES, budget)
+    schema["properties"]["locations"]["maxItems"] = min(20, budget)
+    scene_schema = schema.get("$defs", {}).get("_CreativeScene", {})
+    if scene_schema:
+        scene_schema["properties"]["shots"]["maxItems"] = min(MAX_SHOTS_PER_SCENE, budget)
+    return schema
+
+
+_KNOWN_OUTPUT_FIELDS = {
+    "title", "logline", "visual_style", "characters", "locations", "scenes", "audio_requested",
+    "video_continuation_requested", "ic_lora_requested", "id", "name", "identity", "distinguishing_traits",
+    "reference_ids", "description", "scale", "continuity_requirements", "sequence", "story_beat",
+    "location_id", "location_name", "characters_present", "visual_description", "framing", "character_layout",
+    "expected_character_count", "shots", "beat", "prompt", "caption", "transition_after",
+}
+
+
+def _safe_validation_issues(error: Exception) -> list[dict[str, str]]:
+    """Extract paths and Pydantic error types only; never include input or messages."""
+    if isinstance(error, _CreativeOutputError):
+        return [{"path": error.path, "type": error.error_type}]
+    if isinstance(error, ValidationError):
+        issues = []
+        for item in error.errors(include_url=False, include_context=False)[:12]:
+            parts = []
+            for part in item.get("loc", ()):
+                if isinstance(part, int) and 0 <= part < 100_000:
+                    parts.append(f"[{part}]")
+                elif isinstance(part, str):
+                    parts.append(f".{part}" if part in _KNOWN_OUTPUT_FIELDS else ".unknown_field")
+            path = "".join(parts).lstrip(".") or "$"
+            error_type = item.get("type", "invalid")
+            if not isinstance(error_type, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", error_type):
+                error_type = "invalid"
+            issues.append({"path": path, "type": error_type})
+        return issues or [{"path": "$", "type": "invalid"}]
+    if isinstance(error, json.JSONDecodeError):
+        return [{"path": "$", "type": "json_invalid"}]
+    return [{"path": "$", "type": "project_scope" if isinstance(error, PlannerOutputError) else "invalid"}]
+
+
+def _outline_name_key(name: str) -> str:
+    return name.strip()
+
+
+def _compile_creative_outline(text: str, request: dict[str, Any]) -> StoryPlan:
+    """Deterministically compile a compact outline into FRAMEWORK's strict plan."""
+    if not text or not text.strip():
+        raise _CreativeOutputError("$", "json_empty")
+    if len(text.encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise _CreativeOutputError("$", "response_too_large")
+    try:
+        outline = _CreativeOutline.model_validate_json(text)
+    except json.JSONDecodeError as exc:
+        raise _CreativeOutputError("$", "json_invalid") from exc
+
+    total_shots = sum(len(scene.shots) for scene in outline.scenes)
+    budget = int(request.get("shot_budget", 0))
+    if total_shots > budget:
+        raise _CreativeOutputError("scenes[].shots", "shot_budget_exceeded")
+
+    character_by_name: dict[str, _CreativeCharacter] = {}
+    character_ids: dict[str, str] = {}
+    characters = []
+    for index, character in enumerate(outline.characters):
+        key = _outline_name_key(character.name)
+        if key in character_by_name:
+            raise _CreativeOutputError(f"characters[{index}].name", "duplicate_name")
+        character_by_name[key] = character
+        character_id = f"character-{index + 1}"
+        character_ids[key] = character_id
+        characters.append({"id": character_id, "name": character.name, "identity": character.identity,
+                           "distinguishing_traits": character.distinguishing_traits,
+                           "reference_ids": character.reference_ids})
+
+    allowed_reference_ids = set(request.get("allowed_reference_ids", []))
+    reference_categories = {item["id"]: item["category"] for item in request.get("project_reference_catalog", [])
+                           if isinstance(item, dict) and item.get("id") and item.get("category")}
+    for index, character in enumerate(outline.characters):
+        if not set(character.reference_ids).issubset(allowed_reference_ids):
+            raise _CreativeOutputError(f"characters[{index}].reference_ids", "reference_not_approved")
+        if any(reference_categories.get(ref_id) != "character" for ref_id in character.reference_ids):
+            raise _CreativeOutputError(f"characters[{index}].reference_ids", "reference_not_character")
+
+    location_by_name: dict[str, tuple[str, _CreativeLocation]] = {}
+    locations = []
+    for index, location in enumerate(outline.locations):
+        key = _outline_name_key(location.name)
+        if key in location_by_name:
+            raise _CreativeOutputError(f"locations[{index}].name", "duplicate_name")
+        location_id = f"location-{index + 1}"
+        location_by_name[key] = (location_id, location)
+        locations.append({"id": location_id, "name": location.name, "description": location.description,
+                          "scale": location.scale, "continuity_requirements": location.continuity_requirements})
+
+    scenes = []
+    for scene_index, scene in enumerate(outline.scenes):
+        location_match = location_by_name.get(_outline_name_key(scene.location_name))
+        if not location_match:
+            raise _CreativeOutputError(f"scenes[{scene_index}].location_name", "unknown_location")
+        location_id, _ = location_match
+
+        def map_character_names(names: list[str], path: str) -> list[str]:
+            mapped = []
+            seen = set()
+            for name_index, name in enumerate(names):
+                key = _outline_name_key(name)
+                if key not in character_ids:
+                    raise _CreativeOutputError(f"{path}[{name_index}]", "unknown_character")
+                if key in seen:
+                    raise _CreativeOutputError(f"{path}[{name_index}]", "duplicate_character")
+                seen.add(key)
+                mapped.append(character_ids[key])
+            return mapped
+
+        scene_character_ids = map_character_names(scene.characters_present, f"scenes[{scene_index}].characters_present")
+        shots = []
+        for shot_index, shot in enumerate(scene.shots):
+            shot_character_ids = map_character_names(shot.characters_present,
+                f"scenes[{scene_index}].shots[{shot_index}].characters_present")
+            if not set(shot_character_ids).issubset(scene_character_ids):
+                raise _CreativeOutputError(f"scenes[{scene_index}].shots[{shot_index}].characters_present", "scene_roster_mismatch")
+            if not set(shot.reference_ids).issubset(allowed_reference_ids):
+                raise _CreativeOutputError(f"scenes[{scene_index}].shots[{shot_index}].reference_ids", "reference_not_approved")
+            refs_for_present_characters = {ref_id for key, character in character_by_name.items()
+                                           if character_ids[key] in shot_character_ids
+                                           for ref_id in character.reference_ids}
+            if not set(shot.reference_ids).issubset(refs_for_present_characters):
+                raise _CreativeOutputError(f"scenes[{scene_index}].shots[{shot_index}].reference_ids", "reference_character_mismatch")
+            shots.append({"id": f"shot-{scene_index + 1}-{shot_index + 1}", "sequence": shot_index,
+                "title": shot.title, "beat": shot.beat, "prompt": shot.prompt, "framing": shot.framing,
+                "character_layout": shot.character_layout, "characters_present": shot_character_ids,
+                "expected_character_count": len(shot_character_ids), "reference_ids": shot.reference_ids,
+                "caption": shot.caption, "transition_after": shot.transition_after})
+        scenes.append({"id": f"scene-{scene_index + 1}", "sequence": scene_index, "title": scene.title,
+            "story_beat": scene.story_beat, "location_id": location_id, "characters_present": scene_character_ids,
+            "visual_description": scene.visual_description, "framing": scene.framing,
+            "character_layout": scene.character_layout, "continuity_requirements": scene.continuity_requirements,
+            "expected_character_count": len(scene_character_ids), "shots": shots})
+
+    compiled = {"title": outline.title, "logline": outline.logline, "visual_style": outline.visual_style,
+        "audio_requested": False, "video_continuation_requested": False, "ic_lora_requested": False,
+        "characters": characters, "locations": locations, "scenes": scenes}
+    try:
+        plan = StoryPlan.model_validate(compiled)
+    except ValidationError:
+        # This should only indicate a compiler/schema mismatch; keep the same safe field reporting.
+        raise
+    return plan.validate_project_scope(allowed_reference_ids, reference_categories)
 
 
 def _output_token_limit(shot_budget: int) -> int:
@@ -556,14 +778,15 @@ class GeminiStoryPlanner(StoryPlanner):
             raise GeminiPlanningError("missing_key", "Gemini API key is missing. Connect it in Settings first.")
 
     @staticmethod
-    def _validate_output(text: str, request: dict[str, Any]) -> StoryPlan:
+    def _validate_output(text: str, request: dict[str, Any], response_mode: str = "schema") -> StoryPlan:
         if not text or not text.strip():
-            raise PlannerOutputError("Gemini returned empty structured output")
+            raise _CreativeOutputError("$", "json_empty")
         if len(text.encode("utf-8")) > MAX_RESPONSE_BYTES:
-            raise PlannerOutputError("Gemini StoryPlan output exceeded the 8 MiB safety limit")
-        plan = StoryPlan.model_validate_json(text)
+            raise _CreativeOutputError("$", "response_too_large")
+        plan = (_compile_creative_outline(text, request) if response_mode == "json_only"
+                else StoryPlan.model_validate_json(text))
         if len(plan.ordered_shots) > int(request["shot_budget"]):
-            raise PlannerOutputError("Gemini StoryPlan exceeds the authorized maximum shot count")
+            raise _CreativeOutputError("scenes[].shots", "shot_budget_exceeded")
         categories = {item["id"]: item["category"] for item in request.get("project_reference_catalog", [])}
         return plan.validate_project_scope(set(request.get("allowed_reference_ids", [])), categories)
 
@@ -591,15 +814,32 @@ class GeminiStoryPlanner(StoryPlanner):
         }
 
     @staticmethod
-    def _prompt(request: dict[str, Any], repair: dict[str, str] | None = None) -> str:
+    def _prompt(request: dict[str, Any], repair: dict[str, Any] | None = None) -> str:
         input_json = json.dumps(GeminiStoryPlanner._privacy_filtered_request(request), ensure_ascii=False, separators=(",", ":"))
         prompt = ("Create a film story plan using the user's prompt as the only plot source. Preserve distinct character identities, ")
         prompt += ("causal chronology, location scale, visual continuity, camera framing, and exactly described character layout. "
                    "Use only supplied opaque reference IDs; the planner cannot see reference images, names, or paths. Leave references unassigned when their identity is ambiguous. "
-                   "Do not invent approvals. Keep within the exact shot budget, preset, and local model capabilities. Set unsupported audio, continuation, and IC-LoRA flags accurately. "
-                   "Return a StoryPlan JSON object.\nINPUT_JSON:\n" + input_json)
+                   "Do not invent approvals. Keep within the exact shot budget, preset, and local model capabilities. "
+                   "Return only the JSON object specified for this response mode.\nINPUT_JSON:\n" + input_json)
+        if request.get("response_mode") == "json_only":
+            contract = json.dumps(gemini_creative_schema(int(request.get("shot_budget", 1))),
+                                  ensure_ascii=False, separators=(",", ":"))
+            prompt += ("\n\nJSON-ONLY OUTPUT CONTRACT (authoritative; return exactly one JSON object, with no Markdown): "
+                "Use the complete creative-outline JSON Schema below. It defines required top-level title, logline, "
+                "visual_style, characters, locations, and ordered scenes; each scene contains ordered shots. Character "
+                "and location names must be unique. Scene location_name must match a listed location exactly. Scene and "
+                "shot characters_present must be distinct names copied exactly from characters; each shot roster must "
+                "be a subset of its scene roster. Keep each array in story order. The server assigns stable IDs, zero-based "
+                "scene and per-scene shot sequence numbers, expected character counts, and unsupported capability flags; "
+                "do not output derived fields. Stay at or below input shot_budget; for a one-shot budget return exactly "
+                "one scene with exactly one shot. Use only exact approved reference_ids from input and only for listed "
+                "characters; if uncertain use empty arrays. Never invent approved assets or assign a shot reference to "
+                "an absent character. Preserve causal beats, continuity, and the user's story.\n"
+                "CREATIVE_OUTLINE_JSON_SCHEMA:\n" + contract)
         if repair:
-            prompt += "\n\nThe prior response failed local validation. Repair it, preserving story facts. Validation error: " + repair["error"] + "\nINVALID_RESPONSE_JSON:\n" + repair["output"][:MAX_RESPONSE_BYTES]
+            prompt += ("\n\nThe prior response failed local validation. Regenerate the complete JSON object, preserving the user's story. "
+                       "Correct only the listed structural or scope issues; do not include an explanation.\n"
+                       "SAFE_VALIDATION_ISSUES:\n" + json.dumps(repair["issues"], separators=(",", ":")))
         return prompt
 
     def _call(self, client, request_text: str, shot_budget: int, response_mode: str):
@@ -653,23 +893,38 @@ class GeminiStoryPlanner(StoryPlanner):
         usages = [_safe_usage(response)]
         output = getattr(response, "text", None)
         output = output if isinstance(output, str) else ""
+        validation_attempts: list[dict[str, Any]] = []
         try:
-            plan = self._validate_output(output, request)
-        except (PlannerOutputError, ValidationError) as first_error:
-            # Exactly one bounded schema repair, charged against this run's two-call cap.
+            plan = self._validate_output(output, request, response_mode)
+        except (PlannerOutputError, ValidationError, _CreativeOutputError, ValueError) as first_error:
+            first_issues = _safe_validation_issues(first_error)
+            validation_attempts.append({"attempt": 1, "issues": first_issues})
+            # Exactly one explicit, bounded repair. The untrusted response body is
+            # never copied back into the request; only sanitized field/type pairs are sent.
             if len(output.encode("utf-8")) > MAX_RESPONSE_BYTES:
-                raise GeminiPlanningError("invalid_output", "Gemini returned malformed or oversized JSON. No shot jobs were queued.", retryable_by_user=True) from None
-            repaired = self._call(client, self._prompt(request, {"error": str(first_error)[:2000], "output": output}), shot_budget, response_mode)
+                raise GeminiPlanningError("invalid_output", "Gemini returned an oversized planning response. No shot jobs were queued.",
+                    retryable_by_user=True, diagnostics={"category": "storyplan_validation_failed",
+                        "validation_attempts": validation_attempts, "response_mode": response_mode}) from None
+            try:
+                repaired = self._call(client, self._prompt(request, {"issues": first_issues}), shot_budget, response_mode)
+            except GeminiPlanningError as repair_error:
+                repair_error.diagnostics.setdefault("validation_attempts", validation_attempts)
+                raise
             usages.append(_safe_usage(repaired))
             try:
-                plan = self._validate_output(getattr(repaired, "text", None), request)
-            except (PlannerOutputError, ValidationError):
-                raise GeminiPlanningError("invalid_output", "Gemini output remained invalid after one bounded repair request. No shot jobs were queued.", retryable_by_user=True) from None
+                plan = self._validate_output(getattr(repaired, "text", None), request, response_mode)
+            except (PlannerOutputError, ValidationError, _CreativeOutputError, ValueError) as repair_error:
+                validation_attempts.append({"attempt": 2, "issues": _safe_validation_issues(repair_error)})
+                raise GeminiPlanningError("invalid_output",
+                    "Gemini output failed FRAMEWORK's strict story-plan validation after one bounded repair. No shot jobs were queued; review the safe field paths and error types.",
+                    retryable_by_user=True, diagnostics={"category": "storyplan_validation_failed",
+                        "response_mode": response_mode, "validation_attempts": validation_attempts}) from None
         usage = {key: sum((item[key] or 0) for item in usages) if any(item[key] is not None for item in usages) else None
                  for key in ("input_tokens", "output_tokens", "thoughts_tokens", "total_tokens")}
         return PlannerResult(plan=plan, provenance={"provider": "gemini", "model": self.model,
             "api": "Gemini generateContent API JSON Schema" if response_mode == "schema" else "Gemini generateContent API JSON-only fallback",
             "response_mode": response_mode, "sdk": "google-genai", "request_count": len(usages),
+            **({"validation_repairs": validation_attempts} if validation_attempts else {}),
             "output_token_limit": _output_token_limit(shot_budget),
             "usage": usage, "cost_estimate": None,
             "billing_note": "Gemini billing/free-tier data policy varies by account and tier; review current Google AI Studio pricing.",

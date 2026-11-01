@@ -1,10 +1,11 @@
 from types import SimpleNamespace
+import json
 
 import pytest
 
 from app.gemini_planning import (MAX_OUTPUT_TOKENS, GeminiPlanningError, GeminiStoryPlanner,
                                  ENDPOINT_PROBE_MAX_OUTPUT_TOKENS, _output_token_limit,
-                                 gemini_story_schema)
+                                 gemini_creative_schema, gemini_story_schema)
 from app.story_planning import PlannerOutputError, StoryPlan
 
 
@@ -32,6 +33,32 @@ def valid_plan(reference_ids=None):
                                "framing": "Wide establishing shot", "character_layout": "Mira is foreground left, harbor fills background.",
                                "characters_present": ["keeper"], "expected_character_count": 1,
                                "reference_ids": reference_ids, "caption": "", "transition_after": "cut"}]}],
+    }
+
+
+def fox_creative_outline(reference_ids=None):
+    """A realistic compact model response; IDs, counts and sequence fields are omitted."""
+    return {
+        "title": "Pip Finds the Way Home",
+        "logline": "A young red fox follows a creek through the first snow and finds its den before nightfall.",
+        "visual_style": "Handmade cinematic claymation with thumb-pressed fur and soft winter light.",
+        "characters": [{"name": "Pip", "identity": "A small red fox kit with a cream muzzle, dark paws and a white tail tip.",
+                        "distinguishing_traits": ["cream muzzle", "white tail tip"],
+                        "reference_ids": reference_ids or []}],
+        "locations": [{"name": "Snowy creek", "description": "A narrow creek winds through a quiet pine forest under fresh snow.",
+                       "scale": "Small forest creek between young pine trees",
+                       "continuity_requirements": ["Creek remains on frame right", "Snow stays fresh and unbroken except Pip's tracks"]}],
+        "scenes": [{"title": "Following the creek", "story_beat": "Pip follows the creek and recognizes the familiar bend near home.",
+                    "location_name": "Snowy creek", "characters_present": ["Pip"],
+                    "visual_description": "Pip pauses beside a snow-covered bend in the creek as dusk settles between the pines.",
+                    "framing": "Medium-wide low angle at fox height",
+                    "character_layout": "Pip stands on the left bank in the foreground, facing along the creek toward frame right.",
+                    "continuity_requirements": ["Pip is the only character", "The creek flows toward frame right"],
+                    "shots": [{"title": "Pip recognizes the bend", "beat": "Pip spots the familiar creek bend and turns toward the den.",
+                               "prompt": "Handmade claymation red fox kit Pip with cream muzzle and white tail tip pauses at a snowy pine creek bend, then turns toward home; the creek stays on frame right, soft blue dusk, one fox only.",
+                               "framing": "Medium-wide low angle at fox height",
+                               "character_layout": "Pip is alone on the left bank, facing right along the creek.",
+                               "characters_present": ["Pip"], "reference_ids": reference_ids or []}]}],
     }
 
 
@@ -357,9 +384,11 @@ def test_shot_budget_is_checked_and_invalid_second_output_is_a_blocker():
     # The internal StoryPlan schema accepts two shots, but the run's cap is one.
     output = StoryPlan.model_validate(two_shots).model_dump_json()
     client = FakeClient([response(output), response(output)])
-    with pytest.raises(GeminiPlanningError, match="remained invalid") as error:
+    with pytest.raises(GeminiPlanningError, match="strict story-plan validation") as error:
         make_planner(client).plan(fixture_request(shot_budget=1))
     assert error.value.code == "invalid_output"
+    assert error.value.diagnostics["validation_attempts"][0]["issues"] == [
+        {"path": "scenes[].shots", "type": "shot_budget_exceeded"}]
     assert len(client.models.calls) == 2
 
 
@@ -461,23 +490,93 @@ def test_schema_400_exposes_only_sanitized_provider_status_reason_and_field_path
 
 
 def test_json_only_mode_omits_provider_schema_and_still_validates_storyplan_locally():
-    request = fixture_request(shot_budget=1) | {"response_mode": "json_only"}
-    valid = StoryPlan.model_validate(valid_plan()).model_dump_json()
+    request = fixture_request(shot_budget=1) | {"response_mode": "json_only",
+        "prompt": "A red fox kit follows a snowy creek and finds its den before nightfall."}
+    # This model output intentionally omits internal IDs, sequence numbers, counts,
+    # capability flags, caption, and transition; the adapter compiles them safely.
+    valid = json.dumps(fox_creative_outline())
     client = FakeClient([response(valid)])
     result = make_planner(client).plan(request)
     config = client.models.calls[0]["config"]
     assert config == {"response_mime_type": "application/json", "max_output_tokens": 6784,
                       "thinking_config": {"thinking_level": "low"}}
-    assert result.plan.title == "The Lighthouse Keeper"
+    assert result.plan.title == "Pip Finds the Way Home"
     assert result.provenance["response_mode"] == "json_only"
+    assert result.plan.characters[0].id == "character-1"
+    assert result.plan.locations[0].id == "location-1"
+    assert result.plan.scenes[0].id == "scene-1"
+    assert result.plan.scenes[0].sequence == 0
+    assert result.plan.scenes[0].shots[0].id == "shot-1-1"
+    assert result.plan.scenes[0].shots[0].sequence == 0
+    assert result.plan.scenes[0].expected_character_count == 1
+    assert result.plan.scenes[0].shots[0].expected_character_count == 1
+    assert result.plan.audio_requested is False
+    assert result.plan.video_continuation_requested is False
+    assert result.plan.ic_lora_requested is False
+    assert "CREATIVE_OUTLINE_JSON_SCHEMA" in client.models.calls[0]["contents"]
+    assert "location_name" in client.models.calls[0]["contents"]
+    assert "scene and per-scene shot sequence numbers" in client.models.calls[0]["contents"]
+    assert "one scene with exactly one shot" in client.models.calls[0]["contents"]
+    assert "response_json_schema" not in client.models.calls[0]["config"]
 
-    invalid = valid_plan(["not-approved"])
-    client = FakeClient([response(StoryPlan.model_validate(invalid).model_dump_json()), response("still invalid")])
+    invalid = json.dumps(fox_creative_outline(["not-approved"]))
+    client = FakeClient([response(invalid), response(invalid)])
     with pytest.raises(GeminiPlanningError) as rejected:
         make_planner(client).plan(request | {"allowed_reference_ids": ["approved"],
             "project_reference_catalog": [{"id": "approved", "category": "character"}]})
     assert rejected.value.code == "invalid_output"
+    assert rejected.value.diagnostics["validation_attempts"][0]["issues"] == [
+        {"path": "characters[0].reference_ids", "type": "reference_not_approved"}]
+    assert "not-approved" not in str(rejected.value)
     assert all("response_json_schema" not in call["config"] for call in client.models.calls)
+
+
+def test_json_only_contract_schema_is_bounded_to_one_shot_and_complete():
+    schema = gemini_creative_schema(1)
+    assert schema["properties"]["scenes"]["maxItems"] == 1
+    assert schema["properties"]["locations"]["maxItems"] == 1
+    assert schema["$defs"]["_CreativeScene"]["properties"]["shots"]["maxItems"] == 1
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {"title", "logline", "visual_style", "characters", "locations", "scenes"}
+    assert "id" not in schema["$defs"]["_CreativeCharacter"]["properties"]
+    assert "sequence" not in schema["$defs"]["_CreativeShot"]["properties"]
+
+
+def test_json_only_repair_uses_safe_field_paths_and_types_without_echoing_model_output():
+    request = fixture_request(shot_budget=1) | {"response_mode": "json_only"}
+    incomplete = fox_creative_outline()
+    del incomplete["scenes"][0]["shots"][0]["character_layout"]
+    raw_incomplete = json.dumps(incomplete)
+    client = FakeClient([response(raw_incomplete), response(raw_incomplete)])
+
+    with pytest.raises(GeminiPlanningError) as rejected:
+        make_planner(client).plan(request)
+
+    assert rejected.value.code == "invalid_output"
+    attempts = rejected.value.diagnostics["validation_attempts"]
+    assert attempts[0] == {"attempt": 1, "issues": [
+        {"path": "scenes[0].shots[0].character_layout", "type": "missing"}]}
+    assert attempts[1] == {"attempt": 2, "issues": attempts[0]["issues"]}
+    repair_prompt = client.models.calls[1]["contents"]
+    assert "SAFE_VALIDATION_ISSUES" in repair_prompt
+    assert '"path":"scenes[0].shots[0].character_layout","type":"missing"' in repair_prompt
+    assert "INVALID_RESPONSE_JSON" not in repair_prompt
+    assert raw_incomplete not in repair_prompt
+
+
+def test_json_only_rejects_mismatched_character_roster_with_safe_diagnostic():
+    request = fixture_request(shot_budget=1) | {"response_mode": "json_only"}
+    mismatched = fox_creative_outline()
+    mismatched["scenes"][0]["shots"][0]["characters_present"] = ["An invented fox"]
+    output = json.dumps(mismatched)
+    client = FakeClient([response(output), response(output)])
+
+    with pytest.raises(GeminiPlanningError) as rejected:
+        make_planner(client).plan(request)
+
+    issue = rejected.value.diagnostics["validation_attempts"][0]["issues"][0]
+    assert issue == {"path": "scenes[0].shots[0].characters_present[0]", "type": "unknown_character"}
+    assert "An invented fox" not in str(rejected.value)
 
 
 def test_invalid_json_uses_one_bounded_schema_repair():
@@ -485,7 +584,8 @@ def test_invalid_json_uses_one_bounded_schema_repair():
     result = make_planner(client).plan(fixture_request())
     assert result.plan.title == "The Lighthouse Keeper"
     assert len(client.models.calls) == 2
-    assert "INVALID_RESPONSE_JSON" in client.models.calls[1]["contents"]
+    assert "SAFE_VALIDATION_ISSUES" in client.models.calls[1]["contents"]
+    assert "INVALID_RESPONSE_JSON" not in client.models.calls[1]["contents"]
 
 
 def test_schema_has_no_unsupported_pydantic_reference_definitions():
