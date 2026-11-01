@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from hashlib import sha256
 import ipaddress
+import json
 import os
 from pathlib import Path
 import re
@@ -19,12 +20,13 @@ from pydantic import BaseModel, Field, model_validator
 
 from .adapters import verify_video
 from .config import get_settings
-from .db import Database
+from .db import (Database, MAX_GEMINI_ATTEMPTS_PER_HOUR, MAX_GEMINI_ATTEMPTS_PER_REVISION,
+                 MAX_GEMINI_REVISIONS_PER_RUN)
 from .integrations import detect_integrations
 from .film_planner import UnsupportedStory, make_approved_fable_plan, validate_approved_fable
 from .film_orchestrator import FilmOrchestrator, FilmRunConflict, FilmRunTransitionError, STAGES
 from .story_planning import LocalStoryPlanner
-from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner
+from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner, STORY_PLAN_SCHEMA_VERSION
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, GenerationSettings, Preset
@@ -172,7 +174,7 @@ class BuildFilmPlanRequest(BaseModel):
 
 
 class FilmRunBudget(BaseModel):
-    max_shots: int = Field(default=12, ge=1, le=40)
+    max_shots: int = Field(default=1, ge=1, le=40)
     max_retries_per_shot: int = Field(default=1, ge=0, le=3)
     max_generation_seconds: int = Field(default=3600, ge=60, le=86400)
     max_output_bytes: int = Field(default=8 * 1024**3, ge=256 * 1024**2, le=50 * 1024**3)
@@ -213,6 +215,13 @@ class FilmRunAuthorizationRequest(BaseModel):
 
 class GeminiModelRequest(BaseModel):
     model: str = Field(min_length=1, max_length=120)
+
+
+class GeminiReplanRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    planner_model: str = Field(min_length=1, max_length=120)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    confirm_billable_planning: bool = False
 
 
 class ApproveFilmPlanRequest(BaseModel):
@@ -1151,7 +1160,19 @@ def _film_run_status(run: dict) -> dict:
         run["planner_status"] = _gemini_planner_config()["status"]
         request = db.film_run_planner_request(run["id"], include_result=False)
         run["planner_request"] = ({"status": request["status"], "provider": request["provider"], "model": request["model"],
-                                   "attempts": request["attempts"], "error_code": request.get("error_code")} if request else None)
+                                   "revision": request.get("revision", 1), "schema_version": request.get("schema_version", "legacy-unversioned-schema"),
+                                   "attempts": request["attempts"], "remaining_attempts": request.get("remaining_attempts", max(0, 3-request["attempts"])),
+                                   "error_code": request.get("error_code")} if request else None)
+        history = db.film_run_planner_attempts(run["id"], include_result=False)
+        run["planner_attempts"] = [{"revision": item["revision"], "provider": item["provider"], "model": item["model"],
+            "schema_version": item["schema_version"], "status": item["status"], "attempts": item["attempts"],
+            "remaining_attempts": item["remaining_attempts"], "error_code": item.get("error_code"),
+            "consent": item.get("consent")} for item in history]
+        run["planner_schema_current"] = STORY_PLAN_SCHEMA_VERSION
+        run["planner_hourly_attempts_used"] = db.gemini_planner_attempts_last_hour()
+        run["planner_revision_limit"] = MAX_GEMINI_REVISIONS_PER_RUN
+        run["planner_attempt_limit"] = MAX_GEMINI_ATTEMPTS_PER_REVISION
+        run["planner_hourly_attempt_limit"] = MAX_GEMINI_ATTEMPTS_PER_HOUR
     else:
         run["planner_status"] = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()["status"]
     batch_id = run.get("film_batch_id") or run.get("checkpoint", {}).get("generate_shots", {}).get("film_batch_id")
@@ -1290,6 +1311,36 @@ def pause_film_run(run_id: str, request: FilmRunRevisionRequest):
 @app.post("/api/film-runs/{run_id}/resume")
 def resume_film_run(run_id: str, request: FilmRunRevisionRequest):
     return _film_run_control(run_id, request, "resume")
+
+
+@app.post("/api/film-runs/{run_id}/replan")
+def replan_film_run(run_id: str, request: GeminiReplanRequest):
+    if not request.confirm_billable_planning:
+        raise HTTPException(422, "Confirm that this new Gemini structured-planning request may incur a charge.")
+    run = film_orchestrator.get(run_id)
+    config = _gemini_planner_config()
+    if config["status"] != "connected":
+        raise HTTPException(409, "Connect Gemini and test the account model list before switching planner models.")
+    if request.planner_model not in {model["id"] for model in config["models"]}:
+        raise HTTPException(400, "Choose a Gemini model returned by the latest successful account connection test.")
+    scope = {"project_id": run["project_id"], "prompt": run["prompt"], "reference_ids": run["reference_ids"],
+             "budget": run["budget"], "preset": run["preset"]}
+    scope_hash = sha256(json.dumps(scope, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+    consent = {"confirmed": True, "provider": "Google Gemini API", "model": request.planner_model,
+        "scope": "Same saved prompt, selected project references, preset, and original authorized generation budget",
+        "cost_disclosure_acknowledged": True, "media_uploaded": False,
+        "fields": ["story prompt", "project style text", "preset and generation budget", "opaque selected-reference IDs and categories"]}
+    try:
+        updated = film_orchestrator.replan_with_gemini(run_id, request.expected_revision, request.planner_model,
+            request.idempotency_key, scope_hash, STORY_PLAN_SCHEMA_VERSION, consent)
+        return _film_run_status(updated)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except FilmRunConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (FilmRunTransitionError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/film-runs/{run_id}/cancel")

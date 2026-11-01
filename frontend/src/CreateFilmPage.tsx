@@ -7,12 +7,15 @@ type Preset = { name: string; frames: number; fps: number; status: string; visua
 type Reference = { id: string; name: string; category: string; mime_type: string }
 type FilmRun = {
   id: string; project_id: string; prompt: string; reference_ids: string[]; preset: string; updated_at: string
+  replan_deduplicated?: boolean
   status: string; stage: string; revision: number; budget: { max_shots: number; max_retries_per_shot: number; max_generation_seconds: number; max_output_bytes: number }
   completed_stages: string[]; error: string | null; events: { revision: number; level: string; message: string; time: string }[]
   generation_jobs_created?: number; planner_status?: string; message?: string
   storyboard_id?: string; creative_review_status?: string|null
   request?: {planner_provider?:'gemini'|'local';planner_model?:string|null}
-  planner_request?: {status:string;provider:string;model:string;attempts:number;error_code:string|null}|null
+  planner_request?: {status:string;provider:string;model:string;revision:number;schema_version:string;attempts:number;remaining_attempts:number;error_code:string|null}|null
+  planner_attempts?: {revision:number;provider:string;model:string;schema_version:string;status:string;attempts:number;remaining_attempts:number;error_code:string|null;consent:Record<string,unknown>|null}[]
+  planner_schema_current?:string;planner_revision_limit?:number;planner_attempt_limit?:number;planner_hourly_attempt_limit?:number;planner_hourly_attempts_used?:number
   generation_progress?: {total:number;verified:number;queued:number;failed:number;progress:number;shots:{title:string;scene_title:string;status:string;progress:number;events:{time:string;level:string;message:string}[]}[]}|null
 }
 type Preview = { maximum_footage_seconds:number; generation_time_estimate_seconds:number|null; estimated_output_bytes:number|null; storage_hard_cap_bytes:number; generation_time_hard_cap_seconds:number; storage_sample_count:number; available_output_bytes:number; disk_sufficient_for_budget:boolean; estimated_output_within_cap:boolean|null; generation_time_within_cap:boolean|null; planner_message:string;general_story_planner_available:boolean }
@@ -40,7 +43,7 @@ function formatBytes(bytes:number){const units=['B','KB','MB','GB','TB'];let val
 
 export default function CreateFilmPage({project,presets,onMessage,onNavigate}:{project:Project|null;presets:Preset[];onMessage:(message:string)=>void;onNavigate:(page:string)=>void}){
   const [prompt,setPrompt]=useState('');const [references,setReferences]=useState<Reference[]>([]);const [selectedRefs,setSelectedRefs]=useState<string[]>([])
-  const [preset,setPreset]=useState('Short');const [maxShots,setMaxShots]=useState(12);const [maxRetries,setMaxRetries]=useState(1);const [maxRuntime,setMaxRuntime]=useState(3600);const [maxBytes,setMaxBytes]=useState(8*1024**3)
+  const [preset,setPreset]=useState('Short');const [maxShots,setMaxShots]=useState(1);const [maxRetries,setMaxRetries]=useState(1);const [maxRuntime,setMaxRuntime]=useState(3600);const [maxBytes,setMaxBytes]=useState(8*1024**3)
   const [runs,setRuns]=useState<FilmRun[]>([]);const [capabilities,setCapabilities]=useState<Capabilities|null>(null);const [busy,setBusy]=useState(false);const [error,setError]=useState('')
   const [plannerProvider,setPlannerProvider]=useState<'gemini'|'local'>('gemini');const [geminiConfig,setGeminiConfig]=useState<StoryPlannerConfig|null>(null);const [remoteConsent,setRemoteConsent]=useState(false)
   const pendingRequest=useRef<{signature:string;key:string}|null>(null)
@@ -94,7 +97,7 @@ Available output disk: ${formatBytes(preview.available_output_bytes)}
 Storage hard cap: ${formatBytes(maxBytes)}
 Retries per shot: ${maxRetries}${presetWarning}
 
-Planner: ${plannerProvider==='gemini'?`Gemini API${geminiConfig?.gemini.model?` · ${geminiConfig.gemini.model}`:''} (up to two structured-planning requests, including one schema repair)`:'configured local planner'}
+Planner: ${plannerProvider==='gemini'?`Gemini API${geminiConfig?.gemini.model?` · ${geminiConfig.gemini.model}`:''} (up to three explicitly authorized planning attempts for this revision; model/schema changes are separately tracked)`:'configured local planner'}
 
 ${plannerProvider==='gemini'?'You opted in to send the story prompt, project style text, preset/budget, and opaque selected-reference IDs/categories to Google. No images, generated media, filenames, paths, reference notes or project database are uploaded. Gemini planning may incur charges; the account tier and exact price are not known to FRAMEWORK.':'Story planning stays local.'} LTX generation and Remotion rendering remain local.
 
@@ -112,6 +115,22 @@ Technical checks do not approve creative quality; the run will stop for creative
     }
     setBusy(true);setError('')
     try{const updated=await requestJson<FilmRun>(`/api/film-runs/${run.id}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({expected_revision:run.revision})});setRuns(current=>current.map(item=>item.id===updated.id?updated:item));onMessage(`Film request ${action}d.`)}catch(e){setError(e instanceof Error?e.message:String(e));await load()}finally{setBusy(false)}
+  }
+  async function replan(run:FilmRun,model:string){
+    const sameModel=model===run.request?.planner_model
+    const revisionKey=`framework-film-replan:${run.id}:${run.revision}`
+    let idempotencyKey=''
+    try{idempotencyKey=localStorage.getItem(revisionKey)??''}catch{}
+    if(!idempotencyKey){idempotencyKey=crypto.randomUUID();try{localStorage.setItem(revisionKey,idempotencyKey)}catch{}}
+    const confirmed=window.confirm(`Authorize a new Gemini planning revision using ${model}${sameModel?' and the current schema':' instead of '+(run.request?.planner_model??'the prior model')}?\n\nThis sends this run's saved story prompt, project style text, preset/budget, and opaque reference IDs/categories to Google. It does not upload media. The request may incur a charge.\n\nThe original ${run.budget.max_shots}-shot and time/storage budget and generation authorization remain unchanged. No LTX job is created until the new plan passes validation. Test connection only lists models; this is the actual structured-planning request.`)
+    if(!confirmed)return
+    setBusy(true);setError('')
+    try{
+      const updated=await requestJson<FilmRun>(`/api/film-runs/${run.id}/replan`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({expected_revision:run.revision,planner_model:model,idempotency_key:idempotencyKey,confirm_billable_planning:true})})
+      try{localStorage.removeItem(revisionKey)}catch{}
+      setRuns(current=>[updated,...current.filter(item=>item.id!==updated.id)])
+      onMessage(updated.replan_deduplicated?'Reused the already authorized planning revision.':'New planning revision authorized. Previous attempts and the run budget are preserved.')
+    }catch(e){setError(e instanceof Error?e.message:String(e));await load()}finally{setBusy(false)}
   }
   return <div className="create-film-page">
     <section className="panel create-film-hero">
@@ -139,15 +158,22 @@ Technical checks do not approve creative quality; the run will stop for creative
       </>}
       {error&&<div className="model-caution"><AlertTriangle size={13}/>{error}</div>}
     </section>
-    <section className="panel create-film-runs"><div className="section-kicker">DURABLE RUN HISTORY</div><h2>Film runs</h2>{runs.length?runs.map(run=><FilmRunCard key={run.id} run={run} busy={busy} onControl={control} onNavigate={onNavigate}/>):<p className="empty-workspace">No film runs in this project yet.</p>}</section>
+    <section className="panel create-film-runs"><div className="section-kicker">DURABLE RUN HISTORY</div><h2>Film runs</h2>{runs.length?runs.map(run=><FilmRunCard key={run.id} run={run} busy={busy} models={geminiConfig?.gemini.models??[]} geminiConnected={geminiConfig?.gemini.status==='connected'} onControl={control} onReplan={replan} onNavigate={onNavigate}/>):<p className="empty-workspace">No film runs in this project yet.</p>}</section>
   </div>
 }
 
-function FilmRunCard({run,busy,onControl,onNavigate}:{run:FilmRun;busy:boolean;onControl:(run:FilmRun,action:'pause'|'resume'|'cancel')=>void;onNavigate:(page:string)=>void}){
+function FilmRunCard({run,busy,models,geminiConnected,onControl,onReplan,onNavigate}:{run:FilmRun;busy:boolean;models:{id:string;display_name:string}[];geminiConnected:boolean;onControl:(run:FilmRun,action:'pause'|'resume'|'cancel')=>void;onReplan:(run:FilmRun,model:string)=>void;onNavigate:(page:string)=>void}){
+  const [replanModel,setReplanModel]=useState('')
+  const modelIds=models.map(model=>model.id).join('|')
+  useEffect(()=>{const replacement=models.find(model=>model.id!==run.request?.planner_model)?.id??run.request?.planner_model??'';setReplanModel(replacement)},[run.request?.planner_model,modelIds])
   const stageIndex=Math.max(0,run.completed_stages.length)
   const progress=Math.round(stageIndex/10*100)
   const blocked=run.status==='needs_attention'
-  const canRetry=blocked&&['understand_story','generate_shots'].includes(run.stage)&&!['not_configured','executable_missing','invalid_configuration'].includes(run.planner_status??'')
+  const isGeminiPlanningFailure=blocked&&run.stage==='understand_story'&&run.request?.planner_provider==='gemini'&&!!run.planner_request&&['failed','started'].includes(run.planner_request.status)
+  const schemaMatches=run.planner_request?.schema_version===run.planner_schema_current
+  const canRetry=blocked&&((run.stage==='understand_story'&&run.request?.planner_provider==='gemini'&&schemaMatches&&(run.planner_request?.remaining_attempts??0)>0)||run.stage==='generate_shots')&&!['not_configured','executable_missing','invalid_configuration'].includes(run.planner_status??'')
+  const canReplan=isGeminiPlanningFailure&&geminiConnected&&(run.planner_attempts?.length??0)<(run.planner_revision_limit??3)&&(run.planner_hourly_attempts_used??0)<(run.planner_hourly_attempt_limit??5)
+  const diagnostic:Record<string,string>={model_or_endpoint_incompatible:'The selected model or endpoint was unavailable (404). This points to model/API compatibility; choose another account-listed model.',model_invalid:'The selected model is no longer in the compatible account model list. Test the connection and choose a currently listed model.',model_unavailable:'The selected model is unavailable to this account. Test the connection and switch to a listed model.',invalid_request:'Gemini rejected the structured planning request (400). A 400 is not proof that the model is faulty; the request schema may be unsupported.',service_unavailable:'Gemini returned a temporary provider/service error. Wait before spending another attempt.',rate_limit:'Gemini or the account quota rate-limited this request. Wait for the hourly safeguard or account quota to recover.',auth_denied:'Gemini rejected the key or account permissions. Fix the connection in Settings before retrying.',invalid_output:'The response did not pass FRAMEWORK’s strict StoryPlan checks after its bounded repair.',incomplete_output:'Gemini stopped before completing the structured plan. This is an output or response-budget issue; the incomplete plan was not accepted.',blocked_content:'Gemini blocked the prompt under its safety policy. Review the story prompt before authorizing another request.',timeout:'The request timed out and may have reached Google. Its outcome may be billable; it was not resent automatically.',provider_error:'Gemini planning failed; the original provider response is hidden to protect private data.'}
   return <article className="film-run-card">
     <header><div><b>{run.prompt.length>100?`${run.prompt.slice(0,100)}…`:run.prompt}</b><small>{new Date(run.updated_at).toLocaleString()} · {run.preset} · {run.budget.max_shots} shot cap</small></div><span className={`job-status ${run.status}`}>{run.status.replaceAll('_',' ')}</span></header>
     <div className="film-run-progress"><span style={{width:`${progress}%`}}/></div>
@@ -156,6 +182,21 @@ function FilmRunCard({run,busy,onControl,onNavigate}:{run:FilmRun;busy:boolean;o
       return <li className={`${complete?'complete':''} ${current?'current':''}`} key={stage}><span>{complete?<Check size={12}/>:index+1}</span><small>{stageLabels[stage]}</small></li>
     })}</ol>
     {blocked&&<div className="create-film-limitation"><AlertTriangle size={14}/><span>{run.error??'Waiting for a verified general story-planning capability. No shot jobs have been queued.'}</span></div>}
+    {isGeminiPlanningFailure&&<section className="planner-recovery-panel">
+      <div className="section-kicker">GEMINI PLANNING DIAGNOSTIC</div>
+      <p><b>{diagnostic[run.planner_request?.error_code??'']??'Planning stopped before any shot job was queued.'}</b></p>
+      <p>Run is pinned to <code>{run.planner_request?.model??run.request?.planner_model??'no model'}</code> · schema <code>{run.planner_request?.schema_version??'unknown'}</code> · revision {run.planner_request?.revision??1}.</p>
+      <p>Current revision: {run.planner_request?.attempts??0}/{run.planner_attempt_limit??3} planning attempts used, {run.planner_request?.remaining_attempts??0} remaining. Hourly safeguard: {run.planner_hourly_attempts_used??0}/{run.planner_hourly_attempt_limit??5} attempts used. Revisions: {run.planner_attempts?.length??0}/{run.planner_revision_limit??3}.</p>
+      {run.planner_attempts&&run.planner_attempts.length>0&&<details><summary>Planner revision history</summary><ol className="planner-attempt-history">{run.planner_attempts.map(item=><li key={item.revision}><b>Revision {item.revision}</b> · {item.model} · {item.schema_version} · {item.attempts} attempt(s) · {item.status}{item.error_code?` · ${item.error_code}`:''}</li>)}</ol></details>}
+      <div className="planner-recovery-controls"><label className="setting-field"><span>ACCOUNT-AVAILABLE MODEL FOR THIS RUN</span><select value={replanModel} disabled={busy||!geminiConnected||!models.length} onChange={event=>setReplanModel(event.target.value)}>{models.map(model=><option key={model.id} value={model.id}>{model.display_name} · {model.id}{model.id===run.planner_request?.model?' · current':''}</option>)}</select></label>
+        <button className="button primary mini" disabled={busy||!canReplan||!replanModel} onClick={()=>onReplan(run,replanModel)}>{replanModel!==run.planner_request?.model?'Switch model and retry planning':run.planner_request?.schema_version!==run.planner_schema_current?'Retry with updated schema':'Authorize a separate planning revision'}</button></div>
+      {geminiConnected&&models.length>0&&<p>These account-listed models expose the supported planning endpoint, but model listing does not guarantee acceptance of FRAMEWORK’s structured StoryPlan schema. Switching performs a real planning request only after confirmation; it may be billable.</p>}
+      {!geminiConnected&&<p>Connect Gemini and run Test connection to list account models. That connection test does not send a planning request.</p>}
+      {geminiConnected&&models.every(model=>model.id===run.planner_request?.model)&&<p>No alternate compatible models were returned by this account. A confirmed retry can still use the revised schema with the current model.</p>}
+      {(run.planner_attempts?.length??0)>=(run.planner_revision_limit??3)&&<p>This run has reached its revision limit. Its history is preserved; review account usage before starting a new film run.</p>}
+      {(run.planner_hourly_attempts_used??0)>=(run.planner_hourly_attempt_limit??5)&&<p>The hourly planning safeguard is exhausted. Wait before authorizing another request.</p>}
+      <small>Switching does not alter global Settings, reset old attempt counts, or change this run’s shot/time/storage budget. The next confirmed action sends a real structured-planning request and may be billable. Connection testing only lists models; it does not test schema compatibility.</small>
+    </section>}
     {run.status==='needs_review'&&<div className="create-film-limitation"><ShieldCheck size={14}/><div><span>All {run.generation_progress?.verified??0} clip(s) passed technical verification. Creative review is pending; no automatic visual approval or Remotion render occurred.</span><button className="text-button" onClick={()=>onNavigate('Story to Film')}>Review verified clips</button></div></div>}
     {run.generation_progress&&<div className="film-run-shot-progress"><header><b>Local generation queue</b><span>{run.generation_progress.verified}/{run.generation_progress.total} technically verified · {run.generation_progress.progress}%</span></header>{run.generation_progress.shots.map((shot,index)=><div className="film-run-shot" key={`${index}-${shot.title}`}><span>{shot.scene_title} / {shot.title}</span><b className={`job-status ${shot.status}`}>{shot.status} {shot.status==='running'?`${shot.progress}%`:''}</b>{shot.events.slice(-1).map((event,eventIndex)=><small key={eventIndex}>{event.message}</small>)}</div>)}</div>}
     <div className="create-film-run-meta"><span>Authorization {run.status==='awaiting_authorization'?'not granted':'recorded'}</span><span>Generation jobs created: {run.generation_jobs_created??0}</span><span>Technical verification and creative approval remain separate.</span></div>

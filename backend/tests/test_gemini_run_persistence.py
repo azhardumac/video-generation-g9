@@ -174,5 +174,145 @@ def test_gemini_planner_attempts_are_capped_across_runs_per_hour(tmp_path):
     claimed = db.update_film_run(run["id"], run["revision"], status="running", message="test claim")
     import pytest
     from app.film_orchestrator import FilmRunTransitionError
-    with pytest.raises(FilmRunTransitionError, match="five planning attempts per hour"):
+    with pytest.raises(FilmRunTransitionError, match="five attempts per hour"):
         db.reserve_film_run_planner_request(run["id"], "gemini", "gemini-3.8-flash", "hash-6")
+
+
+def test_exhausted_model_can_switch_on_same_run_with_a_separate_attempt_and_restart(tmp_path):
+    import pytest
+    from app.film_orchestrator import FilmRunTransitionError
+    from app.gemini_planning import GeminiPlanningError, STORY_PLAN_SCHEMA_VERSION
+
+    db, project, settings, _request, run, secrets = setup_run(tmp_path)
+    db.put_setting("story_planner_gemini", {"status": "connected", "models": [
+        {"id": "gemini-3.8-flash"}, {"id": "gemini-2.5-flash"}], "model": "gemini-3.8-flash"})
+    calls = []
+
+    class FailingPlanner:
+        def plan(self, request):
+            calls.append(("old", request))
+            raise GeminiPlanningError("invalid_request", "Safe structured request error", retryable_by_user=True)
+
+    failing = FilmRunEngine(db, settings, secret_store=secrets,
+        gemini_planner_factory=lambda *_: FailingPlanner(), ltx_ready=lambda: True)
+    for attempt in range(3):
+        failed = failing.process_next()
+        assert failed["status"] == "needs_attention"
+        if attempt < 2:
+            resumed = FilmOrchestrator(db).resume(run["id"], failed["revision"])
+            assert resumed["status"] == "waiting_for_planner"
+    assert len(calls) == 3
+    old_attempt = db.film_run_planner_request(run["id"], revision=1, include_result=False)
+    assert old_attempt["attempts"] == 3 and old_attempt["status"] == "failed"
+    with pytest.raises(FilmRunTransitionError, match="all three attempts"):
+        FilmOrchestrator(db).resume(run["id"], failed["revision"])
+
+    consent = {"confirmed": True, "model": "gemini-2.5-flash", "media_uploaded": False}
+    orchestrator = FilmOrchestrator(db)
+    switched = orchestrator.replan_with_gemini(run["id"], failed["revision"], "gemini-2.5-flash",
+        "switch-model-key", "same-scope-hash", STORY_PLAN_SCHEMA_VERSION, consent)
+    assert switched["id"] == run["id"]
+    assert switched["request"]["planner_model"] == "gemini-2.5-flash"
+    assert switched["budget"] == run["budget"]
+    assert db.film_run_planner_request(run["id"], revision=1, include_result=False)["attempts"] == 3
+    new_attempt = db.film_run_planner_request(run["id"], revision=2, include_result=False)
+    assert new_attempt["status"] == "retry_authorized" and new_attempt["attempts"] == 0
+    assert new_attempt["model"] == "gemini-2.5-flash"
+    assert new_attempt["schema_version"] == STORY_PLAN_SCHEMA_VERSION
+    assert new_attempt["consent"]["confirmed"] is True
+    duplicate = orchestrator.replan_with_gemini(run["id"], failed["revision"], "gemini-2.5-flash",
+        "switch-model-key", "same-scope-hash", STORY_PLAN_SCHEMA_VERSION, consent)
+    assert duplicate["replan_deduplicated"] is True
+    assert len(db.film_run_planner_attempts(run["id"])) == 2
+
+    class NewModelPlanner:
+        def plan(self, request):
+            calls.append(("new", request))
+            return PlannerResult(StoryPlan.model_validate(valid_plan()), {"provider": "gemini",
+                "model": "gemini-2.5-flash", "request_count": 1, "usage": {"total_tokens": 88}})
+
+    restarted_db = Database(settings)
+    recovered = FilmRunEngine(restarted_db, settings, secret_store=secrets,
+        gemini_planner_factory=lambda _key, model, _timeout: NewModelPlanner() if model == "gemini-2.5-flash" else FailingPlanner(),
+        ltx_ready=lambda: True).process_next()
+    assert recovered["stage"] == "define_visual_bible"
+    assert calls[-1][0] == "new"
+    assert restarted_db.film_run_planner_request(run["id"], revision=2)["status"] == "completed"
+    assert restarted_db.film_run_planner_attempts(run["id"])[0]["attempts"] == 3
+    assert restarted_db.film_run_planner_attempts(run["id"])[1]["attempts"] == 1
+    assert restarted_db.list_jobs(project_id=project["id"]) == []
+
+
+def test_replan_requires_explicit_consent_and_is_limited_to_verified_account_models(tmp_path):
+    import pytest
+    from app.film_orchestrator import FilmRunTransitionError
+    from app.gemini_planning import STORY_PLAN_SCHEMA_VERSION
+
+    db, _project, _settings, _request, run, _secrets = setup_run(tmp_path)
+    blocked = db.update_film_run(run["id"], run["revision"], status="needs_attention",
+        message="simulated failed planning", error="safe diagnostic")
+    db.fail_film_run_planner_request(run["id"], "invalid_request")
+    orchestrator = FilmOrchestrator(db)
+    with pytest.raises(FilmRunTransitionError, match="Explicit consent"):
+        orchestrator.replan_with_gemini(run["id"], blocked["revision"], "gemini-unlisted",
+            "no-consent", "same-scope", STORY_PLAN_SCHEMA_VERSION, {"confirmed": False})
+    assert db.film_run_planner_attempts(run["id"]) == []
+
+
+def test_replan_http_route_requires_consent_and_account_listed_model_without_sending_request(tmp_path, monkeypatch):
+    import pytest
+    from fastapi import HTTPException
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "api-global-test.sqlite3"))
+    monkeypatch.setenv("ALLOWED_PATH_ROOTS", str(tmp_path))
+    from app.config import get_settings
+    get_settings.cache_clear()
+    from app import main as api
+    from app.gemini_planning import GeminiPlanningError
+    assert api.FilmRunBudget().max_shots == 1
+
+    db, _project, settings, _request, run, secrets = setup_run(tmp_path)
+    db.put_setting("story_planner_gemini", {"status": "connected", "models": [
+        {"id": "gemini-3.8-flash", "display_name": "Flash"},
+        {"id": "gemini-2.5-flash", "display_name": "Flash 2.5"}], "model": "gemini-3.8-flash"})
+    class Failed:
+        def plan(self, _request):
+            raise GeminiPlanningError("invalid_request", "safe", retryable_by_user=True)
+    failed = FilmRunEngine(db, settings, secret_store=secrets,
+        gemini_planner_factory=lambda *_: Failed(), ltx_ready=lambda: True).process_next()
+    monkeypatch.setattr(api, "db", db)
+    monkeypatch.setattr(api, "film_orchestrator", FilmOrchestrator(db))
+    monkeypatch.setattr(api, "gemini_secret_store", GeminiSecretStore(tmp_path / "unused.json", env={"GEMINI_API_KEY": "fake-key"}))
+
+    with pytest.raises(HTTPException) as no_consent:
+        api.replan_film_run(run["id"], api.GeminiReplanRequest(expected_revision=failed["revision"],
+            planner_model="gemini-2.5-flash", idempotency_key="consent", confirm_billable_planning=False))
+    assert no_consent.value.status_code == 422
+    with pytest.raises(HTTPException) as unlisted:
+        api.replan_film_run(run["id"], api.GeminiReplanRequest(expected_revision=failed["revision"],
+            planner_model="gemini-not-in-account", idempotency_key="unlisted", confirm_billable_planning=True))
+    assert unlisted.value.status_code == 400
+    accepted = api.replan_film_run(run["id"], api.GeminiReplanRequest(expected_revision=failed["revision"],
+        planner_model="gemini-2.5-flash", idempotency_key="accepted", confirm_billable_planning=True))
+    assert accepted["id"] == run["id"]
+    assert accepted["request"]["planner_model"] == "gemini-2.5-flash"
+    assert accepted["status"] == "waiting_for_planner"
+    assert db.film_run_planner_request(run["id"], revision=2)["attempts"] == 0
+
+
+def test_schema_change_creates_a_distinct_revision_without_resetting_prior_ledger(tmp_path):
+    from app.gemini_planning import STORY_PLAN_SCHEMA_VERSION
+
+    db, _project, _settings, _request, run, _secrets = setup_run(tmp_path)
+    claimed = db.update_film_run(run["id"], run["revision"], status="running", message="claim for schema test")
+    db.reserve_film_run_planner_request(run["id"], "gemini", "gemini-3.8-flash", "schema-one",
+        revision=1, schema_version=STORY_PLAN_SCHEMA_VERSION)
+    db.fail_film_run_planner_request(run["id"], "invalid_request", revision=1)
+    blocked = db.update_film_run(run["id"], claimed["revision"], status="needs_attention",
+        message="schema rejected", error="safe schema diagnostic")
+    revision = FilmOrchestrator(db).replan_with_gemini(run["id"], blocked["revision"], "gemini-3.8-flash",
+        "schema-revision-key", "same-scope", "storyplan-schema-revision-test",
+        {"confirmed": True, "model": "gemini-3.8-flash", "media_uploaded": False})
+    history = db.film_run_planner_attempts(run["id"], include_result=False)
+    assert revision["request"]["planner_schema_version"] == "storyplan-schema-revision-test"
+    assert [(item["revision"], item["schema_version"], item["attempts"]) for item in history] == [
+        (1, STORY_PLAN_SCHEMA_VERSION, 1), (2, "storyplan-schema-revision-test", 0)]

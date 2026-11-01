@@ -200,12 +200,20 @@ Only account-listed Flash models advertising `generateContent` support are
 selectable. FRAMEWORK validates every result against the strict Pydantic `StoryPlan` schema, project
 references, story order, identity/count consistency, shot limits, and generation
 budgets. The provider schema's scene, per-scene shot, and location caps and the
-response-token ceiling scale with the authorized shot budget. String length
-constraints remain enforced locally by `StoryPlan`; unsupported JSON Schema
-length keywords are not sent to Gemini. Each run is limited to two planning requests (one optional schema
-repair), with at most five planning attempts per hour and three explicit
-attempts per run. Returned
-token usage is saved when available; a dollar estimate is not fabricated.
+response-token ceiling scale with the authorized shot budget. New film runs
+default to a one-shot test budget; users can explicitly choose a larger cap.
+String length constraints remain enforced locally by `StoryPlan`; unsupported
+JSON Schema length keywords are not sent to Gemini. Each planning revision
+allows at most three explicitly authorized attempts; each run allows at most
+three separately tracked model/schema revisions, with at most five Gemini
+attempts per hour. Changing a model or schema in a blocked **Create Film** card
+creates a new revision in SQLite, retaining the previous model, schema, attempt
+count, errors, and usage data. A connection test only verifies the key and
+returns the account model list. It does not test structured-planning
+compatibility. Switching or retrying displays a confirmation before making a
+potentially billable planning request, and still uses the original run
+authorization and generation budget. Returned token usage is saved when
+available; a dollar estimate is not fabricated.
 
 **Create Film** requires an explicit per-run cloud-processing opt-in for Gemini.
 Only prompt and disclosed metadata are sent; all image/video media work remains
