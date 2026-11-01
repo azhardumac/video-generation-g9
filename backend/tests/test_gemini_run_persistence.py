@@ -112,6 +112,47 @@ def test_interrupted_or_failed_gemini_request_is_never_repeated_until_user_resum
     assert resumed["status"] == "waiting_for_planner"
 
 
+def test_existing_404_failed_run_recovers_only_after_explicit_resume(tmp_path):
+    from app.gemini_planning import GeminiPlanningError
+
+    db, _project, settings, _request, run, secrets = setup_run(tmp_path)
+    calls = []
+    outcomes = [
+        GeminiPlanningError("model_or_endpoint_incompatible", "404 model/endpoint mismatch", retryable_by_user=True),
+        PlannerResult(StoryPlan.model_validate(valid_plan()), {"provider": "gemini", "model": "gemini-3.8-flash",
+            "request_count": 1, "usage": {"total_tokens": 100}, "cost_estimate": None}),
+    ]
+
+    class RecoveringPlanner:
+        def plan(self, request):
+            calls.append(request)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    engine = FilmRunEngine(db, settings, secret_store=secrets,
+        gemini_planner_factory=lambda *_: RecoveringPlanner(), ltx_ready=lambda: True)
+    failed = engine.process_next()
+    assert failed["status"] == "needs_attention"
+    assert failed["error"] == "404 model/endpoint mismatch"
+    assert db.film_run_planner_request(run["id"], include_result=False)["status"] == "failed"
+    assert db.list_jobs(project_id="project-a") == []
+    assert engine.process_next() is None
+    assert len(calls) == 1
+
+    resumed = FilmOrchestrator(db).resume(run["id"], failed["revision"])
+    assert resumed["status"] == "waiting_for_planner"
+    recovered = engine.process_next()
+    assert recovered["stage"] == "define_visual_bible"
+    ledger = db.film_run_planner_request(run["id"])
+    assert ledger["status"] == "completed"
+    assert ledger["attempts"] == 2
+    assert ledger["result"]["plan"]["title"] == "The Lighthouse Keeper"
+    assert len(calls) == 2
+    assert db.list_jobs(project_id="project-a") == []
+
+
 def test_identical_active_prompt_submission_with_new_browser_key_reuses_run(tmp_path):
     db, project, _settings, request, first, _secrets = setup_run(tmp_path)
     duplicate = FilmOrchestrator(db).create(project["id"], "refreshed-browser-key", request, authorized=True)

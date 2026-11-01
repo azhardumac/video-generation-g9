@@ -33,12 +33,12 @@ def valid_plan(reference_ids=None):
     }
 
 
-class FakeInteractions:
+class FakeGenerateContentModels:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
 
-    def create(self, **kwargs):
+    def generate_content(self, **kwargs):
         self.calls.append(kwargs)
         result = self.responses.pop(0)
         if isinstance(result, Exception):
@@ -46,19 +46,19 @@ class FakeInteractions:
         return result
 
 
-class FakeModels:
     def list(self):
         return [
-            {"name": "models/gemini-2.5-flash", "display_name": "Gemini Flash"},
-            {"name": "models/gemini-pro", "display_name": "Gemini Pro"},
-            {"name": "models/gemini-3.8-flash", "display_name": "Gemini 3.8 Flash"},
+            {"name": "models/gemini-2.5-flash", "display_name": "Gemini Flash", "supportedActions": ["generateContent"]},
+            {"name": "models/gemini-pro", "display_name": "Gemini Pro", "supportedActions": ["generateContent"]},
+            {"name": "models/gemini-3.8-flash", "display_name": "Gemini 3.8 Flash", "supportedActions": ["generateContent"]},
+            {"name": "models/gemini-2.5-flash-image", "display_name": "Flash Image", "supportedActions": ["generateContent"]},
+            {"name": "models/gemini-2.5-flash-preview-interactions", "display_name": "Interactions only", "supportedActions": ["interactions"]},
         ]
 
 
 class FakeClient:
     def __init__(self, responses):
-        self.interactions = FakeInteractions(responses)
-        self.models = FakeModels()
+        self.models = FakeGenerateContentModels(responses)
 
 
 class FakeAPIError(Exception):
@@ -67,8 +67,9 @@ class FakeAPIError(Exception):
         super().__init__(f"private response body {code}")
 
 
-def response(value, usage=None, status="completed"):
-    return SimpleNamespace(output_text=value, usage=usage or {"total_input_tokens": 25, "total_output_tokens": 300, "total_tokens": 325}, status=status)
+def response(value, usage=None, finish_reason="STOP"):
+    return SimpleNamespace(text=value, usage_metadata=usage or {"prompt_token_count": 25, "candidates_token_count": 300, "total_token_count": 325},
+                           candidates=[SimpleNamespace(finish_reason=finish_reason)])
 
 
 def fixture_request(refs=None, shot_budget=5):
@@ -93,15 +94,17 @@ def test_account_model_selection_is_limited_to_flash_models_returned_by_account(
 def test_structured_plan_uses_supported_schema_and_always_validates_with_storyplan():
     client = FakeClient([response(StoryPlan.model_validate(valid_plan()).model_dump_json())])
     result = make_planner(client).plan(fixture_request())
-    call = client.interactions.calls[0]
-    schema = call["response_format"]["schema"]
+    call = client.models.calls[0]
+    schema = call["config"]["response_schema"]
     assert call["model"] == "gemini-3.8-flash"
-    assert call["generation_config"]["max_output_tokens"] == 8192
-    assert call["store"] is False
+    assert call["config"]["max_output_tokens"] == 8192
+    assert call["config"]["response_mime_type"] == "application/json"
+    assert call["contents"].startswith("Create a film story plan")
     assert "$defs" not in str(schema) and "minItems" in str(schema)
     assert result.plan.title == "The Lighthouse Keeper"
     assert result.provenance["provider"] == "gemini"
     assert result.provenance["usage"]["total_tokens"] == 325
+    assert result.provenance["api"] == "Gemini generateContent API structured JSON"
     assert result.provenance["cost_estimate"] is None
 
 
@@ -114,10 +117,10 @@ def test_opaque_reference_metadata_only_and_scope_rejection_repair():
                          response(StoryPlan.model_validate(good).model_dump_json())])
     result = make_planner(client).plan(request)
     assert result.plan.ordered_shots[0][1].reference_ids == ["opaque-ref-1"]
-    assert len(client.interactions.calls) == 2  # exactly one bounded schema/scope repair
-    assert "/private/path" not in client.interactions.calls[0]["input"]
-    assert "private filename" not in client.interactions.calls[0]["input"]
-    assert "private notes" not in client.interactions.calls[0]["input"]
+    assert len(client.models.calls) == 2  # exactly one bounded schema/scope repair
+    assert "/private/path" not in client.models.calls[0]["contents"]
+    assert "private filename" not in client.models.calls[0]["contents"]
+    assert "private notes" not in client.models.calls[0]["contents"]
 
 
 def test_shot_budget_is_checked_and_invalid_second_output_is_a_blocker():
@@ -130,7 +133,7 @@ def test_shot_budget_is_checked_and_invalid_second_output_is_a_blocker():
     with pytest.raises(GeminiPlanningError, match="remained invalid") as error:
         make_planner(client).plan(fixture_request(shot_budget=1))
     assert error.value.code == "invalid_output"
-    assert len(client.interactions.calls) == 2
+    assert len(client.models.calls) == 2
 
 
 def test_missing_key_invalid_model_auth_quota_and_empty_output_are_classified_without_secret_echo():
@@ -156,7 +159,7 @@ def test_missing_key_invalid_model_auth_quota_and_empty_output_are_classified_wi
 
     client = FakeClient([response(""), response(StoryPlan.model_validate(valid_plan()).model_dump_json())])
     assert make_planner(client).plan(fixture_request()).plan.title == "The Lighthouse Keeper"
-    assert len(client.interactions.calls) == 2
+    assert len(client.models.calls) == 2
 
 
 def test_only_bounded_503_retry_and_timeout_does_not_automatically_resend():
@@ -164,7 +167,7 @@ def test_only_bounded_503_retry_and_timeout_does_not_automatically_resend():
     delays = []
     result = make_planner(client, sleeper=delays.append).plan(fixture_request())
     assert result.plan.title == "The Lighthouse Keeper"
-    assert len(client.interactions.calls) == 2
+    assert len(client.models.calls) == 2
     assert delays == [0.5]
 
     client = FakeClient([TimeoutError("key and prompt must not be included")])
@@ -172,7 +175,27 @@ def test_only_bounded_503_retry_and_timeout_does_not_automatically_resend():
         make_planner(client).plan(fixture_request())
     assert timeout.value.code == "timeout"
     assert "key and prompt" not in str(timeout.value)
-    assert len(client.interactions.calls) == 1
+    assert len(client.models.calls) == 1
+
+
+def test_404_identifies_model_or_endpoint_incompatibility_without_private_text():
+    client = FakeClient([FakeAPIError(404)])
+    with pytest.raises(GeminiPlanningError) as missing:
+        make_planner(client).plan(fixture_request())
+    assert missing.value.code == "model_or_endpoint_incompatible"
+    assert "generateContent" in str(missing.value)
+    assert "private response body" not in str(missing.value)
+    assert "not-a-real-test-secret" not in str(missing.value)
+    assert "A lighthouse keeper guides a lost boat" not in str(missing.value)
+    assert len(client.models.calls) == 1
+
+
+def test_invalid_json_uses_one_bounded_schema_repair():
+    client = FakeClient([response("{\"title\":"), response(StoryPlan.model_validate(valid_plan()).model_dump_json())])
+    result = make_planner(client).plan(fixture_request())
+    assert result.plan.title == "The Lighthouse Keeper"
+    assert len(client.models.calls) == 2
+    assert "INVALID_RESPONSE_JSON" in client.models.calls[1]["contents"]
 
 
 def test_schema_has_no_unsupported_pydantic_reference_definitions():

@@ -968,6 +968,7 @@ def _gemini_planner_config() -> dict:
             "rate_limit": "Gemini connection testing reached an account rate or quota limit. Wait and review the account quota.",
             "service_unavailable": "Gemini was unavailable during the last connection test. Retry after the provider recovers.",
             "timeout": "The last Gemini connection test timed out. Its result is unknown; test again manually.",
+            "model_or_endpoint_incompatible": "Gemini returned 404 during the last connection test. Confirm the API is enabled for this account, then retest and choose a Flash model supporting generateContent.",
         }.get(saved.get("error_code"), "The last Gemini connection test failed. Recheck the key and account model access, then test again.")
     elif saved.get("status") == "no_flash_models":
         status, detail = "no_flash_models", "The key was accepted, but this account returned no Flash-class models available to FRAMEWORK. Check account model access."
@@ -1060,7 +1061,7 @@ def test_gemini_connection():
     if not models:
         db.put_setting("story_planner_gemini", {"status": "no_flash_models", "models": [], "model": None,
                                                   "last_connection_test_at": now, "connection_test_times": recent_tests})
-        raise HTTPException(409, "The connected account returned no available Gemini Flash-class models. Check account model access.")
+        raise HTTPException(409, "The connected account returned no Gemini Flash model that supports generateContent. Check account model access and test the connection again.")
     ids = {item["id"] for item in models}
     selected = saved.get("model") if saved.get("model") in ids else models[0]["id"]
     db.put_setting("story_planner_gemini", {"status": "connected", "models": models, "model": selected,
