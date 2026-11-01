@@ -19,6 +19,7 @@ MAX_SHOTS_PER_SCENE = 40
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_TRANSIENT_ATTEMPTS = 2  # Includes the first request; one bounded retry at most.
 MAX_SCHEMA_REPAIR_REQUESTS = 1
+STORY_PLAN_SCHEMA_VERSION = "storyplan-budgeted-v1"
 _FLASH_ALLOWLIST = re.compile(r"^(?:models/)?gemini-[a-z0-9][a-z0-9.-]*flash[a-z0-9.-]*$", re.IGNORECASE)
 
 

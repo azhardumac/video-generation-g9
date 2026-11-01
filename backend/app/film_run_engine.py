@@ -15,7 +15,7 @@ from .integrations import detect_integrations
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, GenerationSettings
 from .story_planning import LocalStoryPlanner, PlannerOutputError, PlannerUnavailable, PlannerResult, StoryPlan, StoryPlanner
-from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner
+from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner, STORY_PLAN_SCHEMA_VERSION
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
 
 
@@ -117,9 +117,16 @@ class FilmRunEngine:
             if model not in {item.get("id") for item in saved_models.get("models", [])}:
                 raise GeminiPlanningError("model_unavailable", "The selected Gemini Flash model is not verified for the current account. Test the connection and select an available model in Settings.")
             planner = self.gemini_planner_factory(key, model, self.settings.gemini_timeout_seconds)
-            fingerprint = hashlib.sha256(json.dumps({"provider": provider, "model": model, "input": remote_request},
+            planner_revision = int(request.get("planner_revision", 1))
+            prior_attempt = self.db.film_run_planner_request(run["id"], revision=planner_revision, include_result=False)
+            schema_version = (request.get("planner_schema_version") or
+                              (prior_attempt.get("schema_version") if prior_attempt else None) or
+                              STORY_PLAN_SCHEMA_VERSION)
+            fingerprint = hashlib.sha256(json.dumps({"provider": provider, "model": model, "input": remote_request,
+                    "schema_version": schema_version, "revision": planner_revision},
                     ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-            reservation = self.db.reserve_film_run_planner_request(run["id"], provider, model, fingerprint)
+            reservation = self.db.reserve_film_run_planner_request(run["id"], provider, model, fingerprint,
+                revision=planner_revision, schema_version=schema_version)
             if reservation["status"] == "completed":
                 stored = reservation.get("result") or {}
                 try:
@@ -142,12 +149,12 @@ class FilmRunEngine:
                     provenance = result.provenance if isinstance(result, PlannerResult) else {"provider": "gemini", "model": model}
                     categories = {item["id"]: item["category"] for item in catalog}
                     planned.validate_project_scope(selected_ids, categories)
-                    self.db.complete_film_run_planner_request(run["id"], {"plan": planned.model_dump(mode="json"), "provenance": provenance})
+                    self.db.complete_film_run_planner_request(run["id"], {"plan": planned.model_dump(mode="json"), "provenance": provenance}, revision=planner_revision)
                 except GeminiPlanningError as exc:
-                    self.db.fail_film_run_planner_request(run["id"], exc.code)
+                    self.db.fail_film_run_planner_request(run["id"], exc.code, revision=planner_revision)
                     raise
                 except (PlannerOutputError, ValueError) as exc:
-                    self.db.fail_film_run_planner_request(run["id"], "invalid_output")
+                    self.db.fail_film_run_planner_request(run["id"], "invalid_output", revision=planner_revision)
                     raise PlannerOutputError(f"Gemini returned a StoryPlan that failed project validation: {exc}") from exc
             self._last_planner_provenance = provenance
         elif provider == "local":
