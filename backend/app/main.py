@@ -20,8 +20,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .adapters import verify_video
 from .config import get_settings
-from .db import (Database, MAX_GEMINI_ATTEMPTS_PER_HOUR, MAX_GEMINI_ATTEMPTS_PER_REVISION,
-                 MAX_GEMINI_REVISIONS_PER_RUN)
+from .db import Database, MAX_GEMINI_ATTEMPTS_PER_REVISION
 from .integrations import detect_integrations
 from .film_planner import UnsupportedStory, make_approved_fable_plan, validate_approved_fable
 from .film_orchestrator import FilmOrchestrator, FilmRunConflict, FilmRunTransitionError, STAGES
@@ -189,6 +188,8 @@ class CreateFilmRunRequest(BaseModel):
     initial_confirmation: bool = False
     planner_provider: Literal["gemini", "local"] = "local"
     planner_model: str | None = Field(default=None, min_length=1, max_length=120)
+    planner_response_mode: Literal["schema", "json_only"] = "schema"
+    plan_only: bool = False
     remote_processing_consent: bool = False
 
     @model_validator(mode="after")
@@ -221,6 +222,7 @@ class GeminiReplanRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     planner_model: str = Field(min_length=1, max_length=120)
     idempotency_key: str = Field(min_length=1, max_length=128)
+    response_mode: Literal["schema", "json_only"] = "schema"
     confirm_billable_planning: bool = False
 
 
@@ -1161,18 +1163,17 @@ def _film_run_status(run: dict) -> dict:
         request = db.film_run_planner_request(run["id"], include_result=False)
         run["planner_request"] = ({"status": request["status"], "provider": request["provider"], "model": request["model"],
                                    "revision": request.get("revision", 1), "schema_version": request.get("schema_version", "legacy-unversioned-schema"),
+                                   "response_mode": request.get("response_mode", "schema"),
                                    "attempts": request["attempts"], "remaining_attempts": request.get("remaining_attempts", max(0, 3-request["attempts"])),
-                                   "error_code": request.get("error_code")} if request else None)
+                                   "error_code": request.get("error_code"), "error_details": request.get("error_details")} if request else None)
         history = db.film_run_planner_attempts(run["id"], include_result=False)
         run["planner_attempts"] = [{"revision": item["revision"], "provider": item["provider"], "model": item["model"],
-            "schema_version": item["schema_version"], "status": item["status"], "attempts": item["attempts"],
+            "schema_version": item["schema_version"], "response_mode": item.get("response_mode", "schema"),
+            "status": item["status"], "attempts": item["attempts"],
             "remaining_attempts": item["remaining_attempts"], "error_code": item.get("error_code"),
-            "consent": item.get("consent")} for item in history]
+            "error_details": item.get("error_details"), "consent": item.get("consent")} for item in history]
         run["planner_schema_current"] = STORY_PLAN_SCHEMA_VERSION
-        run["planner_hourly_attempts_used"] = db.gemini_planner_attempts_last_hour()
-        run["planner_revision_limit"] = MAX_GEMINI_REVISIONS_PER_RUN
         run["planner_attempt_limit"] = MAX_GEMINI_ATTEMPTS_PER_REVISION
-        run["planner_hourly_attempt_limit"] = MAX_GEMINI_ATTEMPTS_PER_HOUR
     else:
         run["planner_status"] = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()["status"]
     batch_id = run.get("film_batch_id") or run.get("checkpoint", {}).get("generate_shots", {}).get("film_batch_id")
@@ -1202,11 +1203,11 @@ def create_film_run(project_id: str, request: CreateFilmRunRequest):
         raise HTTPException(400, "Choose a Gemini Flash model returned by the last successful account connection test.")
     preview = preview_film_run(project_id, request)
     free_bytes = preview["available_output_bytes"]
-    if free_bytes < request.budget.max_output_bytes:
+    if not request.plan_only and free_bytes < request.budget.max_output_bytes:
         raise HTTPException(409, f"The approved output storage cap ({request.budget.max_output_bytes} bytes) exceeds current free space ({free_bytes} bytes). Lower the cap or free disk space and re-preview.")
-    if preview["estimated_output_within_cap"] is False:
+    if not request.plan_only and preview["estimated_output_within_cap"] is False:
         raise HTTPException(409, "Measured output-size samples exceed the approved storage cap. Increase the cap or reduce the maximum shot/retry count and re-preview.")
-    if preview["generation_time_within_cap"] is False:
+    if not request.plan_only and preview["generation_time_within_cap"] is False:
         raise HTTPException(409, "The measured time estimate exceeds the approved generation time cap. Increase the cap or reduce the maximum shot/retry count and re-preview.")
     references = []
     for reference_id in request.reference_ids:
@@ -1229,13 +1230,15 @@ def create_film_run(project_id: str, request: CreateFilmRunRequest):
         "reference_categories": [item["category"] for item in references],
         "planner_provider": request.planner_provider,
         "planner_model": (request.planner_model or (gemini_config.get("model") if gemini_config else None)),
+        "planner_response_mode": request.planner_response_mode,
+        "plan_only": request.plan_only,
         "remote_processing_consent": ({"confirmed": True, "provider": "Google Gemini API",
             "fields": ["story prompt", "project style text", "preset and generation budget", "opaque selected-reference IDs and categories"],
             "media_uploaded": False} if request.planner_provider == "gemini" and request.remote_processing_consent else {}),
         "preset": request.preset,
         "budget": request.budget.model_dump(),
         "generation_profile": {"frames": frames, "fps": fps, "width": 448, "height": 768},
-        "authorization": ({"confirmed": True, "scope": "local LTX jobs within the declared shot/time/storage budget; Gemini planning explicitly opted in" if request.planner_provider == "gemini" else "local LTX jobs within the declared shot/time/storage budget"}
+        "authorization": ({"confirmed": True, "scope": ("Gemini story planning only; no LTX generation until separately authorized" if request.plan_only else "local LTX jobs within the declared shot/time/storage budget; Gemini planning explicitly opted in" if request.planner_provider == "gemini" else "local LTX jobs within the declared shot/time/storage budget")}
                           if request.initial_confirmation else {}),
     }
     try:
@@ -1255,7 +1258,7 @@ def create_film_run(project_id: str, request: CreateFilmRunRequest):
     elif not request.initial_confirmation:
         run["message"] = "A dry request was saved. Explicit initial authorization is required before any future planning or generation stage."
     elif request.planner_provider == "gemini":
-        run["message"] = ("The authorized run will use Gemini only for structured story planning; references and generated media remain local." if gemini_state["status"] == "connected"
+        run["message"] = (("Plan Only is authorized: one explicit story-planning action will be attempted; LTX generation still requires a separate confirmation. References and generated media remain local." if request.plan_only else "The authorized run will use Gemini only for structured story planning; references and generated media remain local.") if gemini_state["status"] == "connected"
                           else gemini_state["detail"] + " The run is saved and no shot jobs will be queued until planning succeeds.")
     else:
         run["message"] = ("The authorized request was saved and will be planned locally." if local_state["available"]
@@ -1294,6 +1297,23 @@ def authorize_film_run(run_id: str, request: FilmRunAuthorizationRequest):
     if not request.confirmed or not request.budget_acknowledged:
         raise HTTPException(422, "Explicit confirmation of the run scope and budget is required")
     try:
+        run = film_orchestrator.get(run_id)
+        if (run["status"] == "awaiting_authorization" and run["stage"] == "define_visual_bible" and
+                run.get("request", {}).get("plan_only") and run.get("checkpoint", {}).get("understand_story")):
+            saved = run["request"]
+            preview_request = CreateFilmRunRequest(prompt=run["prompt"], reference_ids=run["reference_ids"],
+                preset=run["preset"], budget=FilmRunBudget.model_validate(run["budget"]),
+                idempotency_key="plan-only-generation-authorization", initial_confirmation=True,
+                planner_provider=saved.get("planner_provider", "local"), planner_model=saved.get("planner_model"),
+                planner_response_mode=saved.get("planner_response_mode", "schema"), plan_only=True,
+                remote_processing_consent=bool(saved.get("remote_processing_consent", {}).get("confirmed")))
+            preview = preview_film_run(run["project_id"], preview_request)
+            if preview["available_output_bytes"] < run["budget"]["max_output_bytes"]:
+                raise HTTPException(409, "The saved generation storage cap exceeds current free space. Lower the cap in a new run or free disk space before authorizing LTX jobs.")
+            if preview["estimated_output_within_cap"] is False:
+                raise HTTPException(409, "Verified output-size samples exceed this run's saved storage cap. Review the cap before authorizing LTX jobs.")
+            if preview["generation_time_within_cap"] is False:
+                raise HTTPException(409, "The measured generation estimate exceeds this run's saved time cap. Review the cap before authorizing LTX jobs.")
         return film_orchestrator.authorize(run_id, request.expected_revision,
                                            {"confirmed": True, "budget_acknowledged": True,
                                             "scope": "local LTX work within the persisted run budget"})
@@ -1329,11 +1349,11 @@ def replan_film_run(run_id: str, request: GeminiReplanRequest):
         separators=(",", ":")).encode("utf-8")).hexdigest()
     consent = {"confirmed": True, "provider": "Google Gemini API", "model": request.planner_model,
         "scope": "Same saved prompt, selected project references, preset, and original authorized generation budget",
-        "cost_disclosure_acknowledged": True, "media_uploaded": False,
+        "cost_disclosure_acknowledged": True, "media_uploaded": False, "response_mode": request.response_mode,
         "fields": ["story prompt", "project style text", "preset and generation budget", "opaque selected-reference IDs and categories"]}
     try:
         updated = film_orchestrator.replan_with_gemini(run_id, request.expected_revision, request.planner_model,
-            request.idempotency_key, scope_hash, STORY_PLAN_SCHEMA_VERSION, consent)
+            request.idempotency_key, scope_hash, STORY_PLAN_SCHEMA_VERSION, request.response_mode, consent)
         return _film_run_status(updated)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc

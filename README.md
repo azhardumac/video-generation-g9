@@ -203,17 +203,22 @@ budgets. The provider schema's scene, per-scene shot, and location caps and the
 response-token ceiling scale with the authorized shot budget. New film runs
 default to a one-shot test budget; users can explicitly choose a larger cap.
 String length constraints remain enforced locally by `StoryPlan`; unsupported
-JSON Schema length keywords are not sent to Gemini. Each planning revision
-allows at most three explicitly authorized attempts; each run allows at most
-three separately tracked model/schema revisions, with at most five Gemini
-attempts per hour. Changing a model or schema in a blocked **Create Film** card
-creates a new revision in SQLite, retaining the previous model, schema, attempt
-count, errors, and usage data. A connection test only verifies the key and
-returns the account model list. It does not test structured-planning
-compatibility. Switching or retrying displays a confirmation before making a
-potentially billable planning request, and still uses the original run
-authorization and generation budget. Returned token usage is saved when
-available; a dollar estimate is not fabricated.
+JSON Schema length keywords are not sent to Gemini. Failed attempts can be
+retried explicitly on the same run. Each revision allows at most three
+attempts, while users can create additional model/schema/response-format
+revisions without a FRAMEWORK hourly cooldown or revision ceiling. Every
+revision remains in the SQLite history; prior counters are never cleared. Google
+account quota and 429 responses still apply. The **Plan Only / Test Planner**
+action saves a strictly validated plan and pauses before LTX; a separate
+confirmation is required before generation. If a model rejects provider-side
+JSON Schema, users can explicitly select JSON-only output, which omits the
+provider schema while preserving the same local `StoryPlan` validation. A
+connection test only verifies the key and returns the account model list; it
+does not test structured-planning compatibility. Each planning action displays
+a confirmation and may incur a charge. Returned token usage is saved when
+available; a dollar estimate is not fabricated. For HTTP 400 responses the UI
+shows only sanitized provider status, reason, and rejected field paths; raw
+provider bodies, prompt text, and credentials are not exposed.
 
 **Create Film** requires an explicit per-run cloud-processing opt-in for Gemini.
 Only prompt and disclosed metadata are sent; all image/video media work remains
