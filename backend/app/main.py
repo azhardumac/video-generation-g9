@@ -25,7 +25,8 @@ from .integrations import detect_integrations
 from .film_planner import UnsupportedStory, make_approved_fable_plan, validate_approved_fable
 from .film_orchestrator import FilmOrchestrator, FilmRunConflict, FilmRunTransitionError, STAGES
 from .story_planning import LocalStoryPlanner
-from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner, STORY_PLAN_SCHEMA_VERSION
+from .gemini_planning import (GeminiPlanningError, GeminiStoryPlanner, STORY_PLAN_SCHEMA_VERSION,
+                              _stored_model_is_text_eligible)
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, GenerationSettings, Preset
@@ -973,11 +974,14 @@ def _gemini_planner_config() -> dict:
     except SecretStoreError as exc:
         return {"status": "storage_error", "source": None, "model": None, "models": [], "detail": str(exc)}
     saved = db.get_setting("story_planner_gemini") or {}
-    models = saved.get("models", []) if key else []
+    cached_models = saved.get("models", []) if key else []
+    models = [model for model in cached_models if isinstance(model, dict) and _stored_model_is_text_eligible(model)]
     if not key:
         status, detail = "missing_key", "Connect your own Gemini API key in Settings; cloud planning stays opt-in per film run."
-    elif saved.get("status") == "connected" and saved.get("models"):
-        status, detail = "connected", "Key was tested and account-listed Flash models are available. Test again if key permissions changed."
+    elif saved.get("status") == "connected" and models:
+        status, detail = "connected", "The account list includes text-output candidates. Listing does not guarantee inference availability; use the explicit endpoint test before planning."
+    elif cached_models and not models:
+        status, detail = "no_text_models", "Previously listed models are not suitable text-output StoryPlan models (for example, TTS/audio, image, embedding, video, or live variants). Refresh the account model list after text-output access is available."
     elif saved.get("status") == "connection_failed":
         status, detail = "connection_failed", {
             "auth_denied": "Gemini rejected the key or account. Check API access and permissions, then test again.",
@@ -986,11 +990,15 @@ def _gemini_planner_config() -> dict:
             "timeout": "The last Gemini connection test timed out. Its result is unknown; test again manually.",
             "model_or_endpoint_incompatible": "Gemini returned 404 during the last connection test. Confirm the API is enabled for this account, then retest and choose a Flash model supporting generateContent.",
         }.get(saved.get("error_code"), "The last Gemini connection test failed. Recheck the key and account model access, then test again.")
-    elif saved.get("status") == "no_flash_models":
-        status, detail = "no_flash_models", "The key was accepted, but this account returned no Flash-class models available to FRAMEWORK. Check account model access."
+    elif saved.get("status") == "no_text_models":
+        status, detail = "no_text_models", "The key was accepted, but the account returned no text-output Flash model suitable for story planning. TTS/audio, image, embedding, video, and live variants are excluded."
     else:
         status, detail = "configured_not_tested", "A backend-only Gemini key is configured. Test the connection to list account-available Flash models."
-    model = saved.get("model") if any(item.get("id") == saved.get("model") for item in models) else None
+    eligible_ids = {item.get("id") for item in models}
+    model = saved.get("model") if saved.get("model") in eligible_ids else (models[0]["id"] if models else None)
+    if saved.get("model") and saved.get("model") not in eligible_ids and models:
+        detail = (f"Previously selected model {saved['model']} is not eligible for text story output. "
+                  f"FRAMEWORK selected the first account-listed text-output candidate, {model}; run the explicit endpoint test before planning.")
     return {"status": status, "source": source, "model": model, "models": models, "detail": detail}
 
 
@@ -1075,9 +1083,9 @@ def test_gemini_connection():
         raise HTTPException(502 if exc.code == "service_unavailable" else 401 if exc.code == "auth_denied" else 400,
                             {"code": exc.code, "message": str(exc)}) from None
     if not models:
-        db.put_setting("story_planner_gemini", {"status": "no_flash_models", "models": [], "model": None,
+        db.put_setting("story_planner_gemini", {"status": "no_text_models", "models": [], "model": None,
                                                   "last_connection_test_at": now, "connection_test_times": recent_tests})
-        raise HTTPException(409, "The connected account returned no Gemini Flash model that supports generateContent. Check account model access and test the connection again.")
+        raise HTTPException(409, "The account key was accepted, but no text-output Flash model suitable for story planning was listed. TTS/audio, image, embedding, video, and live variants are excluded.")
     ids = {item["id"] for item in models}
     selected = saved.get("model") if saved.get("model") in ids else models[0]["id"]
     db.put_setting("story_planner_gemini", {"status": "connected", "models": models, "model": selected,
@@ -1107,7 +1115,8 @@ def test_gemini_generation_endpoint(payload: GeminiGenerationEndpointProbeReques
         return GeminiStoryPlanner(key, payload.model, settings.gemini_timeout_seconds).test_generation_endpoint()
     except GeminiPlanningError as exc:
         http_status = exc.diagnostics.get("http_status")
-        response_status = 502 if isinstance(http_status, int) and http_status >= 500 else 400
+        response_status = (502 if isinstance(http_status, int) and http_status >= 500 else
+                           422 if exc.code in {"non_text_response", "no_text_response"} else 400)
         raise HTTPException(response_status, {"code": exc.code, "message": str(exc),
                                                "diagnostics": exc.diagnostics}) from None
 

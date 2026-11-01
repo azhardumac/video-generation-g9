@@ -49,10 +49,14 @@ class FakeGenerateContentModels:
 
     def list(self):
         return [
-            {"name": "models/gemini-2.5-flash", "display_name": "Gemini Flash", "supportedActions": ["generateContent"]},
+            {"name": "models/gemini-2.5-flash", "display_name": "Gemini Flash", "supportedActions": ["generateContent"], "outputModalities": ["TEXT"]},
             {"name": "models/gemini-pro", "display_name": "Gemini Pro", "supportedActions": ["generateContent"]},
             {"name": "models/gemini-3.8-flash", "display_name": "Gemini 3.8 Flash", "supportedActions": ["generateContent"]},
-            {"name": "models/gemini-2.5-flash-image", "display_name": "Flash Image", "supportedActions": ["generateContent"]},
+            {"name": "models/gemini-3.8-flash-lite-tts", "display_name": "Flash-Lite TTS", "supportedActions": ["generateContent"], "outputModalities": ["AUDIO"]},
+            {"name": "models/gemini-2.5-flash-image", "display_name": "Flash Image", "supportedActions": ["generateContent"], "outputModalities": ["TEXT", "IMAGE"]},
+            {"name": "models/gemini-2.5-flash-audio", "display_name": "Flash Audio", "supportedActions": ["generateContent"], "outputModalities": ["AUDIO"]},
+            {"name": "models/gemini-2.5-flash-embed", "display_name": "Flash Embed", "supportedActions": ["generateContent"]},
+            {"name": "models/gemini-2.5-flash-live", "display_name": "Flash Live", "supportedActions": ["generateContent"]},
             {"name": "models/gemini-2.5-flash-preview-interactions", "display_name": "Interactions only", "supportedActions": ["interactions"]},
         ]
 
@@ -88,9 +92,32 @@ def make_planner(client, *, model="gemini-3.8-flash"):
 
 
 def test_account_model_selection_is_limited_to_flash_models_returned_by_account():
+    from app.gemini_planning import _stored_model_is_text_eligible
+
     client = FakeClient([])
     models = GeminiStoryPlanner("test-key", None, client_factory=lambda *_: client).test_connection()
     assert [item["id"] for item in models] == ["gemini-2.5-flash", "gemini-3.8-flash"]
+    assert models[0]["output_modalities"] == ["TEXT"]
+    assert models[0]["text_output_source"] == "output_modalities"
+    assert models[1]["text_output_source"] == "name_fallback"
+    assert _stored_model_is_text_eligible(models[1])
+
+
+def test_model_output_modalities_override_name_fallback_and_unsuitable_names_are_excluded():
+    from app.gemini_planning import _text_output_eligibility
+
+    client = FakeClient([])
+    client.models.list = lambda: [
+        {"name": "models/gemini-3.8-flash", "displayName": "Flash", "supportedGenerationMethods": ["generateContent"], "output_modalities": ["AUDIO"]},
+        {"name": "models/gemini-3.8-flash-lite-tts", "displayName": "Flash TTS", "supportedGenerationMethods": ["generateContent"], "output_modalities": ["TEXT"]},
+        {"name": "models/gemini-2.5-flash", "displayName": "Flash", "supportedGenerationMethods": ["generateContent"], "supportedOutputModalities": ["TEXT"]},
+        {"name": "models/gemini-2.5-flash-image", "displayName": "Image Flash", "supportedGenerationMethods": ["generateContent"]},
+    ]
+    models = GeminiStoryPlanner("test-key", None, client_factory=lambda *_: client).test_connection()
+    assert [item["id"] for item in models] == ["gemini-2.5-flash"]
+    assert models[0]["text_output_source"] == "output_modalities"
+    assert _text_output_eligibility("gemini-3.8-flash", ("TEXT",))[0]
+    assert not _text_output_eligibility("gemini-3.8-flash-tts", ("TEXT",))[0]
 
 
 def test_structured_plan_uses_supported_schema_and_always_validates_with_storyplan():
@@ -193,6 +220,45 @@ def test_generation_endpoint_probe_surfaces_sanitized_404_route_diagnostics():
     assert "schema settings were not sent" in str(missing.value)
     assert "PRIVATE_BODY" not in str(missing.value)
     assert "not-a-real-test-secret" not in str(missing.value)
+    assert len(client.models.calls) == 1
+
+
+def test_endpoint_probe_classifies_503_as_transient_without_automatic_retry():
+    client = FakeClient([FakeAPIError(503, {"error": {"code": 503, "status": "UNAVAILABLE"}}),
+                         response("should not be requested automatically")])
+    client._api_client = SimpleNamespace(_http_options=SimpleNamespace(
+        api_version="v1beta", base_url="https://generativelanguage.googleapis.com/"))
+    with pytest.raises(GeminiPlanningError) as unavailable:
+        make_planner(client, model="gemini-3.8-flash").test_generation_endpoint()
+    assert unavailable.value.code == "service_unavailable"
+    assert unavailable.value.diagnostics["http_status"] == 503
+    assert unavailable.value.diagnostics["category"] == "transient_provider_service"
+    assert unavailable.value.diagnostics["endpoint_path"] == "/v1beta/models/gemini-3.8-flash:generateContent"
+    assert "does not indicate a schema or model-access failure" in str(unavailable.value)
+    assert "explicitly repeat" in str(unavailable.value)
+    assert len(client.models.calls) == 1
+
+
+def test_endpoint_probe_reports_successful_audio_response_as_modality_mismatch():
+    class AudioOnlyResponse:
+        candidates = [SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(
+            inline_data=SimpleNamespace(mime_type="audio/wav", data="private-audio-payload"))]))]
+
+        @property
+        def text(self):
+            raise ValueError("No text part in audio response")
+
+    client = FakeClient([AudioOnlyResponse()])
+    client._api_client = SimpleNamespace(_http_options=SimpleNamespace(
+        api_version="v1beta", base_url="https://generativelanguage.googleapis.com/"))
+    with pytest.raises(GeminiPlanningError) as audio:
+        make_planner(client, model="gemini-3.8-flash-lite-tts").test_generation_endpoint()
+    assert audio.value.code == "non_text_response"
+    assert audio.value.diagnostics["http_status"] == 200
+    assert audio.value.diagnostics["output_modalities"] == ["AUDIO"]
+    assert audio.value.diagnostics["category"] == "unsupported_response_modality"
+    assert "successful audio response" in str(audio.value)
+    assert "private-audio-payload" not in str(audio.value)
     assert len(client.models.calls) == 1
 
 
