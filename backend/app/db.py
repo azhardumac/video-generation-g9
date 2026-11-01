@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -424,10 +425,39 @@ class Database:
         }
         shot_settings = payload.get("shot_settings", payload if "id" in payload else {})
         for key in ("style_context", "style_bible_revision", "width", "height", "fps", "output_location", "framing"):
-            value = shot_settings.get(key, payload.get(key, nested.get(key)))
+            # A storyboard shot is hydrated with the *current* project style bible
+            # for editing. Its generation payload is the immutable record of the
+            # style text actually authorized for that shot. Do not compare a job
+            # against mutable project metadata when that captured value exists.
+            if key == "style_context" and "id" in payload and key in nested:
+                value = nested[key]
+            elif key == "style_bible_revision" and "id" in payload and "reviewed_style_revision" in payload:
+                value = payload.get("reviewed_style_revision")
+            else:
+                value = shot_settings.get(key, payload.get(key, nested.get(key)))
             if value is not None and value != "" and not (key == "style_bible_revision" and value == 0):
                 snapshot[key] = value
         return snapshot
+
+    @staticmethod
+    def generation_settings_mismatches(expected: dict, actual: dict) -> list[str]:
+        """Return safe field names whose generation settings differ.
+
+        Values are intentionally not returned: prompts and local paths can be
+        private. Empty strings and null references are equivalent, and output
+        paths are compared lexically after expanding `~` and normalizing `.`.
+        """
+        def canonical(key: str, value):
+            if key in {"style_context"} and isinstance(value, str):
+                return value.strip()
+            if key == "reference_image" and not value:
+                return None
+            if key == "output_location" and isinstance(value, str):
+                return os.path.normpath(os.path.expanduser(value))
+            return value
+
+        return [key for key, value in expected.items()
+                if key not in actual or canonical(key, actual[key]) != canonical(key, value)]
 
     def get_job(self, job_id: str):
         with self.connect() as db:
@@ -733,7 +763,7 @@ class Database:
                                (storyboard_id,)).fetchone()
             if not story or story["project_id"] != project_id or story["revision"] != expected_storyboard_revision:
                 raise RuntimeError("Storyboard changed before the review was saved; refresh and compare the current clip")
-            shot = db.execute("SELECT id FROM storyboard_shots WHERE id=? AND storyboard_id=? AND deleted_at IS NULL",
+            shot = db.execute("SELECT * FROM storyboard_shots WHERE id=? AND storyboard_id=? AND deleted_at IS NULL",
                               (shot_id, storyboard_id)).fetchone()
             if not shot:
                 raise KeyError("Shot is not part of this film run")
@@ -748,6 +778,16 @@ class Database:
                     verified = False
             if not verified:
                 raise RuntimeError("Creative review requires this shot's current technically verified generation job")
+            linked = db.execute("SELECT settings_snapshot FROM shot_jobs WHERE shot_id=? AND job_id=?", (shot_id, job_id)).fetchone()
+            if not linked:
+                raise RuntimeError("Creative review requires a job linked to this storyboard shot")
+            try:
+                expected_settings = json.loads(linked["settings_snapshot"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                expected_settings = {}
+            mismatches = self.generation_settings_mismatches(expected_settings, self.generation_settings_snapshot(dict(shot)))
+            if mismatches:
+                raise RuntimeError("Creative review is blocked because generation settings differ: " + ", ".join(mismatches))
             db.execute("INSERT INTO film_run_shot_reviews(id,project_id,run_id,storyboard_id,shot_id,job_id,run_revision,"
                        "storyboard_revision,decision,notes,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                        (review_id, project_id, run_id, storyboard_id, shot_id, job_id, expected_run_revision,
@@ -1699,8 +1739,9 @@ class Database:
                         if key not in snapshot and current_settings.get(key) == value:
                             snapshot[key] = value
                     candidate["settings_snapshot"] = snapshot or payload_snapshot
-                    candidate["settings_match"] = all(key in current_settings and current_settings[key] == value
-                                                       for key, value in candidate["settings_snapshot"].items())
+                    candidate["settings_mismatches"] = self.generation_settings_mismatches(
+                        candidate["settings_snapshot"], current_settings)
+                    candidate["settings_match"] = not candidate["settings_mismatches"]
                     verified = (candidate["status"] == "completed" and candidate["exit_code"] == 0 and
                                 bool((candidate.get("verification_metadata") or {}).get("verified_output")) and
                                 bool(candidate.get("result_path")) and Path(candidate["result_path"]).is_file())

@@ -826,6 +826,8 @@ def test_generic_gemini_run_review_uses_authoritative_job_when_batch_job_and_sho
     project_id = f"generic-review-project-{uuid4().hex}"
     project = api.db.create_project({"id":project_id,"name":"Fox film","root":str(root),
         "aspect_ratio":"9:16","frame_rate":24,"production_type":"short"})
+    api.db.update_project_style_bible(project_id, {"material":"Handmade felt puppet finish"})
+    captured_style_context = "Material and finish: Handmade felt puppet finish"
     prompt = "A fox discovers a lantern at dawn and carries it back to a sleepy village."
     request = {"prompt":prompt,"reference_ids":[],"preset":"Short",
         "budget":{"max_shots":1,"max_retries_per_shot":1,"max_generation_seconds":3600,"max_output_bytes":8*1024**3},
@@ -841,7 +843,8 @@ def test_generic_gemini_run_review_uses_authoritative_job_when_batch_job_and_sho
         "generation_payload":{"prompt":"A small red fox finds a brass lantern in the dawn grass.",
             "shot_prompt":"A small red fox finds a brass lantern in the dawn grass.","reference_image":None,
             "seed":37,"preset":"Short","width":448,"height":768,"fps":24,"frames":49,
-            "output_location":output,"shot_settings":{"width":448,"height":768,"fps":24,
+            "output_location":output,"style_context":captured_style_context,"style_bible_revision":1,
+            "shot_settings":{"width":448,"height":768,"fps":24,
                 "output_location":output,"framing":"Medium close-up"}}}
     generic_metadata = {"planner_mode":"gemini","planner_provenance":{"provider":"gemini","model":"gemini-3.5-flash-lite"},
         "story_plan":{"title":"Sunrise on the Hill","characters":[{"name":"Fox"}],"scenes":[]},
@@ -857,6 +860,9 @@ def test_generic_gemini_run_review_uses_authoritative_job_when_batch_job_and_sho
     clip.write_bytes(b"verified Gemini storyboard fixture; no inference")
     assert api.db.complete_job(job["id"],progress=100,result_path=str(clip),exit_code=0,
         verification_metadata={"verified_output":{"width":448,"height":768,"fps":24,"frames":49}})
+    # Project style metadata changed after generation; the shot payload remains
+    # the immutable record of what the renderer actually received.
+    api.db.update_project_style_bible(project_id, {})
 
     # Reproduce the persisted mismatch: a completed batch slot has no job_id/job,
     # while the storyboard's shot_jobs association still points to the verified MP4.
@@ -892,10 +898,34 @@ def test_generic_gemini_run_review_uses_authoritative_job_when_batch_job_and_sho
     assert len(review_page["shots"]) == 1
     item = review_page["shots"][0]
     assert item["verified"] is True and item["prompt"].startswith("A small red fox")
+    assert item["playable"] is True and item["settings_mismatches"] == []
     assert item["framing"] == "Medium close-up" and item["characters"] == ["Fox"]
     assert item["expected_character_count"] == 1 and item["references"] == []
     assert Path(item["job"]["result_path"]).resolve() == clip.resolve()
     assert "scenes" not in generic_metadata and "expected_workload" not in generic_metadata
+
+    # Material shot edits block creative review, but never hide the existing
+    # technically verified file. Eligibility refresh recomputes current state.
+    with api.db.connect() as conn:
+        conn.execute("UPDATE storyboard_shots SET prompt=? WHERE id=?", ("A different fox prompt", shot["id"]))
+    stale = api.get_film_run_review(project_id,run["id"])["shots"][0]
+    assert stale["verified"] is False and stale["playable"] is True
+    assert stale["settings_mismatches"] == ["prompt"]
+    assert Path(stale["job"]["result_path"]).resolve() == clip.resolve()
+    with pytest.raises(RuntimeError, match="generation settings differ: prompt"):
+        api.db.add_film_run_shot_review(project_id=project_id,run_id=run["id"],storyboard_id=story["id"],
+            shot_id=shot["id"],job_id=job["id"],expected_run_revision=needs_review["revision"],
+            expected_storyboard_revision=story["revision"],decision="approved",notes="Stale settings")
+    with pytest.raises(HTTPException, match="prompt") as blocked_review:
+        api.review_film_run_shot(project_id,run["id"],shot["id"],api.FilmRunShotReviewRequest(
+            expected_run_revision=needs_review["revision"],expected_storyboard_revision=story["revision"],
+            job_id=job["id"],decision="approved",notes="Do not approve stale settings"))
+    assert blocked_review.value.status_code == 409
+    with api.db.connect() as conn:
+        conn.execute("UPDATE storyboard_shots SET prompt=? WHERE id=?", (shot["prompt"], shot["id"]))
+    refreshed = api.recheck_film_run_shot_eligibility(project_id,run["id"],shot["id"])["shots"][0]
+    assert refreshed["verified"] is True and refreshed["playable"] is True
+    assert refreshed["settings_mismatches"] == []
 
     approved = api.review_film_run_shot(project_id,run["id"],shot["id"],api.FilmRunShotReviewRequest(
         expected_run_revision=needs_review["revision"],expected_storyboard_revision=story["revision"],
@@ -936,3 +966,10 @@ def test_generic_gemini_run_review_uses_authoritative_job_when_batch_job_and_sho
     assert blocked["verified"] is False
     assert blocked["job"] is None
     assert "saved video is missing" in blocked["reviewability_reason"]
+
+
+def test_generation_settings_compare_serialized_defaults_and_style_payload_safely():
+    assert api.db.generation_settings_mismatches(
+        {"reference_image":None,"style_context":"  felt puppet  ","output_location":"/tmp/outputs/./fox"},
+        {"reference_image":"","style_context":"felt puppet","output_location":"/tmp/outputs/fox"},
+    ) == []
