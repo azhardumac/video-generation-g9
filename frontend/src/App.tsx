@@ -11,7 +11,7 @@ import CreateFilmPage from './CreateFilmPage'
 import GeminiConnectionPanel from './GeminiConnectionPanel'
 import FilmRunReviewPage from './FilmRunReviewPage'
 import ErrorBoundary from './ErrorBoundary'
-import { filmRunReviewTarget, type FilmRunReviewTarget } from './filmRunReviewNavigation'
+import { activateFilmRunReview, type FilmRunReviewTarget } from './filmRunReviewNavigation'
 
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
 type Asset = { id: string; category: string; relative_path: string; path: string; name: string; size_bytes: number; mime_type: string }
@@ -145,6 +145,11 @@ export default function App() {
     setActive(label)
   }
 
+  function openFilmRunReview(runId:string,shotId:string){
+    if(!activeProject){setNotice('Select the film run project before opening clip review.');return}
+    activateFilmRunReview(activeProject.id,runId,shotId,setReviewTarget,setActive)
+  }
+
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><div className="brand-mark"><Aperture size={20}/></div><div><strong>FRAMEWORK</strong><span>AI VIDEO STUDIO</span></div></div>
@@ -158,7 +163,7 @@ export default function App() {
         <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> {dateLabel}</div><h1>{active === 'Overview' ? activeProject?.name??'Local video studio' : active}</h1><p className="subtitle">{active === 'Overview' ? activeProject?.description||'Create or select a project to start planning.' : 'A local-first production workspace.'}</p></div>{activeProject&&<button className="button primary" onClick={() => navigate('Generate video')}><Plus size={16}/> New generation</button>}</div>
         {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={14}/></button></div>}
         <ErrorBoundary key={`${active}:${errorBoundaryRevision}`} onReset={()=>{setReviewTarget(null);setActive('Create Film');setErrorBoundaryRevision(value=>value+1)}}>
-        {active === 'Create Film' && <CreateFilmPage project={activeProject} presets={presets} onMessage={setNotice} onNavigate={navigate} onReview={(runId,shotId)=>{if(activeProject){setReviewTarget(filmRunReviewTarget(activeProject.id,runId,shotId));setActive('Clip review')}}}/>}
+        {active === 'Create Film' && <CreateFilmPage project={activeProject} presets={presets} onMessage={setNotice} onNavigate={navigate} onReview={openFilmRunReview}/>}
         {active === 'Clip review' && <FilmRunReviewPage target={reviewTarget} onBack={()=>setActive('Create Film')} onContinueExport={storyboardId=>{setExportStoryboardId(storyboardId);setActive('Export / Remotion')}}/>}
         {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onSaved={()=>activeProject?loadProjectSettings(activeProject.id):Promise.resolve()} onRecheck={recheckLocalStatus} onMessage={setNotice} integrations={integrations} resources={resources} projectId={activeProject?.id??null}/>}
         {active === 'Setup' && <SetupPage onMessage={setNotice} onContinue={()=>setActive('Overview')}/>}
@@ -169,7 +174,7 @@ export default function App() {
         {active === 'Style bible' && <StyleBiblePage projectId={activeProject?.id??null} onMessage={setNotice}/>}
         {active === 'Scene continuity' && <SceneContinuityPage projectId={activeProject?.id??null} onMessage={setNotice}/>}
         {active === 'Storyboard' && <StoryboardPage projectId={activeProject?.id??null} project={activeProject} assets={assets} jobs={jobs} ltxReady={Boolean(integrations?.ltx.ready)} onMessage={setNotice} onDirtyChange={setUnsavedStoryboard}/>}
-        {(active === 'Story to Film' || active === 'Export / Remotion') && <FilmPlanPage projectId={activeProject?.id??null} projectName={activeProject?.name??''} onMessage={setNotice} onNavigate={navigate} focusExport={active === 'Export / Remotion'} initialStoryboardId={active==='Export / Remotion'?exportStoryboardId:null}/>}
+        {(active === 'Story to Film' || active === 'Export / Remotion') && <FilmPlanPage projectId={activeProject?.id??null} projectName={activeProject?.name??''} onMessage={setNotice} onNavigate={navigate} onReview={openFilmRunReview} focusExport={active === 'Export / Remotion'} initialStoryboardId={active==='Export / Remotion'?exportStoryboardId:null}/>}
         <div hidden={active !== 'Overview' && active !== 'Generate video'}>
         <section className="stats-grid"><Stat icon={<Film size={16}/>} label="TOTAL GENERATIONS" value={String(jobs.filter(j=>j.kind==='generation').length).padStart(2,'0')} delta="Selected project"/><Stat icon={<LoaderCircle size={16}/>} label="IN THE QUEUE" value={String(jobs.filter(j=>j.status==='queued'||j.status==='running').length).padStart(2,'0')} delta={running ? `${running} running now` : 'No active jobs'} accent/><Stat icon={<Check size={16}/>} label="COMPLETED GENERATIONS" value={String(jobs.filter(j=>j.kind==='generation'&&j.status==='completed').length).padStart(2,'0')} delta="Selected project"/><Stat icon={<HardDrive size={16}/>} label="OUTPUT DESTINATION" value={outputPath||'Configured default'} delta="Local path"/></section>
         <div className="content-grid">
