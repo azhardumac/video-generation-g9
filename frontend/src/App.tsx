@@ -11,7 +11,7 @@ import CreateFilmPage from './CreateFilmPage'
 import GeminiConnectionPanel from './GeminiConnectionPanel'
 import FilmRunReviewPage from './FilmRunReviewPage'
 import ErrorBoundary from './ErrorBoundary'
-import { activateFilmRunReview, type FilmRunReviewTarget } from './filmRunReviewNavigation'
+import { filmRunReviewTarget, type FilmRunReviewTarget } from './filmRunReviewNavigation'
 
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
 type Asset = { id: string; category: string; relative_path: string; path: string; name: string; size_bytes: number; mime_type: string }
@@ -20,9 +20,8 @@ type Job = { id: string; kind?:string; status: string; progress: number; payload
 type Integration = { ltx: { root: string; installed: boolean; runner: string; runner_available: boolean; model: string; hf_home: string; cache_available: boolean; weights_cached: boolean; ready: boolean }; remotion: { root: string; installed: boolean; cli: string; cli_available: boolean; version: string | null; ready: boolean }; story_project: { root: string; available: boolean }; ffprobe: { available: boolean; path: string | null } }
 type Resources = { disk_free_bytes: number; memory: { total_bytes: number | null; available_bytes: number | null }; swap: { total_bytes: number | null; used_bytes: number | null }; memory_pressure: { free_percent: number; level: string } | null; warnings:string[] }
 const nav = [
-  { group: 'STUDIO', items: [['Create Film', WandSparkles], ['Overview', LayoutDashboard], ['Projects', FolderOpen], ['Storyboard', ListVideo], ['Story to Film', Film], ['Scene continuity', ShieldCheck], ['Export / Remotion', Film], ['References', Image], ['Style bible', BookOpen]] },
-  { group: 'PRODUCTION', items: [['Generate video', WandSparkles], ['Job queue', Gauge], ['History & logs', History]] },
-  { group: 'WORKSPACE', items: [['Setup', Download], ['Settings', Settings]] },
+  { group: 'STUDIO', items: [['Create Film', WandSparkles], ['Overview', LayoutDashboard], ['Projects', FolderOpen], ['References', Image]] },
+  { group: 'ADVANCED', items: [['Storyboard', ListVideo], ['Story to Film', Film], ['Scene continuity', ShieldCheck], ['Export / Remotion', Film], ['Generate video', WandSparkles], ['Job queue', Gauge], ['History & logs', History], ['Style bible', BookOpen], ['Setup', Download], ['Settings', Settings]] },
 ] as const
 const dateLabel = new Intl.DateTimeFormat('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }).format(new Date()).toUpperCase()
 const jobTitle = (job:Job) => job.payload.job_label || (job.kind === 'render' ? `Remotion render · ${job.payload.composition_id || 'storyboard composition'}` : job.payload.prompt || 'Untitled generation')
@@ -147,7 +146,8 @@ export default function App() {
 
   function openFilmRunReview(runId:string,shotId:string){
     if(!activeProject){setNotice('Select the film run project before opening clip review.');return}
-    activateFilmRunReview(activeProject.id,runId,shotId,setReviewTarget,setActive)
+    setReviewTarget(filmRunReviewTarget(activeProject.id,runId,shotId))
+    setActive('Create Film')
   }
 
   return <div className="app-shell">
@@ -160,11 +160,11 @@ export default function App() {
     <main className="main-content">
       <header className="topbar"><div className="breadcrumbs"><span>{activeProject?.name??'No project selected'}</span><span className="slash">/</span><b>{active}</b></div><div className="top-actions"><div className="local-indicator"><span className={`status-dot ${connected ? 'online' : ''}`}/>{connected ? 'Local mode' : 'API disconnected'}</div><span className="top-divider"/><span>{activeProject?'Project data stays local':'Select a project to begin'}</span></div></header>
       <div className="page-scroll"><div className="page-container">
-        <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> {dateLabel}</div><h1>{active === 'Overview' ? activeProject?.name??'Local video studio' : active}</h1><p className="subtitle">{active === 'Overview' ? activeProject?.description||'Create or select a project to start planning.' : 'A local-first production workspace.'}</p></div>{activeProject&&<button className="button primary" onClick={() => navigate('Generate video')}><Plus size={16}/> New generation</button>}</div>
+        <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> {dateLabel}</div><h1>{active === 'Overview' ? activeProject?.name??'Local video studio' : active}</h1><p className="subtitle">{active === 'Overview' ? activeProject?.description||'Create or select a project to start planning.' : 'A local-first production workspace.'}</p></div>{activeProject&&active!=='Create Film'&&<button className="button secondary" onClick={() => navigate('Create Film')}><WandSparkles size={16}/> Continue in Create Film</button>}</div>
         {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={14}/></button></div>}
         <ErrorBoundary key={`${active}:${errorBoundaryRevision}`} onReset={()=>{setReviewTarget(null);setActive('Create Film');setErrorBoundaryRevision(value=>value+1)}}>
-        {active === 'Create Film' && <CreateFilmPage project={activeProject} presets={presets} onMessage={setNotice} onNavigate={navigate} onReview={openFilmRunReview}/>}
-        {active === 'Clip review' && <FilmRunReviewPage target={reviewTarget} onBack={()=>setActive('Create Film')} onContinueExport={storyboardId=>{setExportStoryboardId(storyboardId);setActive('Export / Remotion')}}/>}
+        {active === 'Create Film' && <CreateFilmPage project={activeProject} presets={presets} onMessage={setNotice} onNavigate={navigate} onReview={openFilmRunReview} reviewTarget={reviewTarget} onCloseReview={()=>setReviewTarget(null)}/>}
+        {active === 'Clip review' && <FilmRunReviewPage target={reviewTarget} onBack={()=>setActive('Create Film')} onContinueExport={()=>setActive('Create Film')}/>}
         {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onSaved={()=>activeProject?loadProjectSettings(activeProject.id):Promise.resolve()} onRecheck={recheckLocalStatus} onMessage={setNotice} integrations={integrations} resources={resources} projectId={activeProject?.id??null}/>}
         {active === 'Setup' && <SetupPage onMessage={setNotice} onContinue={()=>setActive('Overview')}/>}
         {active === 'Job queue' && <JobsPage title="Local job queue" jobs={jobs.filter(j=>j.status==='queued'||j.status==='running'||j.status==='failed')} onChanged={refresh} onMessage={setNotice}/>}

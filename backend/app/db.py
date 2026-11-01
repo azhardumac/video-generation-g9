@@ -1629,6 +1629,84 @@ class Database:
                 raise RuntimeError("Film batch is no longer in a state that supports this action")
         return self.get_film_batch(batch_id)
 
+    def reconcile_film_run_shots(self, *, run_id: str, project_id: str, storyboard_id: str,
+                                 expected_run_revision: int, expected_storyboard_revision: int,
+                                 canonical_jobs: dict[str, str]):
+        """Idempotently record already-reviewed, verified run outputs as composition sources."""
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = db.execute("SELECT project_id,storyboard_id,revision,status,archived_at FROM film_runs WHERE id=?", (run_id,)).fetchone()
+            if not run or run["project_id"] != project_id or run["storyboard_id"] != storyboard_id or run["archived_at"]:
+                raise KeyError("Film run is not available in this project")
+            if run["revision"] != expected_run_revision or run["status"] not in {"needs_review", "completed"}:
+                raise RuntimeError("Film run changed or is no longer awaiting creative review; refresh before preparing the film")
+            story = db.execute("SELECT revision,project_id FROM storyboards WHERE id=? AND archived_at IS NULL", (storyboard_id,)).fetchone()
+            if not story or story["project_id"] != project_id or story["revision"] != expected_storyboard_revision:
+                raise RuntimeError("Storyboard changed before preparation; refresh and review its current revision")
+            shots = {row["id"]: dict(row) for row in db.execute(
+                "SELECT * FROM storyboard_shots WHERE storyboard_id=? AND deleted_at IS NULL", (storyboard_id,))}
+            if not shots or set(canonical_jobs) != set(shots):
+                raise RuntimeError("Every current storyboard shot must have one eligible generation output")
+
+            changed = False
+            for shot_id, job_id in canonical_jobs.items():
+                shot = shots[shot_id]
+                job_row = db.execute("SELECT kind,project_id,status,exit_code,payload,verification_metadata FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if not job_row or job_row["kind"] != "generation" or job_row["project_id"] != project_id or job_row["status"] != "completed" or job_row["exit_code"] != 0:
+                    raise RuntimeError("A selected shot job is no longer a completed successful generation in this project")
+                payload = json.loads(job_row["payload"] or "{}")
+                if payload.get("shot_id") not in (None, shot_id) or payload.get("storyboard_id") not in (None, storyboard_id):
+                    raise RuntimeError("A selected generation job is associated with a different shot or storyboard")
+                metadata = json.loads(job_row["verification_metadata"] or "{}")
+                verified_output = metadata.get("verified_output")
+                if not isinstance(verified_output, dict):
+                    raise RuntimeError("A selected generation job has no recorded ffprobe verification")
+
+                generation_payload = json.loads(shot.get("generation_payload_json") or "{}")
+                expected_output = {"width": generation_payload.get("width") or shot.get("width"),
+                    "height": generation_payload.get("height") or shot.get("height"),
+                    "fps": generation_payload.get("fps") or shot.get("fps"),
+                    "frames": generation_payload.get("frames") or generation_payload.get("duration_frames")}
+                if any(not isinstance(expected_output[key], int) or expected_output[key] <= 0 or verified_output.get(key) != expected_output[key]
+                       for key in expected_output):
+                    raise RuntimeError("A selected generation job's ffprobe metadata no longer matches the saved shot dimensions and duration")
+
+                linked = db.execute("SELECT settings_snapshot FROM shot_jobs WHERE shot_id=? AND job_id=?", (shot_id, job_id)).fetchone()
+                if not linked:
+                    elsewhere = db.execute("SELECT shot_id FROM shot_jobs WHERE job_id=?", (job_id,)).fetchone()
+                    if elsewhere:
+                        raise RuntimeError("A selected generation job is already linked to another storyboard shot")
+                    snapshot = self.generation_settings_snapshot(payload)
+                    db.execute("INSERT INTO shot_jobs(shot_id,job_id,settings_snapshot,created_at) VALUES(?,?,?,?)",
+                               (shot_id, job_id, json.dumps(snapshot, ensure_ascii=False, sort_keys=True), timestamp))
+                    changed = True
+                else:
+                    try:
+                        snapshot = json.loads(linked["settings_snapshot"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        snapshot = {}
+                    if not snapshot:
+                        snapshot = self.generation_settings_snapshot(payload)
+                if not snapshot:
+                    raise RuntimeError("A selected generation job has no usable settings snapshot")
+                current_settings = self.generation_settings_snapshot(shot)
+                if self.generation_settings_mismatches(snapshot, current_settings):
+                    raise RuntimeError("A selected shot no longer matches its generation settings")
+
+                review = db.execute("SELECT decision,run_revision,storyboard_revision,job_id FROM film_run_shot_reviews "
+                    "WHERE run_id=? AND shot_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (run_id, shot_id)).fetchone()
+                if (not review or review["decision"] != "approved" or review["run_revision"] != expected_run_revision or
+                        review["storyboard_revision"] != expected_storyboard_revision or review["job_id"] != job_id):
+                    raise RuntimeError("Every selected clip needs current creative approval for this exact run, shot, and generation job")
+                if shot.get("reconciled_job_id") != job_id:
+                    db.execute("UPDATE storyboard_shots SET reconciled_job_id=?,updated_at=? WHERE id=? AND storyboard_id=?",
+                               (job_id, timestamp, shot_id, storyboard_id))
+                    changed = True
+            if changed:
+                db.execute("UPDATE storyboards SET manifest_json=NULL,manifest_path=NULL,updated_at=? WHERE id=?", (timestamp, storyboard_id))
+        return {"storyboard": self.get_storyboard(storyboard_id, include_events=False), "reconciled_shots": len(canonical_jobs), "changed": changed}
+
     def cancel_film_batch(self, batch_id: str):
         with self.lock, self.connect() as db:
             row = db.execute("SELECT status FROM film_batches WHERE id=?", (batch_id,)).fetchone()
