@@ -3,7 +3,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.gemini_planning import (MAX_OUTPUT_TOKENS, GeminiPlanningError, GeminiStoryPlanner,
-                                 _output_token_limit, gemini_story_schema)
+                                 ENDPOINT_PROBE_MAX_OUTPUT_TOKENS, _output_token_limit,
+                                 gemini_story_schema)
 from app.story_planning import PlannerOutputError, StoryPlan
 
 
@@ -73,9 +74,10 @@ class FakeAPIError(Exception):
         super().__init__(f"private response body {code}")
 
 
-def response(value, usage=None, finish_reason="STOP"):
+def response(value, usage=None, finish_reason="STOP", block_reason=None):
     return SimpleNamespace(text=value, usage_metadata=usage or {"prompt_token_count": 25, "candidates_token_count": 300, "total_token_count": 325},
-                           candidates=[SimpleNamespace(finish_reason=finish_reason)])
+                           candidates=[SimpleNamespace(finish_reason=finish_reason)],
+                           prompt_feedback=SimpleNamespace(block_reason=block_reason))
 
 
 def fixture_request(refs=None, shot_budget=5):
@@ -127,7 +129,8 @@ def test_structured_plan_uses_supported_schema_and_always_validates_with_storypl
     schema = call["config"]["response_json_schema"]
     assert call["model"] == "gemini-3.8-flash"
     assert "response_schema" not in call["config"]
-    assert call["config"]["max_output_tokens"] == 3712
+    assert call["config"]["max_output_tokens"] == 6784
+    assert call["config"]["thinking_config"] == {"thinking_level": "low"}
     assert call["config"]["response_mime_type"] == "application/json"
     assert call["contents"].startswith("Create a film story plan")
     assert schema["properties"]["scenes"]["maxItems"] == 1
@@ -137,8 +140,9 @@ def test_structured_plan_uses_supported_schema_and_always_validates_with_storypl
     assert result.plan.title == "The Lighthouse Keeper"
     assert result.provenance["provider"] == "gemini"
     assert result.provenance["usage"]["total_tokens"] == 325
+    assert result.provenance["usage"]["thoughts_tokens"] is None
     assert result.provenance["api"] == "Gemini generateContent API JSON Schema"
-    assert result.provenance["output_token_limit"] == 3712
+    assert result.provenance["output_token_limit"] == 6784
     assert result.provenance["cost_estimate"] is None
 
 
@@ -150,13 +154,17 @@ def test_pinned_google_genai_sdk_serializes_schema_and_json_only_configs():
     schema_config = types.GenerateContentConfig.model_validate({
         "response_mime_type": "application/json", "response_json_schema": gemini_story_schema(1),
         "max_output_tokens": _output_token_limit(1),
+        "thinking_config": {"thinking_level": "low"},
     }).model_dump(by_alias=True, exclude_none=True)
     json_config = types.GenerateContentConfig.model_validate({
         "response_mime_type": "application/json", "max_output_tokens": _output_token_limit(1),
+        "thinking_config": {"thinking_level": "low"},
     }).model_dump(by_alias=True, exclude_none=True)
     assert schema_config["responseMimeType"] == "application/json"
     assert schema_config["responseJsonSchema"]["properties"]["scenes"]["maxItems"] == 1
-    assert json_config == {"responseMimeType": "application/json", "maxOutputTokens": 3712}
+    assert schema_config["thinkingConfig"]["thinkingLevel"] == "LOW"
+    assert json_config == {"responseMimeType": "application/json", "maxOutputTokens": 6784,
+                           "thinkingConfig": {"thinkingLevel": "LOW"}}
     assert "responseJsonSchema" not in json_config
 
 
@@ -178,7 +186,7 @@ def test_pinned_sdk_default_client_routes_generate_content_to_gemini_developer_a
             return SimpleNamespace(response_stream=['{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}'], headers={})
 
         client._api_client._request = fake_request
-        result = client.models.generate_content(model="gemini-2.5-flash", contents="fixed test", config={"max_output_tokens": 24})
+        result = client.models.generate_content(model="gemini-2.5-flash", contents="fixed test", config={"max_output_tokens": 512, "thinking_config": {"thinking_level": "low"}})
         assert result.text == "ok"
         assert captured["method"] == "post"
         assert captured["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
@@ -196,13 +204,78 @@ def test_generation_endpoint_probe_is_fixed_text_only_and_reports_sdk_route():
     call = client.models.calls[0]
     assert call == {"model": "gemini-2.5-flash",
         "contents": "Reply with exactly: FRAMEWORK Gemini endpoint check passed.",
-        "config": {"max_output_tokens": 24}}
+        "config": {"max_output_tokens": ENDPOINT_PROBE_MAX_OUTPUT_TOKENS,
+                   "thinking_config": {"thinking_level": "low"}}}
     assert result["success"] is True
     assert result["http_status"] == 200
     assert result["api_version"] == "v1beta"
     assert result["endpoint_host"] == "generativelanguage.googleapis.com"
     assert result["endpoint_path"] == "/v1beta/models/gemini-2.5-flash:generateContent"
     assert result["request_shape"] == "text_only_no_schema_no_media"
+    assert result["thinking_level"] == "low"
+    assert result["response_metadata"]["finish_reasons"] == ["STOP"]
+    assert result["response_metadata"]["candidates_token_count"] == 300
+    assert result["response_metadata"]["max_output_tokens"] == ENDPOINT_PROBE_MAX_OUTPUT_TOKENS
+
+
+def test_endpoint_probe_classifies_empty_max_tokens_response_with_thought_usage_safely():
+    private_thoughts = "PRIVATE_HIDDEN_REASONING"
+    exhausted = response("", usage={"prompt_token_count": 18, "candidates_token_count": 0,
+        "thoughts_token_count": 512, "total_token_count": 530}, finish_reason="MAX_TOKENS")
+    exhausted.thoughts = private_thoughts
+    client = FakeClient([exhausted])
+    client._api_client = SimpleNamespace(_http_options=SimpleNamespace(
+        api_version="v1beta", base_url="https://generativelanguage.googleapis.com/"))
+
+    with pytest.raises(GeminiPlanningError) as result:
+        make_planner(client, model="gemini-3.8-flash").test_generation_endpoint()
+
+    assert result.value.code == "token_exhaustion"
+    assert result.value.diagnostics["http_status"] == 200
+    assert result.value.diagnostics["category"] == "output_token_exhaustion"
+    assert result.value.diagnostics["finish_reasons"] == ["MAX_TOKENS"]
+    assert result.value.diagnostics["thoughts_token_count"] == 512
+    assert result.value.diagnostics["max_output_tokens"] == ENDPOINT_PROBE_MAX_OUTPUT_TOKENS
+    assert "512 thinking tokens" in str(result.value)
+    assert private_thoughts not in str(result.value)
+    assert "not-a-real-test-secret" not in str(result.value)
+    assert client.models.calls[0]["config"] == {
+        "max_output_tokens": ENDPOINT_PROBE_MAX_OUTPUT_TOKENS,
+        "thinking_config": {"thinking_level": "low"},
+    }
+
+
+def test_endpoint_probe_distinguishes_safety_block_and_normal_empty_text():
+    client = FakeClient([response("", finish_reason="SAFETY", block_reason="SAFETY"),
+                         response("", finish_reason="STOP")])
+    client._api_client = SimpleNamespace(_http_options=SimpleNamespace(
+        api_version="v1beta", base_url="https://generativelanguage.googleapis.com/"))
+    with pytest.raises(GeminiPlanningError) as blocked:
+        make_planner(client, model="gemini-3.8-flash").test_generation_endpoint()
+    assert blocked.value.code == "blocked_content"
+    assert blocked.value.diagnostics["category"] == "safety_blocking"
+    with pytest.raises(GeminiPlanningError) as empty:
+        make_planner(client, model="gemini-3.8-flash").test_generation_endpoint()
+    assert empty.value.code == "empty_response"
+    assert empty.value.diagnostics["category"] == "empty_text_response"
+    assert len(client.models.calls) == 2
+
+
+def test_story_planning_uses_low_thinking_and_rejects_max_tokens_without_repair_retry():
+    client = FakeClient([response("", usage={"prompt_token_count": 42, "candidates_token_count": 0,
+        "thoughts_token_count": 5100, "total_token_count": 5142}, finish_reason="MAX_TOKENS")])
+
+    with pytest.raises(GeminiPlanningError) as rejected:
+        make_planner(client, model="gemini-3.8-flash").plan(fixture_request(shot_budget=1))
+
+    assert rejected.value.code == "token_exhaustion"
+    assert rejected.value.diagnostics["max_output_tokens"] == 6784
+    assert rejected.value.diagnostics["thoughts_token_count"] == 5100
+    assert rejected.value.diagnostics["model"] == "gemini-3.8-flash"
+    assert rejected.value.diagnostics["thinking_level"] == "low"
+    assert client.models.calls[0]["config"]["thinking_config"] == {"thinking_level": "low"}
+    assert client.models.calls[0]["config"]["max_output_tokens"] == 6784
+    assert len(client.models.calls) == 1  # MAX_TOKENS is classified; it is never auto-retried.
 
 
 def test_generation_endpoint_probe_surfaces_sanitized_404_route_diagnostics():
@@ -331,8 +404,11 @@ def test_missing_key_invalid_model_auth_quota_and_empty_output_are_classified_wi
     assert len(client.models.calls) == 1
 
     client = FakeClient([response(""), response(StoryPlan.model_validate(valid_plan()).model_dump_json())])
-    assert make_planner(client).plan(fixture_request()).plan.title == "The Lighthouse Keeper"
-    assert len(client.models.calls) == 2
+    with pytest.raises(GeminiPlanningError) as empty:
+        make_planner(client).plan(fixture_request())
+    assert empty.value.code == "empty_response"
+    assert empty.value.diagnostics["category"] == "empty_text_response"
+    assert len(client.models.calls) == 1  # Empty provider responses are not treated as malformed JSON repairs.
 
 
 def test_transient_provider_error_is_not_automatically_retried():
@@ -390,7 +466,8 @@ def test_json_only_mode_omits_provider_schema_and_still_validates_storyplan_loca
     client = FakeClient([response(valid)])
     result = make_planner(client).plan(request)
     config = client.models.calls[0]["config"]
-    assert config == {"response_mime_type": "application/json", "max_output_tokens": 3712}
+    assert config == {"response_mime_type": "application/json", "max_output_tokens": 6784,
+                      "thinking_config": {"thinking_level": "low"}}
     assert result.plan.title == "The Lighthouse Keeper"
     assert result.provenance["response_mode"] == "json_only"
 
@@ -427,8 +504,8 @@ def test_schema_and_response_limit_scale_to_authorized_shot_budget():
     assert eight["properties"]["scenes"]["maxItems"] == 8
     assert eight["properties"]["scenes"]["items"]["properties"]["shots"]["maxItems"] == 8
     assert one["properties"]["locations"]["maxItems"] == 1
-    assert _output_token_limit(1) == 3712
-    assert _output_token_limit(1) < _output_token_limit(4) < _output_token_limit(8) == MAX_OUTPUT_TOKENS
+    assert _output_token_limit(1) == 6784
+    assert _output_token_limit(1) < _output_token_limit(2) < _output_token_limit(4) == _output_token_limit(8) == MAX_OUTPUT_TOKENS
 
 
 def test_provider_schema_omits_unsupported_max_lengths_but_local_storyplan_keeps_them():
