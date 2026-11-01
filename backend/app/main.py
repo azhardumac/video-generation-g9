@@ -268,6 +268,15 @@ class ReconcileVerifiedShotsRequest(ApproveFilmPlanRequest):
     source_batch_id: str = Field(min_length=1, max_length=80)
 
 
+class PrepareFilmRunRequest(BaseModel):
+    expected_run_revision: int = Field(ge=1)
+    expected_storyboard_revision: int = Field(ge=1)
+
+
+class RenderFilmRunRequest(PrepareFilmRunRequest):
+    confirmed: bool = False
+
+
 class StyleBibleRequest(BaseModel):
     material: str = Field(default="", max_length=2000)
     silhouettes: str = Field(default="", max_length=2000)
@@ -1442,6 +1451,31 @@ def review_film_run_shot(project_id: str, run_id: str, shot_id: str, request: Fi
         raise HTTPException(409, str(exc)) from exc
 
 
+def _film_run_creative_review_state(run: dict, storyboard: dict | None, resolved: list[dict] | None = None):
+    """Human approval state for current verified run shots; never uses legacy plan approval."""
+    if not storyboard:
+        return "pending", {}
+    resolved = resolved if resolved is not None else _resolve_film_run_review_shots(run["project_id"], storyboard, None)
+    verified = [shot for shot in resolved if shot.get("verified")]
+    prior = {}
+    for review in db.film_run_shot_reviews(run["id"]):
+        prior[review["shot_id"]] = review
+    current = {}
+    decisions = []
+    for shot in verified:
+        review = prior.get(shot["shot_id"])
+        if (review and review["run_revision"] == run["revision"] and
+                review["storyboard_revision"] == storyboard["revision"] and
+                review["job_id"] == shot.get("job_id")):
+            current[shot["shot_id"]] = review
+            decisions.append(review["decision"])
+    if verified and len(decisions) == len(verified) and all(value == "approved" for value in decisions):
+        return "approved", current
+    if "rejected" in decisions:
+        return "rejected", current
+    return "pending", current
+
+
 def _film_run_status(run: dict) -> dict:
     provider = run.get("request", {}).get("planner_provider", "local")
     if provider == "gemini":
@@ -1504,20 +1538,7 @@ def _film_run_status(run: dict) -> dict:
             "progress": round(100 * verified_count / max(1, total_shots)), "shots": progress_shots}
     else:
         run["generation_progress"] = None
-    run["creative_review_status"] = None
-    if run["status"] == "needs_review" and storyboard:
-        prior_reviews = {item["shot_id"]: item for item in db.film_run_shot_reviews(run["id"])}
-        verified_shots = [shot for shot in resolved if shot["verified"]]
-        current_decisions = [prior_reviews[shot["shot_id"]]["decision"] for shot in verified_shots
-            if shot["shot_id"] in prior_reviews and prior_reviews[shot["shot_id"]]["run_revision"] == run["revision"]
-            and prior_reviews[shot["shot_id"]]["storyboard_revision"] == storyboard["revision"]
-            and prior_reviews[shot["shot_id"]]["job_id"] == shot.get("job_id")]
-        if verified_shots and len(current_decisions) == len(verified_shots) and all(item == "approved" for item in current_decisions):
-            run["creative_review_status"] = "approved"
-        elif "rejected" in current_decisions:
-            run["creative_review_status"] = "rejected"
-        else:
-            run["creative_review_status"] = "pending"
+    run["creative_review_status"], run["creative_reviews_current"] = _film_run_creative_review_state(run, storyboard, resolved)
     return run
 
 
@@ -1601,6 +1622,118 @@ def get_film_run(run_id: str):
     run = film_orchestrator.get(run_id)
     _project(run["project_id"])
     return _film_run_status(run)
+
+
+@app.get("/api/film-runs/{run_id}/export-status")
+def film_run_export_status(run_id: str):
+    run = db.get_film_run(run_id)
+    if not run:
+        raise HTTPException(404, "Film run not found")
+    _project(run["project_id"])
+    if not run.get("storyboard_id"):
+        raise HTTPException(409, "This film run has no saved storyboard yet")
+    story = db.get_storyboard(run["storyboard_id"], include_events=False)
+    if not story or story["project_id"] != run["project_id"]:
+        raise HTTPException(404, "Film run storyboard is unavailable in this project")
+    current_run = _film_run_status(run)
+    return _film_export_status(story, current_run) | {"run_id": run_id, "run_revision": run["revision"]}
+
+
+@app.post("/api/film-runs/{run_id}/prepare")
+async def prepare_film_run(run_id: str, request: PrepareFilmRunRequest):
+    run = db.get_film_run(run_id)
+    if not run:
+        raise HTTPException(404, "Film run not found")
+    project = _project(run["project_id"])
+    if run.get("archived_at"):
+        raise HTTPException(409, "Restore this film run before preparing its composition")
+    if run.get("status") not in {"needs_review", "completed"}:
+        raise HTTPException(409, "This film run must finish local generation and enter creative review before preparation")
+    if not run.get("storyboard_id"):
+        raise HTTPException(409, "This film run has no saved storyboard to prepare")
+    story = db.get_storyboard(run["storyboard_id"], include_events=False)
+    if not story or story["project_id"] != project["id"]:
+        raise HTTPException(404, "Film run storyboard is unavailable in this project")
+    if (run["revision"] != request.expected_run_revision or story["revision"] != request.expected_storyboard_revision):
+        raise HTTPException(409, "The film run or storyboard changed; refresh and review the current production state")
+    current_run = _film_run_status(run)
+    status = _film_export_status(story, current_run)
+    if not status["all_verified"]:
+        raise HTTPException(409, "Preparation requires current technically verified output for every shot: " + ", ".join(status["missing_shots"]))
+    if status["creative_review_status"] != "approved":
+        raise HTTPException(409, "Preparation requires current creative approval for every shot in this run")
+
+    batch_id = run.get("film_batch_id") or run.get("checkpoint", {}).get("generate_shots", {}).get("film_batch_id")
+    batch = db.get_film_batch(batch_id) if batch_id else None
+    resolved = _resolve_film_run_review_shots(project["id"], story, batch)
+    canonical_jobs = {}
+    output_root = safe_local_path(settings.output_root, settings)
+    for shot in story["shots"]:
+        resolved_shot = next((item for item in resolved if item["shot_id"] == shot["id"]), None)
+        job = resolved_shot.get("job") if resolved_shot else None
+        recorded = resolved_shot.get("recorded_output") if resolved_shot else None
+        if not resolved_shot or not resolved_shot["verified"] or not job or not recorded:
+            raise HTTPException(409, f"Shot '{shot['title']}' is not eligible for composition preparation")
+        try:
+            output = safe_local_path(job.get("result_path") or "", settings, must_exist=True)
+            if not output.is_file() or output_root.resolve() not in output.resolve().parents:
+                raise ValueError("The clip is not a regular file under the configured output root")
+            expected = _expected_shot_output(shot)
+            if not all(expected.get(key, 0) > 0 for key in ("width", "height", "fps", "frames")):
+                raise ValueError("The shot is missing expected dimensions, frame rate, or frame count")
+            actual = await verify_video(str(output), settings, expected=expected)
+            if actual.get("verified_output") != recorded:
+                raise ValueError("Fresh ffprobe metadata differs from the saved job verification")
+        except (ValueError, FileNotFoundError, OSError, RuntimeError) as exc:
+            raise HTTPException(409, f"Shot '{shot['title']}' failed fresh verification; no output was regenerated: {exc}") from exc
+        canonical_jobs[shot["id"]] = job["id"]
+
+    try:
+        db.reconcile_film_run_shots(run_id=run_id, project_id=project["id"], storyboard_id=story["id"],
+            expected_run_revision=request.expected_run_revision,
+            expected_storyboard_revision=request.expected_storyboard_revision, canonical_jobs=canonical_jobs)
+        prepared_story = create_storyboard_manifest(story["id"])
+    except HTTPException:
+        raise
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    refreshed_run = _film_run_status(db.get_film_run(run_id))
+    export_status = _film_export_status(prepared_story, refreshed_run)
+    return {"storyboard": prepared_story, "export_status": export_status,
+            "reconciled_shots": len(canonical_jobs), "render_started": False}
+
+
+@app.post("/api/film-runs/{run_id}/render", status_code=201)
+def render_film_run(run_id: str, request: RenderFilmRunRequest):
+    if not request.confirmed:
+        raise HTTPException(400, "Rendering requires explicit confirmation")
+    run = db.get_film_run(run_id)
+    if not run or run.get("archived_at"):
+        raise HTTPException(404, "Film run is unavailable")
+    if run.get("status") not in {"needs_review", "completed"}:
+        raise HTTPException(409, "This film run is not ready for final rendering")
+    _project(run["project_id"])
+    if not run.get("storyboard_id"):
+        raise HTTPException(409, "This film run has no saved storyboard")
+    story = db.get_storyboard(run["storyboard_id"], include_events=False)
+    if not story or story["project_id"] != run["project_id"]:
+        raise HTTPException(404, "Film run storyboard is unavailable in this project")
+    if run["revision"] != request.expected_run_revision or story["revision"] != request.expected_storyboard_revision:
+        raise HTTPException(409, "The film run or storyboard changed; refresh before rendering")
+    current_run = _film_run_status(run)
+    status = _film_export_status(story, current_run)
+    if status["creative_review_status"] != "approved" or not status["all_verified"]:
+        raise HTTPException(409, "A current approved review and technically verified output for every shot are required to render")
+    if not status["reconciled"] or not status["manifest_ready"]:
+        raise HTTPException(409, "Prepare this film from its current verified clips before rendering")
+    try:
+        return queue_storyboard_render(story["id"])
+    except HTTPException:
+        raise
 
 
 def _film_run_control(run_id: str, request: FilmRunRevisionRequest, action: str):
@@ -1878,10 +2011,22 @@ def _verified_source_batches(story: dict) -> list[dict]:
     return candidates
 
 
-def _film_export_status(story: dict) -> dict:
+def _film_export_status(story: dict, film_run: dict | None = None) -> dict:
     candidates = _verified_source_batches(story)
     shots = story.get("shots", [])
-    current_verified = [shot["id"] for shot in shots if shot.get("status") == "verified" and shot.get("settings_match")]
+    resolved = []
+    current_reviews = {}
+    if film_run:
+        batch_id = film_run.get("film_batch_id") or film_run.get("checkpoint", {}).get("generate_shots", {}).get("film_batch_id")
+        batch = db.get_film_batch(batch_id) if batch_id else None
+        resolved = _resolve_film_run_review_shots(film_run["project_id"], story, batch)
+        current_verified = [item["shot_id"] for item in resolved if item.get("verified")]
+        creative_review_status, current_reviews = _film_run_creative_review_state(film_run, story, resolved)
+        approved = creative_review_status == "approved"
+    else:
+        current_verified = [shot["id"] for shot in shots if shot.get("status") == "verified" and shot.get("settings_match")]
+        creative_review_status = None
+        approved = bool(story.get("film_plan", {}).get("approved"))
     missing = [shot["title"] for shot in shots if shot["id"] not in current_verified]
     batches = db.list_film_batches(story["id"])
     paused = [{"id": batch["id"], "status": batch["status"],
@@ -1891,7 +2036,13 @@ def _film_export_status(story: dict) -> dict:
     manifest = story.get("manifest")
     manifest_ready = bool(manifest and manifest.get("revision") == story["revision"])
     all_verified = bool(shots) and len(current_verified) == len(shots)
-    reconciled = bool(shots) and all(shot.get("reconciled_job_id") == (shot.get("job") or {}).get("id") for shot in shots)
+    if film_run:
+        resolved_by_shot = {item["shot_id"]: item for item in resolved}
+        reconciled = bool(shots) and all(shot.get("reconciled_job_id") == resolved_by_shot.get(shot["id"], {}).get("job_id")
+                                         for shot in shots)
+    else:
+        reconciled = bool(shots) and all(shot.get("reconciled_job_id") == (shot.get("job") or {}).get("id") for shot in shots)
+    output_root = settings.expanded(settings.output_root)
     latest_render = None
     for job in db.list_jobs(limit=500, project_id=story["project_id"]):
         job_manifest = ((job.get("payload") or {}).get("props") or {}).get("manifest") or {}
@@ -1902,11 +2053,31 @@ def _film_export_status(story: dict) -> dict:
                              "current": bool(manifest_ready and job_manifest == manifest),
                              "manifest_revision": job_manifest.get("revision")}
             break
+    verified_final = False
+    if latest_render and latest_render.get("status") == "completed" and latest_render.get("current") and latest_render.get("result_path") and manifest_ready:
+        verified = (latest_render.get("verification_metadata") or {}).get("verified_output") or {}
+        try:
+            final_path = safe_local_path(latest_render["result_path"], settings, must_exist=True)
+            verified_final = bool(final_path.is_file() and output_root.resolve() in final_path.resolve().parents and
+                verified.get("width") == manifest.get("width") and verified.get("height") == manifest.get("height") and
+                verified.get("fps") == manifest.get("fps") and verified.get("frames") == manifest.get("duration_in_frames"))
+        except (ValueError, FileNotFoundError, OSError):
+            verified_final = False
+    blockers = []
+    if not current_verified:
+        blockers.append("No current technically verified shot outputs are available.")
+    if len(current_verified) != len(shots):
+        blockers.extend(missing)
+    if not approved:
+        blockers.append("Current creative approval is required for every verified shot." if film_run else "The current film plan must be approved.")
     return {"storyboard_id": story["id"], "revision": story["revision"],
-            "style_bible_revision": story["style_bible_revision"], "approved": bool(story.get("film_plan", {}).get("approved")),
+            "style_bible_revision": story["style_bible_revision"], "approved": approved,
             "total_shots": len(shots), "verified_shots": len(current_verified), "missing_shots": missing,
             "all_verified": all_verified, "reconciled": reconciled, "manifest_ready": manifest_ready,
+            "creative_review_status": creative_review_status,
+            "ready_to_prepare": bool(all_verified and approved), "preparation_blockers": blockers,
             "manifest_path": story.get("manifest_path"), "manifest": manifest,
+            "verified_final": verified_final,
             "remotion_ready": detect_integrations(settings)["remotion"]["ready"],
             "latest_render": latest_render,
             "source_batches": [{key: value for key, value in candidate.items() if key != "job_ids"} for candidate in candidates],

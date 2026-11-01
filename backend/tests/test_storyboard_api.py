@@ -1,4 +1,5 @@
 import atexit
+import asyncio
 import os
 import shutil
 import tempfile
@@ -834,7 +835,7 @@ def test_generic_gemini_run_review_uses_authoritative_job_when_batch_job_and_sho
         "authorization":{"confirmed":True,"scope":"test only"},"planner_provider":"gemini"}
     run = FilmOrchestrator(api.db).create(project_id,"generic-run",request,authorized=True)
     running = api.db.update_film_run(run["id"],run["revision"],status="running",message="persist fixture plan")
-    output = str(root / "outputs")
+    output = str(api.settings.expanded(api.settings.output_root) / project_id)
     shot = {"id":str(uuid4()),"scene_title":"01. Dawn by the cottage","title":"Finds the lantern",
         "prompt":"A small red fox finds a brass lantern in the dawn grass.","visual_description":"The fox notices a glow.",
         "reference_image":None,"reference_ids":[],"characters":["Fox"],"framing":"Medium close-up",
@@ -855,7 +856,7 @@ def test_generic_gemini_run_review_uses_authoritative_job_when_batch_job_and_sho
         "9:16","Short",generic_metadata)
     job = api.db.create_shot_job(story["id"],shot["id"],dict(shot["generation_payload"]))
     assert api.db.claim_job(job["id"])
-    clip = root / "outputs" / "fox-first-shot.mp4"
+    clip = Path(output) / "fox-first-shot.mp4"
     clip.parent.mkdir(parents=True,exist_ok=True)
     clip.write_bytes(b"verified Gemini storyboard fixture; no inference")
     assert api.db.complete_job(job["id"],progress=100,result_path=str(clip),exit_code=0,
@@ -903,6 +904,9 @@ def test_generic_gemini_run_review_uses_authoritative_job_when_batch_job_and_sho
     assert item["expected_character_count"] == 1 and item["references"] == []
     assert Path(item["job"]["result_path"]).resolve() == clip.resolve()
     assert "scenes" not in generic_metadata and "expected_workload" not in generic_metadata
+    before_approval = api.film_run_export_status(run["id"])
+    assert before_approval["verified_shots"] == 1 and before_approval["all_verified"] is True
+    assert before_approval["approved"] is False and before_approval["ready_to_prepare"] is False
 
     # Material shot edits block creative review, but never hide the existing
     # technically verified file. Eligibility refresh recomputes current state.
@@ -937,6 +941,57 @@ def test_generic_gemini_run_review_uses_authoritative_job_when_batch_job_and_sho
     assert after_approval["shots"][0]["creative_review"]["notes"] == "Identity, framing, and story beat read clearly."
     assert api._film_run_status(api.db.get_film_run(run["id"]))["creative_review_status"] == "approved"
 
+    # Some completed Gemini runs retain the same review revision after the
+    # orchestrator marks its production stage complete. Their current human
+    # approval must remain valid for run-scoped preparation.
+    with api.db.connect() as conn:
+        conn.execute("UPDATE film_runs SET status='completed' WHERE id=?", (run["id"],))
+    assert api._film_run_status(api.db.get_film_run(run["id"]))["creative_review_status"] == "approved"
+
+    approved_export = api.film_run_export_status(run["id"])
+    assert approved_export["approved"] is True and approved_export["ready_to_prepare"] is True
+    assert approved_export["reconciled"] is False and approved_export["manifest_ready"] is False
+
+    async def mock_ffprobe(path, settings, expected=None):
+        return {"verified_output": expected}
+    monkeypatch.setattr(api, "verify_video", mock_ffprobe)
+    prepare_request = api.PrepareFilmRunRequest(expected_run_revision=needs_review["revision"],
+        expected_storyboard_revision=story["revision"])
+    prepared = asyncio.run(api.prepare_film_run(run["id"], prepare_request))
+    assert prepared["render_started"] is False and prepared["reconciled_shots"] == 1
+    assert prepared["storyboard"]["manifest"]["shots"][0]["job_id"] == job["id"]
+    assert prepared["export_status"]["manifest_ready"] is True and prepared["export_status"]["reconciled"] is True
+    manifest = prepared["storyboard"]["manifest"]
+    history_count = len(api.db.list_jobs(project_id=project_id))
+    prepared_again = asyncio.run(api.prepare_film_run(run["id"], prepare_request))
+    assert prepared_again["storyboard"]["manifest"] == manifest
+    assert len(api.db.list_jobs(project_id=project_id)) == history_count == 1
+    assert api.film_run_export_status(run["id"])["manifest_ready"] is True
+    from app.db import Database
+    restarted_db = Database(api.settings)
+    restarted_story = restarted_db.get_storyboard(story["id"], include_events=False)
+    assert restarted_story["manifest"] == manifest
+    assert restarted_story["shots"][0]["reconciled_job_id"] == job["id"]
+
+    saved_clip = clip.read_bytes()
+    clip.unlink()
+    missing_export = api.film_run_export_status(run["id"])
+    assert missing_export["all_verified"] is False and missing_export["missing_shots"] == [shot["title"]]
+    with pytest.raises(HTTPException, match="current technically verified output"):
+        asyncio.run(api.prepare_film_run(run["id"], prepare_request))
+    clip.write_bytes(saved_clip)
+
+    render_request = api.RenderFilmRunRequest(expected_run_revision=needs_review["revision"],
+        expected_storyboard_revision=story["revision"],confirmed=False)
+    with pytest.raises(HTTPException,match="explicit confirmation"):
+        api.render_film_run(run["id"],render_request)
+    queued_render = {}
+    monkeypatch.setattr(api,"queue_storyboard_render",lambda storyboard_id:queued_render.update(storyboard_id=storyboard_id) or {"id":"render-queued-only"})
+    authorized_render = api.render_film_run(run["id"],render_request.model_copy(update={"confirmed":True}))
+    assert authorized_render["id"] == "render-queued-only" and queued_render["storyboard_id"] == story["id"]
+
+    with api.db.connect() as conn:
+        conn.execute("UPDATE film_runs SET status='needs_review' WHERE id=?", (run["id"],))
     with pytest.raises(HTTPException,match="changed before the review was saved") as stale:
         api.review_film_run_shot(project_id,run["id"],shot["id"],api.FilmRunShotReviewRequest(
             expected_run_revision=needs_review["revision"],expected_storyboard_revision=story["revision"]+1,
