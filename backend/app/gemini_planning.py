@@ -12,6 +12,10 @@ from pydantic import ValidationError
 from .story_planning import PlannerOutputError, PlannerResult, StoryPlan, StoryPlanner
 
 MAX_OUTPUT_TOKENS = 8192
+MIN_OUTPUT_TOKENS = 3072
+OUTPUT_TOKENS_PER_SHOT = 640
+MAX_STORY_SCENES = 40
+MAX_SHOTS_PER_SCENE = 40
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_TRANSIENT_ATTEMPTS = 2  # Includes the first request; one bounded retry at most.
 MAX_SCHEMA_REPAIR_REQUESTS = 1
@@ -68,8 +72,21 @@ def _safe_usage(response) -> dict[str, int | None]:
             "total_tokens": usage.get("total_token_count", usage.get("total_tokens"))}
 
 
-def gemini_story_schema() -> dict[str, Any]:
-    """Compact supported JSON Schema subset; Pydantic remains the authority."""
+def gemini_story_schema(shot_budget: int = MAX_STORY_SCENES) -> dict[str, Any]:
+    """Return a compact JSON Schema with array caps based on the authorized budget.
+
+    JSON Schema cannot express a sum over nested shot arrays. Both scene count
+    and per-scene shot count are bounded by the run budget; local StoryPlan
+    validation still enforces the exact total.
+    """
+    try:
+        shot_limit = max(1, min(int(shot_budget), MAX_STORY_SCENES * MAX_SHOTS_PER_SCENE))
+    except (TypeError, ValueError):
+        shot_limit = 1
+    scene_limit = min(MAX_STORY_SCENES, shot_limit)
+    shots_per_scene_limit = min(MAX_SHOTS_PER_SCENE, shot_limit)
+    location_limit = min(20, shot_limit)
+
     def obj(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
         return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
 
@@ -97,14 +114,23 @@ def gemini_story_schema() -> dict[str, Any]:
                  "location_id": string(), "characters_present": array(string(), 20, 1), "visual_description": string(),
                  "framing": string(), "character_layout": string(), "continuity_requirements": array(string(), 16, 1),
                  "expected_character_count": {"type": "integer", "minimum": 1, "maximum": 20},
-                 "shots": array(shot, 40, 1)},
+                 "shots": array(shot, shots_per_scene_limit, 1)},
                 ["id", "sequence", "title", "story_beat", "location_id", "characters_present", "visual_description",
                  "framing", "character_layout", "continuity_requirements", "expected_character_count", "shots"])
     return obj({"title": string(), "logline": string(), "visual_style": string(), "audio_requested": {"type": "boolean"},
                 "video_continuation_requested": {"type": "boolean"}, "ic_lora_requested": {"type": "boolean"},
-                "characters": array(character, 20, 1), "locations": array(location, 20, 1), "scenes": array(scene, 40, 1)},
+                "characters": array(character, 20, 1), "locations": array(location, location_limit, 1), "scenes": array(scene, scene_limit, 1)},
                ["title", "logline", "visual_style", "audio_requested", "video_continuation_requested", "ic_lora_requested",
                 "characters", "locations", "scenes"])
+
+
+def _output_token_limit(shot_budget: int) -> int:
+    """Scale response size with the authorized shot count, with bounded limits."""
+    try:
+        shot_limit = max(1, int(shot_budget))
+    except (TypeError, ValueError):
+        shot_limit = 1
+    return min(MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS + OUTPUT_TOKENS_PER_SHOT * shot_limit)
 
 
 class GeminiStoryPlanner(StoryPlanner):
@@ -231,15 +257,17 @@ class GeminiStoryPlanner(StoryPlanner):
             prompt += "\n\nThe prior response failed local validation. Repair it, preserving story facts. Validation error: " + repair["error"] + "\nINVALID_RESPONSE_JSON:\n" + repair["output"][:MAX_RESPONSE_BYTES]
         return prompt
 
-    def _call(self, client, request_text: str):
+    def _call(self, client, request_text: str, shot_budget: int):
         for attempt in range(MAX_TRANSIENT_ATTEMPTS):
             try:
                 response = client.models.generate_content(
                     model=self.model,
                     contents=request_text,
+                    # The pinned google-genai SDK accepts a raw JSON Schema in
+                    # response_json_schema; response_schema is not this field.
                     config={"response_mime_type": "application/json",
-                            "response_schema": gemini_story_schema(),
-                            "max_output_tokens": MAX_OUTPUT_TOKENS},
+                            "response_json_schema": gemini_story_schema(shot_budget),
+                            "max_output_tokens": _output_token_limit(shot_budget)},
                 )
                 prompt_feedback = getattr(response, "prompt_feedback", None)
                 block_reason = getattr(prompt_feedback, "block_reason", None) if prompt_feedback else None
@@ -276,7 +304,8 @@ class GeminiStoryPlanner(StoryPlanner):
             raise
         except Exception as exc:
             raise self._classify_error(exc, "story planning") from None
-        response = self._call(client, self._prompt(request))
+        shot_budget = int(request["shot_budget"])
+        response = self._call(client, self._prompt(request), shot_budget)
         usages = [_safe_usage(response)]
         output = getattr(response, "text", None)
         output = output if isinstance(output, str) else ""
@@ -286,7 +315,7 @@ class GeminiStoryPlanner(StoryPlanner):
             # Exactly one bounded schema repair, charged against this run's two-call cap.
             if len(output.encode("utf-8")) > MAX_RESPONSE_BYTES:
                 raise GeminiPlanningError("invalid_output", "Gemini returned malformed or oversized JSON. No shot jobs were queued.", retryable_by_user=True) from None
-            repaired = self._call(client, self._prompt(request, {"error": str(first_error)[:2000], "output": output}))
+            repaired = self._call(client, self._prompt(request, {"error": str(first_error)[:2000], "output": output}), shot_budget)
             usages.append(_safe_usage(repaired))
             try:
                 plan = self._validate_output(getattr(repaired, "text", None), request)
@@ -296,6 +325,7 @@ class GeminiStoryPlanner(StoryPlanner):
                  for key in ("input_tokens", "output_tokens", "total_tokens")}
         return PlannerResult(plan=plan, provenance={"provider": "gemini", "model": self.model,
             "api": "Gemini generateContent API structured JSON", "sdk": "google-genai", "request_count": len(usages),
+            "output_token_limit": _output_token_limit(shot_budget),
             "usage": usage, "cost_estimate": None,
             "billing_note": "Gemini billing/free-tier data policy varies by account and tier; review current Google AI Studio pricing.",
             "privacy": "Only story prompt, project style text, preset/budget/capability metadata, and opaque selected-reference IDs/categories were sent. No files or filenames were uploaded."})

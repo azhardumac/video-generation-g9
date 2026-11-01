@@ -2,7 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.gemini_planning import GeminiPlanningError, GeminiStoryPlanner, gemini_story_schema
+from app.gemini_planning import (MAX_OUTPUT_TOKENS, GeminiPlanningError, GeminiStoryPlanner,
+                                 _output_token_limit, gemini_story_schema)
 from app.story_planning import PlannerOutputError, StoryPlan
 
 
@@ -93,18 +94,23 @@ def test_account_model_selection_is_limited_to_flash_models_returned_by_account(
 
 def test_structured_plan_uses_supported_schema_and_always_validates_with_storyplan():
     client = FakeClient([response(StoryPlan.model_validate(valid_plan()).model_dump_json())])
-    result = make_planner(client).plan(fixture_request())
+    result = make_planner(client).plan(fixture_request(shot_budget=1))
     call = client.models.calls[0]
-    schema = call["config"]["response_schema"]
+    schema = call["config"]["response_json_schema"]
     assert call["model"] == "gemini-3.8-flash"
-    assert call["config"]["max_output_tokens"] == 8192
+    assert "response_schema" not in call["config"]
+    assert call["config"]["max_output_tokens"] == 3712
     assert call["config"]["response_mime_type"] == "application/json"
     assert call["contents"].startswith("Create a film story plan")
+    assert schema["properties"]["scenes"]["maxItems"] == 1
+    assert schema["properties"]["scenes"]["items"]["properties"]["shots"]["maxItems"] == 1
+    assert schema["properties"]["locations"]["maxItems"] == 1
     assert "$defs" not in str(schema) and "minItems" in str(schema)
     assert result.plan.title == "The Lighthouse Keeper"
     assert result.provenance["provider"] == "gemini"
     assert result.provenance["usage"]["total_tokens"] == 325
     assert result.provenance["api"] == "Gemini generateContent API structured JSON"
+    assert result.provenance["output_token_limit"] == 3712
     assert result.provenance["cost_estimate"] is None
 
 
@@ -136,6 +142,17 @@ def test_shot_budget_is_checked_and_invalid_second_output_is_a_blocker():
     assert len(client.models.calls) == 2
 
 
+def test_unapproved_reference_is_rejected_after_bounded_repair():
+    request = fixture_request(refs=True)
+    invalid = StoryPlan.model_validate(valid_plan(["invented-reference"])).model_dump_json()
+    client = FakeClient([response(invalid), response(invalid)])
+    with pytest.raises(GeminiPlanningError) as error:
+        make_planner(client).plan(request)
+    assert error.value.code == "invalid_output"
+    assert "invented-reference" not in str(error.value)
+    assert len(client.models.calls) == 2
+
+
 def test_missing_key_invalid_model_auth_quota_and_empty_output_are_classified_without_secret_echo():
     with pytest.raises(GeminiPlanningError) as missing:
         GeminiStoryPlanner(None, None).plan(fixture_request())
@@ -156,6 +173,14 @@ def test_missing_key_invalid_model_auth_quota_and_empty_output_are_classified_wi
     with pytest.raises(GeminiPlanningError) as limited:
         make_planner(client).plan(fixture_request())
     assert limited.value.code == "rate_limit"
+
+    client = FakeClient([FakeAPIError(400)])
+    with pytest.raises(GeminiPlanningError) as rejected:
+        make_planner(client).plan(fixture_request())
+    assert rejected.value.code == "invalid_request"
+    assert "JSON schema" in str(rejected.value)
+    assert "private response body" not in str(rejected.value)
+    assert len(client.models.calls) == 1
 
     client = FakeClient([response(""), response(StoryPlan.model_validate(valid_plan()).model_dump_json())])
     assert make_planner(client).plan(fixture_request()).plan.title == "The Lighthouse Keeper"
@@ -204,3 +229,22 @@ def test_schema_has_no_unsupported_pydantic_reference_definitions():
     assert "$ref" not in str(schema)
     assert "minLength" not in str(schema)
     assert "maxLength" not in str(schema)
+
+
+def test_schema_and_response_limit_scale_to_authorized_shot_budget():
+    one = gemini_story_schema(1)
+    eight = gemini_story_schema(8)
+    assert one["properties"]["scenes"]["maxItems"] == 1
+    assert one["properties"]["scenes"]["items"]["properties"]["shots"]["maxItems"] == 1
+    assert eight["properties"]["scenes"]["maxItems"] == 8
+    assert eight["properties"]["scenes"]["items"]["properties"]["shots"]["maxItems"] == 8
+    assert one["properties"]["locations"]["maxItems"] == 1
+    assert _output_token_limit(1) == 3712
+    assert _output_token_limit(1) < _output_token_limit(4) < _output_token_limit(8) == MAX_OUTPUT_TOKENS
+
+
+def test_provider_schema_omits_unsupported_max_lengths_but_local_storyplan_keeps_them():
+    too_long = valid_plan()
+    too_long["title"] = "T" * 161
+    with pytest.raises(ValueError):
+        StoryPlan.model_validate(too_long)
