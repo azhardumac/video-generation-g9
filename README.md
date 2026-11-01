@@ -220,6 +220,15 @@ available; a dollar estimate is not fabricated. For HTTP 400 responses the UI
 shows only sanitized provider status, reason, and rejected field paths; raw
 provider bodies, prompt text, and credentials are not exposed.
 
+Before planning a story, **Test Gemini generation endpoint** in Settings can
+send one explicitly confirmed, fixed text-only request. It sends no story
+prompt, media, or JSON Schema and creates no film run or LTX job. The result
+shows the HTTP status and sanitized SDK route. With the pinned
+`google-genai==2.33.0`, FRAMEWORK uses the SDK's default Gemini Developer API
+base URL and `v1beta` API version; `generateContent` is routed as
+`/v1beta/models/{account-listed-model}:generateContent`. A connection test
+only lists account models and is not a substitute for this generation probe.
+
 **Create Film** requires an explicit per-run cloud-processing opt-in for Gemini.
 Only prompt and disclosed metadata are sent; all image/video media work remains
 local. A Gemini request is durably reserved before network I/O. A completed

@@ -133,6 +133,69 @@ def test_pinned_google_genai_sdk_serializes_schema_and_json_only_configs():
     assert "responseJsonSchema" not in json_config
 
 
+def test_pinned_sdk_default_client_routes_generate_content_to_gemini_developer_api():
+    from importlib.metadata import version
+    from types import SimpleNamespace
+    from app.gemini_planning import _client
+
+    assert version("google-genai") == "2.33.0"
+    client = _client("not-a-real-test-secret", 30)
+    try:
+        options = client._api_client._http_options
+        assert options.base_url == "https://generativelanguage.googleapis.com/"
+        assert options.api_version == "v1beta"
+        captured = {}
+
+        def fake_request(http_request, http_options=None, stream=False):
+            captured.update(method=http_request.method, url=http_request.url, body=http_request.data)
+            return SimpleNamespace(response_stream=['{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}'], headers={})
+
+        client._api_client._request = fake_request
+        result = client.models.generate_content(model="gemini-2.5-flash", contents="fixed test", config={"max_output_tokens": 24})
+        assert result.text == "ok"
+        assert captured["method"] == "post"
+        assert captured["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        assert captured["body"]["contents"][0]["parts"][0]["text"] == "fixed test"
+        assert "responseJsonSchema" not in captured["body"].get("generationConfig", {})
+    finally:
+        client.close()
+
+
+def test_generation_endpoint_probe_is_fixed_text_only_and_reports_sdk_route():
+    client = FakeClient([response("FRAMEWORK Gemini endpoint check passed.")])
+    client._api_client = SimpleNamespace(_http_options=SimpleNamespace(
+        api_version="v1beta", base_url="https://generativelanguage.googleapis.com/"))
+    result = make_planner(client, model="gemini-2.5-flash").test_generation_endpoint()
+    call = client.models.calls[0]
+    assert call == {"model": "gemini-2.5-flash",
+        "contents": "Reply with exactly: FRAMEWORK Gemini endpoint check passed.",
+        "config": {"max_output_tokens": 24}}
+    assert result["success"] is True
+    assert result["http_status"] == 200
+    assert result["api_version"] == "v1beta"
+    assert result["endpoint_host"] == "generativelanguage.googleapis.com"
+    assert result["endpoint_path"] == "/v1beta/models/gemini-2.5-flash:generateContent"
+    assert result["request_shape"] == "text_only_no_schema_no_media"
+
+
+def test_generation_endpoint_probe_surfaces_sanitized_404_route_diagnostics():
+    details = {"error": {"code": 404, "status": "NOT_FOUND", "message": "PRIVATE_BODY_WITH_PROMPT_AND_KEY"}}
+    client = FakeClient([FakeAPIError(404, details)])
+    client._api_client = SimpleNamespace(_http_options=SimpleNamespace(
+        api_version="v1beta", base_url="https://generativelanguage.googleapis.com/"))
+    with pytest.raises(GeminiPlanningError) as missing:
+        make_planner(client, model="gemini-2.5-flash").test_generation_endpoint()
+    assert missing.value.code == "model_or_endpoint_incompatible"
+    assert missing.value.diagnostics["http_status"] == 404
+    assert missing.value.diagnostics["provider_status"] == "NOT_FOUND"
+    assert missing.value.diagnostics["endpoint_path"] == "/v1beta/models/gemini-2.5-flash:generateContent"
+    assert missing.value.diagnostics["request_shape"] == "text_only_no_schema_no_media"
+    assert "schema settings were not sent" in str(missing.value)
+    assert "PRIVATE_BODY" not in str(missing.value)
+    assert "not-a-real-test-secret" not in str(missing.value)
+    assert len(client.models.calls) == 1
+
+
 def test_opaque_reference_metadata_only_and_scope_rejection_repair():
     request = fixture_request(refs=True)
     request["project_reference_catalog"][0].update({"name": "private filename", "path": "/private/path/image.png", "notes": "private notes"})

@@ -18,6 +18,8 @@ MAX_SHOTS_PER_SCENE = 40
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_SCHEMA_REPAIR_REQUESTS = 1
 STORY_PLAN_SCHEMA_VERSION = "storyplan-budgeted-v1"
+GEMINI_API_VERSION = "v1beta"
+GENERATION_ENDPOINT_PROBE_PROMPT = "Reply with exactly: FRAMEWORK Gemini endpoint check passed."
 _FLASH_ALLOWLIST = re.compile(r"^(?:models/)?gemini-[a-z0-9][a-z0-9.-]*flash[a-z0-9.-]*$", re.IGNORECASE)
 
 
@@ -36,11 +38,12 @@ def _client(api_key: str, timeout_seconds: int):
         from google.genai import types
     except ImportError as exc:
         raise GeminiPlanningError("sdk_missing", "The Google GenAI Python SDK is not installed in this backend environment.") from exc
+    # Let the pinned Google SDK select the Gemini Developer API base URL and
+    # default v1beta version. Overrides duplicate SDK routing and can diverge
+    # from account model discovery as the SDK evolves.
     return genai.Client(api_key=api_key, http_options=types.HttpOptions(
         timeout=timeout_seconds * 1000,
         retry_options=types.HttpRetryOptions(attempts=1),
-        base_url="https://generativelanguage.googleapis.com",
-        api_version="v1beta",
     ))
 
 
@@ -167,9 +170,10 @@ class GeminiStoryPlanner(StoryPlanner):
         except (TypeError, ValueError):
             status = None
         class_name = type(exc).__name__.casefold()
-        safe_context = "Gemini connection test" if context == "connection" else "Gemini story planning"
+        safe_context = {"connection": "Gemini connection test",
+                        "generation endpoint probe": "Gemini basic generation endpoint test"}.get(context, "Gemini story planning")
         diagnostics = cls._safe_provider_diagnostics(exc, status)
-        if context != "connection":
+        if context == "story planning":
             diagnostics["response_mode"] = response_mode
         if status in (401, 403):
             return GeminiPlanningError("auth_denied", f"{safe_context} was denied. Check the Gemini API key, API access, and account permissions.", diagnostics=diagnostics)
@@ -185,7 +189,7 @@ class GeminiStoryPlanner(StoryPlanner):
                 diagnostics["category"] = "model_or_endpoint_rejected"
                 message = "Gemini rejected the selected model or model parameter (HTTP 400). Check the model listed by this account."
                 error_code = "model_parameter_rejected"
-            elif response_mode == "schema" and (schema_field or not fields):
+            elif context == "story planning" and response_mode == "schema" and (schema_field or not fields):
                 diagnostics["category"] = "response_schema_rejected"
                 message = "Gemini rejected the structured JSON Schema request (HTTP 400). The model may be valid while a schema element or schema-mode parameter is unsupported. Select JSON-only format to retry explicitly without provider-side schema enforcement."
                 error_code = "schema_rejected"
@@ -197,8 +201,15 @@ class GeminiStoryPlanner(StoryPlanner):
             return GeminiPlanningError(error_code, message, retryable_by_user=True, diagnostics=diagnostics)
         if status == 404:
             diagnostics["category"] = "model_or_endpoint_incompatible"
+            if context == "generation endpoint probe":
+                message = ("The basic Gemini generateContent request returned HTTP 404. This request contained only "
+                           "the fixed diagnostic text and no schema or media. Check the API key's Google project, "
+                           "Gemini API access, and current availability of the account-listed model.")
+            else:
+                message = ("Gemini returned 404 for structured generation. The selected model may not support the "
+                           "generateContent API, may no longer be available, or may be incompatible with this API version.")
             return GeminiPlanningError("model_or_endpoint_incompatible",
-                "Gemini returned 404 for structured generation. The selected model may not support the generateContent API, may no longer be available, or may be incompatible with this API version. Test the connection and choose an account-listed Flash model that supports generateContent." + cls._diagnostic_suffix(diagnostics),
+                message + cls._diagnostic_suffix(diagnostics),
                 retryable_by_user=True, diagnostics=diagnostics)
         if "timeout" in class_name or isinstance(exc, TimeoutError):
             return GeminiPlanningError("timeout", "Gemini did not finish before the configured request timeout. Its remote outcome is unknown; the run will not resend automatically.", retryable_by_user=True)
@@ -279,6 +290,52 @@ class GeminiStoryPlanner(StoryPlanner):
             raise
         except Exception as exc:
             raise self._classify_error(exc, "connection") from None
+
+    def test_generation_endpoint(self) -> dict[str, Any]:
+        """Send one fixed text-only request through the same SDK route as planning."""
+        self._require_key()
+        try:
+            client = self.client_factory(self.api_key, self.timeout_seconds)
+            http_options = getattr(client._api_client, "_http_options", None)
+            api_version = getattr(http_options, "api_version", None) or GEMINI_API_VERSION
+            base_url = getattr(http_options, "base_url", None) or "https://generativelanguage.googleapis.com/"
+            from urllib.parse import urlsplit
+            host = urlsplit(base_url).hostname or "generativelanguage.googleapis.com"
+            model_id = self.model.removeprefix("models/")
+            route = f"/{api_version}/models/{model_id}:generateContent"
+            try:
+                response = client.models.generate_content(
+                    model=self.model,
+                    contents=GENERATION_ENDPOINT_PROBE_PROMPT,
+                    config={"max_output_tokens": 24},
+                )
+            except Exception as exc:
+                error = self._classify_error(exc, "generation endpoint probe")
+                error.diagnostics.update({"model": model_id, "api_version": api_version,
+                                          "endpoint_host": host, "endpoint_path": route,
+                                          "request_shape": "text_only_no_schema_no_media"})
+                if error.code == "model_or_endpoint_incompatible":
+                    error.args = ("The account-listed model's basic generateContent request returned 404. "
+                                  "The request used the pinned SDK route shown below; schema settings were not sent. "
+                                  "Check that the Gemini API is enabled for the API key's project and confirm "
+                                  "the listed model is available to this key." + self._diagnostic_suffix(error.diagnostics),)
+                raise error from None
+            text = getattr(response, "text", None)
+            if not isinstance(text, str) or not text.strip():
+                raise GeminiPlanningError("empty_generation_response",
+                    "Gemini accepted the basic generateContent request but returned no text. Check provider safety feedback and account access.",
+                    retryable_by_user=True,
+                    diagnostics={"http_status": 200, "model": model_id, "api_version": api_version,
+                                 "endpoint_host": host, "endpoint_path": route,
+                                 "request_shape": "text_only_no_schema_no_media"})
+            return {"success": True, "http_status": 200, "model": model_id,
+                    "api_version": api_version, "endpoint_host": host,
+                    "endpoint_path": route, "request_shape": "text_only_no_schema_no_media",
+                    "response_text": text.strip()[:240]}
+        except GeminiPlanningError:
+            raise
+        except Exception as exc:
+            raise self._classify_error(exc, "generation endpoint probe") from None
 
     def _require_key_for_test(self):
         if not self.api_key:
