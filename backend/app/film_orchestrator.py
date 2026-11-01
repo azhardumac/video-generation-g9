@@ -131,6 +131,11 @@ class FilmOrchestrator:
         run = self.get(run_id)
         if run["status"] not in {"paused", "needs_attention"}:
             raise FilmRunTransitionError("Only a paused or blocked film run can be resumed")
+        if run["stage"] == "understand_story":
+            # Resume is a user action. A failed or interrupted Gemini request
+            # may have incurred a charge; only this explicit action authorizes
+            # a new request. Completed output remains cached and is reused.
+            self.db.authorize_film_run_planner_retry(run_id)
         updated = self.db.update_film_run(run_id, expected_revision, status="waiting_for_planner", message="Resumed from the last durable checkpoint.")
         self.db.transition_film_run_batch(run_id, "resume")
         return updated

@@ -135,6 +135,8 @@ The backend processes local generation jobs sequentially and records their statu
 
 AI Video Studio runs on localhost by default. Reference images, generated videos, project databases, downloaded model weights, and caches are excluded from Git. You control which project assets are imported or linked. The setup process does not upload local production data to this repository.
 
+FRAMEWORK can use Gemini as an explicitly selected story-planning provider. It sends the story prompt, project style text, generation preset/budget, and opaque selected-reference IDs/categories only after the user opts in for that run. It never uploads reference images, generated media, filenames, local paths, reference notes, or the full project database. LTX generation and Remotion rendering stay local. Google account tier and usage policy vary: Google states that free-tier content may be used to improve products while paid-tier content is not; FRAMEWORK cannot determine your tier or quote a reliable planning price. Review [Google's Gemini API pricing and tier details](https://ai.google.dev/gemini-api/docs/pricing) before connecting a key.
+
 Dependencies and model downloads access their respective external package and hosting services during installation. Review those providers' licenses and terms before use or redistribution.
 
 ## License
@@ -187,15 +189,36 @@ run resumes only from a persisted paused checkpoint; it does not re-submit queue
 LTX jobs automatically. Existing independent local queue jobs retain their
 pre-existing worker behavior.
 
-An optional local structured planner can be configured using
+Gemini is the recommended optional story planner. In **Settings**, choose
+**Connect Gemini**, enter a user-owned key, test the connection, and select a
+Flash-class model listed as available to that account. The backend stores the
+key in a protected local file (`GEMINI_SECRET_PATH`, mode 0600) or reads
+`GEMINI_API_KEY` from the backend environment. The key is never returned to the
+browser or written to SQLite, film-run checkpoints, or logs. FRAMEWORK uses the
+official pinned `google-genai` SDK and Gemini structured JSON output, then
+validates every result against the strict Pydantic `StoryPlan` schema, project
+references, story order, identity/count consistency, shot limits, and generation
+budgets. Each run is limited to two planning requests (one optional schema
+repair), with at most five planning attempts per hour and three explicit
+attempts per run. Returned
+token usage is saved when available; a dollar estimate is not fabricated.
+
+**Create Film** requires an explicit per-run cloud-processing opt-in for Gemini.
+Only prompt and disclosed metadata are sent; all image/video media work remains
+local. A Gemini request is durably reserved before network I/O. A completed
+validated plan is reused after restart; an interrupted request is never resent
+automatically because its remote outcome may be billable. Retrying a blocked
+planning stage is an explicit user action. Missing keys, account quota, rate
+limits, invalid output, timeouts, and unavailable models stop before jobs are
+queued with a clear error. No model weights are downloaded.
+
+An optional local structured planner remains available using
 `STORY_PLANNER_COMMAND` in `.env` as a JSON argument array, for example
-`["/absolute/path/to/local-planner"]`. The executable receives a JSON request
-and schema on stdin and must return one `StoryPlan` JSON object on stdout. The
-app never starts a shell, calls a cloud provider, or downloads planner weights.
-Without this executable, Create Film saves the authorized run and reports that
-planning is blocked; it creates no storyboard or generation jobs. A configured
-command is called **unverified** until its output passes the contract and
-project-reference checks for that run.
+`["/absolute/path/to/local-planner"]`. It receives a JSON request on stdin and
+must return a `StoryPlan` JSON object on stdout. Without a configured provider,
+Create Film reports the blocker and creates no storyboard or generation jobs.
+Local planner results are treated as unverified until they pass the same
+strict schema and project-scope checks.
 
 Validated plans persist project-scoped characters, identity traits, locations,
 ordered scenes and shots, framing, continuity rules, and linked reference

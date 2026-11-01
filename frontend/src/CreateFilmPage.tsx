@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, Check, Film, LoaderCircle, Pause, Play, ShieldCheck, Square, WandSparkles } from 'lucide-react'
+import GeminiConnectionPanel, { type StoryPlannerConfig } from './GeminiConnectionPanel'
 
 type Project = { id: string; name: string }
 type Preset = { name: string; frames: number; fps: number; status: string; visual_drift_warning?: boolean }
@@ -10,6 +11,8 @@ type FilmRun = {
   completed_stages: string[]; error: string | null; events: { revision: number; level: string; message: string; time: string }[]
   generation_jobs_created?: number; planner_status?: string; message?: string
   storyboard_id?: string; creative_review_status?: string|null
+  request?: {planner_provider?:'gemini'|'local';planner_model?:string|null}
+  planner_request?: {status:string;provider:string;model:string;attempts:number;error_code:string|null}|null
   generation_progress?: {total:number;verified:number;queued:number;failed:number;progress:number;shots:{title:string;scene_title:string;status:string;progress:number;events:{time:string;level:string;message:string}[]}[]}|null
 }
 type Preview = { maximum_footage_seconds:number; generation_time_estimate_seconds:number|null; estimated_output_bytes:number|null; storage_hard_cap_bytes:number; generation_time_hard_cap_seconds:number; storage_sample_count:number; available_output_bytes:number; disk_sufficient_for_budget:boolean; estimated_output_within_cap:boolean|null; generation_time_within_cap:boolean|null; planner_message:string;general_story_planner_available:boolean }
@@ -18,6 +21,7 @@ type Capabilities = {
   general_story_planner: { available: boolean; status: string; detail: string }
   legacy_planner: { available: boolean; status: string; detail: string }
   creative_quality_detection: { available: boolean; status: string; detail: string }
+  story_planners?: { recommended:string; gemini:{available:boolean;status:string;detail:string};local:{available:boolean;status:string;detail:string} }
 }
 const stageLabels: Record<string,string> = {
   understand_story:'Understand story', define_visual_bible:'Define visual bible', plan_scenes:'Plan scenes',
@@ -38,6 +42,7 @@ export default function CreateFilmPage({project,presets,onMessage,onNavigate}:{p
   const [prompt,setPrompt]=useState('');const [references,setReferences]=useState<Reference[]>([]);const [selectedRefs,setSelectedRefs]=useState<string[]>([])
   const [preset,setPreset]=useState('Short');const [maxShots,setMaxShots]=useState(12);const [maxRetries,setMaxRetries]=useState(1);const [maxRuntime,setMaxRuntime]=useState(3600);const [maxBytes,setMaxBytes]=useState(8*1024**3)
   const [runs,setRuns]=useState<FilmRun[]>([]);const [capabilities,setCapabilities]=useState<Capabilities|null>(null);const [busy,setBusy]=useState(false);const [error,setError]=useState('')
+  const [plannerProvider,setPlannerProvider]=useState<'gemini'|'local'>('gemini');const [geminiConfig,setGeminiConfig]=useState<StoryPlannerConfig|null>(null);const [remoteConsent,setRemoteConsent]=useState(false)
   const pendingRequest=useRef<{signature:string;key:string}|null>(null)
   const projectId=project?.id
   const load=useCallback(async()=>{
@@ -53,12 +58,14 @@ export default function CreateFilmPage({project,presets,onMessage,onNavigate}:{p
     void load();const timer=window.setInterval(()=>void load(),2500);return()=>clearInterval(timer)
   },[load,projectId])
   useEffect(()=>{void requestJson<Capabilities>('/api/film-orchestration/capabilities').then(setCapabilities).catch(e=>setError(e instanceof Error?e.message:String(e)))},[])
+  useEffect(()=>{void requestJson<StoryPlannerConfig>('/api/story-planner/config').then(setGeminiConfig).catch(e=>setError(e instanceof Error?e.message:String(e)))},[])
   const selectedPreset=presets.find(item=>item.name===preset)
   function toggleReference(id:string){setSelectedRefs(current=>current.includes(id)?current.filter(item=>item!==id):[...current,id])}
   async function createFilm(){
     if(!project||!prompt.trim())return
     const budget={max_shots:maxShots,max_retries_per_shot:maxRetries,max_generation_seconds:maxRuntime,max_output_bytes:maxBytes}
-    const input={prompt:prompt.trim(),reference_ids:selectedRefs,preset,budget}
+    const input={prompt:prompt.trim(),reference_ids:selectedRefs,preset,budget,planner_provider:plannerProvider,
+      planner_model:plannerProvider==='gemini'?geminiConfig?.gemini.model??null:null,remote_processing_consent:plannerProvider==='gemini'&&remoteConsent}
     const signature=JSON.stringify(input)
     const signatureHash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(signature)))).map(value=>value.toString(16).padStart(2,'0')).join('')
     if(!pendingRequest.current||pendingRequest.current.signature!==signatureHash){pendingRequest.current={signature:signatureHash,key:crypto.randomUUID()}}
@@ -87,7 +94,11 @@ Available output disk: ${formatBytes(preview.available_output_bytes)}
 Storage hard cap: ${formatBytes(maxBytes)}
 Retries per shot: ${maxRetries}${presetWarning}
 
-This confirms the declared local LTX generation scope. If a local story planner is configured, the app will validate a structured plan against these limits, then use the existing single-worker LTX queue. Technical checks do not approve creative quality; the run will stop for creative review after generation.`
+Planner: ${plannerProvider==='gemini'?`Gemini API${geminiConfig?.gemini.model?` · ${geminiConfig.gemini.model}`:''} (up to two structured-planning requests, including one schema repair)`:'configured local planner'}
+
+${plannerProvider==='gemini'?'You opted in to send the story prompt, project style text, preset/budget, and opaque selected-reference IDs/categories to Google. No images, generated media, filenames, paths, reference notes or project database are uploaded. Gemini planning may incur charges; the account tier and exact price are not known to FRAMEWORK.':'Story planning stays local.'} LTX generation and Remotion rendering remain local.
+
+Technical checks do not approve creative quality; the run will stop for creative review after generation.`
       if(!window.confirm(confirmation))return
       const run=await requestJson<FilmRun>(`/api/projects/${project.id}/film-runs`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...input,idempotency_key:pendingRequest.current.key,initial_confirmation:true})})
       pendingRequest.current=null
@@ -96,6 +107,9 @@ This confirms the declared local LTX generation scope. If a local story planner 
     }catch(e){setError(e instanceof Error?e.message:String(e))}finally{setBusy(false)}
   }
   async function control(run:FilmRun,action:'pause'|'resume'|'cancel'){
+    if(action==='resume'&&run.stage==='understand_story'&&run.request?.planner_provider==='gemini'&&run.planner_request&&['started','failed'].includes(run.planner_request.status)&&!['missing_key','model_missing','model_unavailable'].includes(run.planner_request.error_code??'')){
+      if(!window.confirm('The previous Gemini request may have reached Google and may be billable. FRAMEWORK will not retry automatically. Authorize one new explicit planning attempt?'))return
+    }
     setBusy(true);setError('')
     try{const updated=await requestJson<FilmRun>(`/api/film-runs/${run.id}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({expected_revision:run.revision})});setRuns(current=>current.map(item=>item.id===updated.id?updated:item));onMessage(`Film request ${action}d.`)}catch(e){setError(e instanceof Error?e.message:String(e));await load()}finally{setBusy(false)}
   }
@@ -106,6 +120,8 @@ This confirms the declared local LTX generation scope. If a local story planner 
       {!project?<div className="model-caution"><AlertTriangle size={14}/> Select or create a project before starting a film request. <button className="text-button" onClick={()=>onNavigate('Projects')}>Open Projects</button></div>:<>
         <div className="create-film-project"><Film size={15}/><span>Project</span><b>{project.name}</b></div>
         <label className="setting-field create-film-prompt"><span>STORY PROMPT</span><textarea maxLength={20000} value={prompt} onChange={event=>setPrompt(event.target.value)} placeholder="What story should the film tell? Describe the characters, what changes, and how it ends."/><small>{prompt.length.toLocaleString()} / 20,000</small></label>
+        <div className="create-film-planner-choice"><div><div className="section-kicker">STORY PLANNING PROVIDER</div><p>Gemini API is recommended for general stories. Your selected planner only creates the structured plan; all video work remains local.</p></div><label><input type="radio" name="story-planner-provider" checked={plannerProvider==='gemini'} onChange={()=>{setPlannerProvider('gemini');setRemoteConsent(false)}}/> Gemini API <small>Recommended · cloud</small></label><label><input type="radio" name="story-planner-provider" checked={plannerProvider==='local'} onChange={()=>{setPlannerProvider('local');setRemoteConsent(false)}}/> Local planner <small>Optional · offline</small></label></div>
+        {plannerProvider==='gemini'&&<><GeminiConnectionPanel compact onConfig={setGeminiConfig}/><label className="gemini-consent"><input type="checkbox" checked={remoteConsent} onChange={event=>setRemoteConsent(event.target.checked)}/><span>I opt in to send the disclosed prompt and minimal planning metadata to Google Gemini for this film run. No reference image or generated media is uploaded.</span></label>{geminiConfig?.gemini.status!=='connected'&&<div className="model-caution"><AlertTriangle size={13}/>{geminiConfig?.gemini.detail??'Connect and test a Gemini API key before planning. No cloud request is made automatically.'}</div>}</>}
         <details className="create-film-advanced"><summary>References and generation budget</summary>
           <p>Choose linked local images for characters or environments. Historical outputs are not accepted as silent references.</p>
           {references.length?<div className="create-film-reference-list">{references.map(ref=><label key={ref.id}><input type="checkbox" checked={selectedRefs.includes(ref.id)} onChange={()=>toggleReference(ref.id)}/><span>{ref.name}</span><small>{ref.category}</small></label>)}</div>:<p>No linked image references in this project. You can add them in <button className="text-button" onClick={()=>onNavigate('References')}>References</button>.</p>}
@@ -118,8 +134,8 @@ This confirms the declared local LTX generation scope. If a local story planner 
           </div>
           <div className="create-film-estimate"><b>Approval preview</b><span>Up to {(maxShots*((selectedPreset?.frames??49)/(selectedPreset?.fps??24))).toFixed(1)}s of requested footage · {Math.ceil(maxRuntime/60)} minute time cap · {formatBytes(maxBytes)} output cap.</span><small>Click Create Film to get a read-only time estimate from local benchmark history and a size estimate from this project’s verified outputs before confirming. Missing measurements are shown as unavailable rather than guessed.</small></div>
         </details>
-        {capabilities&&<div className="create-film-limitation"><ShieldCheck size={15}/><div><b>Local story planning · {capabilities.general_story_planner.status.replaceAll('_',' ')}</b><span>{capabilities.general_story_planner.detail} {capabilities.general_story_planner.available?'The configured command is not pre-certified; each returned plan is schema and project-reference validated.':''} Creative QA remains manual; ffprobe only verifies technical media properties.</span></div></div>}
-        <div className="create-film-actions"><button className="button primary" disabled={busy||!prompt.trim()} onClick={()=>void createFilm()}>{busy?<LoaderCircle className="spin" size={15}/>:<WandSparkles size={15}/>} Create Film</button><span>One initial confirmation records the generation authorization and budget. Creative review remains separate.</span></div>
+        {plannerProvider==='local'&&<div className="create-film-limitation"><ShieldCheck size={15}/><div><b>Optional local planner · {capabilities?.story_planners?.local.status.replaceAll('_',' ')??'checking'}</b><span>{capabilities?.story_planners?.local.detail??'Checking local planner availability.'} Every result is schema and project-scope validated.</span></div></div>}
+        <div className="create-film-actions"><button className="button primary" disabled={busy||!prompt.trim()||(plannerProvider==='gemini'&&!remoteConsent)} onClick={()=>void createFilm()}>{busy?<LoaderCircle className="spin" size={15}/>:<WandSparkles size={15}/>} Create Film</button><span>One action requests planning and authorizes the declared local generation budget. Gemini planning requires the explicit opt-in above; creative review remains separate.</span></div>
       </>}
       {error&&<div className="model-caution"><AlertTriangle size={13}/>{error}</div>}
     </section>

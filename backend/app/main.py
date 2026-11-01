@@ -24,6 +24,8 @@ from .integrations import detect_integrations
 from .film_planner import UnsupportedStory, make_approved_fable_plan, validate_approved_fable
 from .film_orchestrator import FilmOrchestrator, FilmRunConflict, FilmRunTransitionError, STAGES
 from .story_planning import LocalStoryPlanner
+from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner
+from .gemini_secrets import GeminiSecretStore, SecretStoreError
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, GenerationSettings, Preset
 from .projects import IMAGE_TYPES, VIDEO_TYPES, scan_project
@@ -36,6 +38,7 @@ from .worker import LocalWorker
 settings = get_settings()
 db = Database(settings)
 worker = LocalWorker(db, settings)
+gemini_secret_store = worker.film_runs.secret_store
 film_orchestrator = FilmOrchestrator(db)
 resource_preflight = ResourcePreflight(settings)
 
@@ -182,6 +185,9 @@ class CreateFilmRunRequest(BaseModel):
     budget: FilmRunBudget = Field(default_factory=FilmRunBudget)
     idempotency_key: str = Field(min_length=1, max_length=128)
     initial_confirmation: bool = False
+    planner_provider: Literal["gemini", "local"] = "local"
+    planner_model: str | None = Field(default=None, min_length=1, max_length=120)
+    remote_processing_consent: bool = False
 
     @model_validator(mode="after")
     def normalized_prompt(self):
@@ -190,6 +196,8 @@ class CreateFilmRunRequest(BaseModel):
             raise ValueError("Story prompt cannot be blank")
         if len(set(self.reference_ids)) != len(self.reference_ids):
             raise ValueError("Reference selections must be unique")
+        if self.planner_provider == "local" and self.remote_processing_consent:
+            raise ValueError("Remote-processing consent applies only to Gemini planning")
         return self
 
 
@@ -201,6 +209,10 @@ class FilmRunAuthorizationRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     confirmed: bool = False
     budget_acknowledged: bool = False
+
+
+class GeminiModelRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=120)
 
 
 class ApproveFilmPlanRequest(BaseModel):
@@ -919,10 +931,15 @@ def list_storyboards(project_id: str | None = None):
 
 @app.get("/api/film-orchestration/capabilities")
 def film_orchestration_capabilities():
-    planner = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()
+    local_planner = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()
+    gemini = _gemini_planner_config()
     return {
         "stages": list(STAGES),
-        "general_story_planner": planner,
+        "general_story_planner": {"available": gemini["status"] == "connected" or local_planner["available"],
+                                   "status": gemini["status"] if gemini["status"] == "connected" else local_planner["status"],
+                                   "detail": "Gemini is connected and has an account-verified Flash model selected." if gemini["status"] == "connected" else local_planner["detail"]},
+        "story_planners": {"recommended": "gemini", "gemini": {"available": gemini["status"] == "connected", "status": gemini["status"], "detail": gemini["detail"]},
+                           "local": local_planner},
         "legacy_planner": {"available": True, "status": "limited_fixture",
                            "detail": "The existing deterministic planner is limited to the approved Scorpion & Frog fable."},
         "technical_verification": {"available": True, "method": "ffprobe"},
@@ -932,6 +949,138 @@ def film_orchestration_capabilities():
         "remotion": {"available": Path(settings.expanded(settings.remotion_executable)).is_file(),
                      "explicit_confirmation_required": True},
     }
+
+
+def _gemini_planner_config() -> dict:
+    try:
+        key, source = gemini_secret_store.get()
+    except SecretStoreError as exc:
+        return {"status": "storage_error", "source": None, "model": None, "models": [], "detail": str(exc)}
+    saved = db.get_setting("story_planner_gemini") or {}
+    models = saved.get("models", []) if key else []
+    if not key:
+        status, detail = "missing_key", "Connect your own Gemini API key in Settings; cloud planning stays opt-in per film run."
+    elif saved.get("status") == "connected" and saved.get("models"):
+        status, detail = "connected", "Key was tested and account-listed Flash models are available. Test again if key permissions changed."
+    elif saved.get("status") == "connection_failed":
+        status, detail = "connection_failed", {
+            "auth_denied": "Gemini rejected the key or account. Check API access and permissions, then test again.",
+            "rate_limit": "Gemini connection testing reached an account rate or quota limit. Wait and review the account quota.",
+            "service_unavailable": "Gemini was unavailable during the last connection test. Retry after the provider recovers.",
+            "timeout": "The last Gemini connection test timed out. Its result is unknown; test again manually.",
+        }.get(saved.get("error_code"), "The last Gemini connection test failed. Recheck the key and account model access, then test again.")
+    elif saved.get("status") == "no_flash_models":
+        status, detail = "no_flash_models", "The key was accepted, but this account returned no Flash-class models available to FRAMEWORK. Check account model access."
+    else:
+        status, detail = "configured_not_tested", "A backend-only Gemini key is configured. Test the connection to list account-available Flash models."
+    model = saved.get("model") if any(item.get("id") == saved.get("model") for item in models) else None
+    return {"status": status, "source": source, "model": model, "models": models, "detail": detail}
+
+
+@app.get("/api/story-planner/config")
+def story_planner_config():
+    config = _gemini_planner_config()
+    return {"provider_default": "gemini", "gemini": config,
+            "local": LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability(),
+            "privacy": {"uploads_media": False, "remote_fields": ["story prompt", "project style text", "preset and generation budget", "opaque selected-reference IDs and categories"],
+                        "omitted_fields": ["reference images", "generated media", "file paths", "filenames", "reference notes", "entire project database"]}}
+
+
+def _store_gemini_key_value(api_key: str):
+    try:
+        gemini_secret_store.save(api_key)
+    except (ValueError, SecretStoreError) as exc:
+        raise HTTPException(400, str(exc)) from None
+    saved = db.get_setting("story_planner_gemini") or {}
+    db.put_setting("story_planner_gemini", {"status": "configured_not_tested", "models": [], "model": None,
+                                               "last_connection_test_at": saved.get("last_connection_test_at")})
+    return {"saved": True, "status": "configured_not_tested", "source": "local_file",
+            "detail": "Key stored by the backend with owner-only file permissions. The key is never returned to the browser."}
+
+
+@app.post("/api/story-planner/gemini/key")
+async def save_gemini_key(request: Request):
+    try:
+        if int(request.headers.get("content-length", "0")) > 8192:
+            raise HTTPException(413, "Gemini key request body exceeds the 8 KiB limit.")
+    except ValueError:
+        raise HTTPException(400, "Invalid request body size.") from None
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Provide a Gemini API key in a JSON request body.") from None
+    api_key = payload.get("api_key") if isinstance(payload, dict) else None
+    if not isinstance(api_key, str):
+        raise HTTPException(400, "Provide a Gemini API key as a string.")
+    return _store_gemini_key_value(api_key)
+
+
+@app.delete("/api/story-planner/gemini/key")
+def remove_gemini_key():
+    try:
+        gemini_secret_store.delete()
+    except SecretStoreError as exc:
+        raise HTTPException(409, str(exc)) from None
+    db.put_setting("story_planner_gemini", {"status": "missing_key", "models": [], "model": None})
+    return {"removed": True, "status": "missing_key"}
+
+
+@app.post("/api/story-planner/gemini/test")
+def test_gemini_connection():
+    try:
+        key, source = gemini_secret_store.get()
+    except SecretStoreError as exc:
+        raise HTTPException(409, str(exc)) from None
+    if not key:
+        raise HTTPException(409, "Gemini API key is missing. Connect it in Settings first.")
+    saved = db.get_setting("story_planner_gemini") or {}
+    try:
+        last = float(saved.get("last_connection_test_at") or 0)
+    except (TypeError, ValueError):
+        last = 0
+    if __import__("time").time() - last < 10:
+        raise HTTPException(429, "Connection test was just run. Wait 10 seconds before testing again.")
+    now = __import__("time").time()
+    recent_tests = [float(value) for value in saved.get("connection_test_times", [])
+                    if isinstance(value, (int, float)) and value >= now - 3600]
+    if len(recent_tests) >= 10:
+        raise HTTPException(429, "FRAMEWORK limits Gemini account connection tests to 10 per hour. Wait before testing again.")
+    recent_tests.append(now)
+    saved["connection_test_times"] = recent_tests
+    saved["last_connection_test_at"] = now
+    db.put_setting("story_planner_gemini", saved)
+    try:
+        models = GeminiStoryPlanner(key, None, settings.gemini_timeout_seconds).test_connection()
+    except GeminiPlanningError as exc:
+        db.put_setting("story_planner_gemini", {"status": "connection_failed", "models": [], "model": None,
+                                                  "error_code": exc.code, "last_connection_test_at": now,
+                                                  "connection_test_times": recent_tests})
+        raise HTTPException(502 if exc.code == "service_unavailable" else 401 if exc.code == "auth_denied" else 400,
+                            {"code": exc.code, "message": str(exc)}) from None
+    if not models:
+        db.put_setting("story_planner_gemini", {"status": "no_flash_models", "models": [], "model": None,
+                                                  "last_connection_test_at": now, "connection_test_times": recent_tests})
+        raise HTTPException(409, "The connected account returned no available Gemini Flash-class models. Check account model access.")
+    ids = {item["id"] for item in models}
+    selected = saved.get("model") if saved.get("model") in ids else models[0]["id"]
+    db.put_setting("story_planner_gemini", {"status": "connected", "models": models, "model": selected,
+                                              "source": source, "last_connection_test_at": now,
+                                              "connection_test_times": recent_tests})
+    return {"connected": True, "status": "connected", "models": models, "model": selected,
+            "detail": "Key accepted. Models were listed from this account; only available Flash-class models are selectable."}
+
+
+@app.patch("/api/story-planner/gemini/model")
+def select_gemini_model(payload: GeminiModelRequest):
+    config = _gemini_planner_config()
+    if config["status"] != "connected":
+        raise HTTPException(409, "Test the Gemini connection before selecting an account model.")
+    if payload.model not in {item["id"] for item in config["models"]}:
+        raise HTTPException(400, "Choose a Flash-class model returned by the last successful account connection test.")
+    saved = db.get_setting("story_planner_gemini") or {}
+    saved["model"] = payload.model
+    db.put_setting("story_planner_gemini", saved)
+    return {"model": payload.model, "status": "connected"}
 
 
 @app.post("/api/projects/{project_id}/film-runs/preview")
@@ -966,6 +1115,8 @@ def preview_film_run(project_id: str, request: CreateFilmRunRequest):
         "queues_jobs": False,
         "general_story_planner_available": LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()["available"],
         "planner_message": LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()["detail"],
+        "planner_provider": request.planner_provider,
+        "gemini_available": _gemini_planner_config()["status"] == "connected",
         "requested_max_shots": request.budget.max_shots,
         "preset": request.preset,
         "frames": frames,
@@ -994,7 +1145,14 @@ def list_film_runs(project_id: str):
 
 
 def _film_run_status(run: dict) -> dict:
-    run["planner_status"] = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()["status"]
+    provider = run.get("request", {}).get("planner_provider", "local")
+    if provider == "gemini":
+        run["planner_status"] = _gemini_planner_config()["status"]
+        request = db.film_run_planner_request(run["id"], include_result=False)
+        run["planner_request"] = ({"status": request["status"], "provider": request["provider"], "model": request["model"],
+                                   "attempts": request["attempts"], "error_code": request.get("error_code")} if request else None)
+    else:
+        run["planner_status"] = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()["status"]
     batch_id = run.get("film_batch_id") or run.get("checkpoint", {}).get("generate_shots", {}).get("film_batch_id")
     batch = db.get_film_batch(batch_id) if batch_id else None
     run["generation_jobs_created"] = batch["total_shots"] if batch else 0
@@ -1013,6 +1171,13 @@ def _film_run_status(run: dict) -> dict:
 @app.post("/api/projects/{project_id}/film-runs", status_code=201)
 def create_film_run(project_id: str, request: CreateFilmRunRequest):
     project = _project(project_id)
+    if request.planner_provider == "gemini" and not request.remote_processing_consent:
+        raise HTTPException(400, "Gemini planning requires explicit opt-in to send the story prompt and disclosed metadata to Google.")
+    if request.planner_provider == "gemini" and not request.initial_confirmation:
+        raise HTTPException(400, "Gemini planning is authorized only as part of an explicitly confirmed film run.")
+    gemini_config = _gemini_planner_config() if request.planner_provider == "gemini" else None
+    if request.planner_provider == "gemini" and request.planner_model and request.planner_model not in {item["id"] for item in gemini_config["models"]}:
+        raise HTTPException(400, "Choose a Gemini Flash model returned by the last successful account connection test.")
     preview = preview_film_run(project_id, request)
     free_bytes = preview["available_output_bytes"]
     if free_bytes < request.budget.max_output_bytes:
@@ -1040,10 +1205,15 @@ def create_film_run(project_id: str, request: CreateFilmRunRequest):
         "prompt": request.prompt,
         "reference_ids": [item["id"] for item in references],
         "reference_categories": [item["category"] for item in references],
+        "planner_provider": request.planner_provider,
+        "planner_model": (request.planner_model or (gemini_config.get("model") if gemini_config else None)),
+        "remote_processing_consent": ({"confirmed": True, "provider": "Google Gemini API",
+            "fields": ["story prompt", "project style text", "preset and generation budget", "opaque selected-reference IDs and categories"],
+            "media_uploaded": False} if request.planner_provider == "gemini" and request.remote_processing_consent else {}),
         "preset": request.preset,
         "budget": request.budget.model_dump(),
         "generation_profile": {"frames": frames, "fps": fps, "width": 448, "height": 768},
-        "authorization": ({"confirmed": True, "scope": "local LTX jobs within the declared shot/time/storage budget"}
+        "authorization": ({"confirmed": True, "scope": "local LTX jobs within the declared shot/time/storage budget; Gemini planning explicitly opted in" if request.planner_provider == "gemini" else "local LTX jobs within the declared shot/time/storage budget"}
                           if request.initial_confirmation else {}),
     }
     try:
@@ -1055,11 +1225,19 @@ def create_film_run(project_id: str, request: CreateFilmRunRequest):
         status = 409 if "Idempotency key" in str(exc) else 400
         raise HTTPException(status, str(exc)) from exc
     run = _film_run_status(run)
-    planner_state = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()
-    run["planner_status"] = planner_state["status"]
-    run["message"] = ("The authorized request was saved and will be planned locally." if planner_state["available"] and request.initial_confirmation
-                      else planner_state["detail"] if request.initial_confirmation
-                      else "A dry request was saved. Explicit initial authorization is required before any future generation stage.")
+    local_state = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()
+    gemini_state = _gemini_planner_config()
+    run["planner_status"] = gemini_state["status"] if request.planner_provider == "gemini" else local_state["status"]
+    if run.get("deduplicated"):
+        run["message"] = "An identical active film request already exists. Reusing its durable plan and queue; no duplicate planner API request or LTX jobs were created."
+    elif not request.initial_confirmation:
+        run["message"] = "A dry request was saved. Explicit initial authorization is required before any future planning or generation stage."
+    elif request.planner_provider == "gemini":
+        run["message"] = ("The authorized run will use Gemini only for structured story planning; references and generated media remain local." if gemini_state["status"] == "connected"
+                          else gemini_state["detail"] + " The run is saved and no shot jobs will be queued until planning succeeds.")
+    else:
+        run["message"] = ("The authorized request was saved and will be planned locally." if local_state["available"]
+                          else local_state["detail"])
     return run
 
 
