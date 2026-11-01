@@ -173,7 +173,7 @@ Backend tests do not invoke LTX or Remotion. This release does not run GPU
 generation, video continuation, model downloads, or a Remotion render.
 
 
-## Prompt-first orchestration (Issue #25 · Milestone A)
+## Prompt-first orchestration (Issue #25 · Milestones A–B)
 
 The **Create Film** landing page records project-scoped prompts, approved image
 references, explicit generation authorization, output/time limits, and resumable
@@ -187,11 +187,23 @@ run resumes only from a persisted paused checkpoint; it does not re-submit queue
 LTX jobs automatically. Existing independent local queue jobs retain their
 pre-existing worker behavior.
 
-This milestone does not yet provide a general story-understanding model. The
-existing deterministic planner remains limited to the approved Scorpion & Frog
-fable. An arbitrary prompt is saved as **waiting for planner**, with zero LTX
-jobs, rather than being represented as a completed plan. Technical ffprobe
-verification remains distinct from creative review, and no automatic visual
-quality detector is claimed. The existing manual Story to Film and Export /
-Remotion workflows remain available. General story planning, measured visual QA,
-and selective automated repair are follow-on milestones.
+An optional local structured planner can be configured using
+`STORY_PLANNER_COMMAND` in `.env` as a JSON argument array, for example
+`["/absolute/path/to/local-planner"]`. The executable receives a JSON request
+and schema on stdin and must return one `StoryPlan` JSON object on stdout. The
+app never starts a shell, calls a cloud provider, or downloads planner weights.
+Without this executable, Create Film saves the authorized run and reports that
+planning is blocked; it creates no storyboard or generation jobs. A configured
+command is called **unverified** until its output passes the contract and
+project-reference checks for that run.
+
+Validated plans persist project-scoped characters, identity traits, locations,
+ordered scenes and shots, framing, continuity rules, and linked reference
+provenance. One authorization advances the run to the existing single-worker
+LTX queue. Queue creation is idempotent per film run; job timeouts enforce the
+remaining generation-time budget, and completed output sizes gate subsequent
+shots. One image can condition each shot; text-only shots are supported, and
+image conditioning does not guarantee cross-shot character identity. Technical
+ffprobe verification stays separate from creative approval. Generated clips
+stop in **creative review pending**; this milestone does not automatically
+approve visuals, repair shots, assemble a manifest, or run Remotion.

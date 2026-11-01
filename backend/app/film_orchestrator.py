@@ -1,9 +1,4 @@
-"""Durable, checkpointed film-run orchestration primitives.
-
-No production stage handlers are registered yet. In particular, this module
-never treats ffprobe verification as creative approval and never submits LTX
-or Remotion work by itself.
-"""
+"""Durable, checkpointed film-run orchestration primitives."""
 
 from __future__ import annotations
 
@@ -20,6 +15,7 @@ STAGES = (
     "anchor_visuals",
     "generate_shots",
     "inspect_clips",
+    "creative_review",
     "repair_failed_shots",
     "compose_manifest",
     "render_film",
@@ -45,16 +41,20 @@ def enforce_generation_budget(run: dict[str, Any], result: dict[str, Any], stage
     """Reject plans/results beyond the user's caps before the next stage can run."""
     budget = run["budget"]
     if stage == "plan_scenes":
-        required = {"shot_count", "estimated_generation_seconds", "estimated_output_bytes"}
+        required = {"shot_count"}
         if not required.issubset(result):
-            raise FilmRunTransitionError("Scene planner omitted a required budget estimate")
-        if int(result["shot_count"]) < 1 or int(result["estimated_generation_seconds"]) < 0 or int(result["estimated_output_bytes"]) < 0:
+            raise FilmRunTransitionError("Scene planner omitted the shot count")
+        if int(result["shot_count"]) < 1:
             raise FilmRunTransitionError("Scene planner returned an invalid budget estimate")
         if int(result["shot_count"]) > budget["max_shots"]:
             raise FilmRunTransitionError("Scene plan exceeds the approved maximum shot count")
-        if int(result.get("estimated_generation_seconds", 0)) > budget["max_generation_seconds"]:
+        if result.get("estimated_generation_seconds") is not None and int(result["estimated_generation_seconds"]) < 0:
+            raise FilmRunTransitionError("Scene planner returned an invalid generation-time estimate")
+        if result.get("estimated_output_bytes") is not None and int(result["estimated_output_bytes"]) < 0:
+            raise FilmRunTransitionError("Scene planner returned an invalid output-size estimate")
+        if result.get("estimated_generation_seconds") is not None and int(result["estimated_generation_seconds"]) > budget["max_generation_seconds"]:
             raise FilmRunTransitionError("Scene plan exceeds the approved generation time budget")
-        if int(result.get("estimated_output_bytes", 0)) > budget["max_output_bytes"]:
+        if result.get("estimated_output_bytes") is not None and int(result["estimated_output_bytes"]) > budget["max_output_bytes"]:
             raise FilmRunTransitionError("Scene plan exceeds the approved output storage budget")
     elif stage == "generate_shots":
         required = {"generated_shots", "elapsed_seconds", "output_bytes"}
@@ -77,11 +77,11 @@ def enforce_generation_budget(run: dict[str, Any], result: dict[str, Any], stage
 
 
 class FilmOrchestrator:
-    """Advance a single persisted stage and checkpoint its result atomically.
+    """Persist run lifecycle transitions and low-level deterministic stages.
 
-    Stage handlers are injected so tests can use deterministic fakes. Production
-    requests cannot inject handlers; unavailable capabilities become explicit
-    attention states instead of mocked progress or success.
+    The application worker uses FilmRunEngine for production stages. This
+    handler-injection method remains for isolated unit tests; HTTP callers
+    cannot supply handlers.
     """
 
     def __init__(self, database):
@@ -123,27 +123,28 @@ class FilmOrchestrator:
         run = self.get(run_id)
         if run["status"] not in {"waiting_for_planner", "running"}:
             raise FilmRunTransitionError("Only an active film run can be paused")
-        return self.db.update_film_run(run_id, expected_revision, status="paused", message="Paused at a durable checkpoint.")
+        updated = self.db.update_film_run(run_id, expected_revision, status="paused", message="Paused at a durable checkpoint.")
+        self.db.transition_film_run_batch(run_id, "pause")
+        return updated
 
     def resume(self, run_id: str, expected_revision: int):
         run = self.get(run_id)
-        if run["status"] != "paused":
-            raise FilmRunTransitionError("Only a paused film run can be resumed")
-        return self.db.update_film_run(run_id, expected_revision, status="waiting_for_planner", message="Resumed from the last durable checkpoint.")
+        if run["status"] not in {"paused", "needs_attention"}:
+            raise FilmRunTransitionError("Only a paused or blocked film run can be resumed")
+        updated = self.db.update_film_run(run_id, expected_revision, status="waiting_for_planner", message="Resumed from the last durable checkpoint.")
+        self.db.transition_film_run_batch(run_id, "resume")
+        return updated
 
     def cancel(self, run_id: str, expected_revision: int):
         run = self.get(run_id)
         if run["status"] in TERMINAL_STATUSES:
             raise FilmRunTransitionError("This film run is already terminal")
-        return self.db.update_film_run(run_id, expected_revision, status="cancelled", message="Film run cancelled; existing files and jobs are preserved.")
+        updated = self.db.update_film_run(run_id, expected_revision, status="cancelled", message="Film run cancelled; existing files and jobs are preserved.")
+        self.db.transition_film_run_batch(run_id, "cancel")
+        return updated
 
     def process_one(self, run_id: str, handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None):
-        """Run one injected stage, persisting a checkpoint before returning.
-
-        The default app has no general story planner, vision QA, or end-to-end
-        stage handler configured. Calling this without one therefore records a
-        blocker and never fabricates a completed stage.
-        """
+        """Run one injected stage, persisting a checkpoint before returning."""
         run = self.get(run_id)
         if run["status"] != "waiting_for_planner":
             raise FilmRunTransitionError("Film run is not ready for a stage")
