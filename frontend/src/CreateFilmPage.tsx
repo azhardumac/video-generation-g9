@@ -9,8 +9,10 @@ type FilmRun = {
   status: string; stage: string; revision: number; budget: { max_shots: number; max_retries_per_shot: number; max_generation_seconds: number; max_output_bytes: number }
   completed_stages: string[]; error: string | null; events: { revision: number; level: string; message: string; time: string }[]
   generation_jobs_created?: number; planner_status?: string; message?: string
+  storyboard_id?: string; creative_review_status?: string|null
+  generation_progress?: {total:number;verified:number;queued:number;failed:number;progress:number;shots:{title:string;scene_title:string;status:string;progress:number;events:{time:string;level:string;message:string}[]}[]}|null
 }
-type Preview = { maximum_footage_seconds:number; generation_time_estimate_seconds:number|null; estimated_output_bytes:number|null; storage_hard_cap_bytes:number; generation_time_hard_cap_seconds:number; storage_sample_count:number; available_output_bytes:number; disk_sufficient_for_budget:boolean; estimated_output_within_cap:boolean|null; generation_time_within_cap:boolean|null; planner_message:string }
+type Preview = { maximum_footage_seconds:number; generation_time_estimate_seconds:number|null; estimated_output_bytes:number|null; storage_hard_cap_bytes:number; generation_time_hard_cap_seconds:number; storage_sample_count:number; available_output_bytes:number; disk_sufficient_for_budget:boolean; estimated_output_within_cap:boolean|null; generation_time_within_cap:boolean|null; planner_message:string;general_story_planner_available:boolean }
 type Capabilities = {
   stages: string[]
   general_story_planner: { available: boolean; status: string; detail: string }
@@ -20,6 +22,7 @@ type Capabilities = {
 const stageLabels: Record<string,string> = {
   understand_story:'Understand story', define_visual_bible:'Define visual bible', plan_scenes:'Plan scenes',
   anchor_visuals:'Anchor visuals', generate_shots:'Generate shots', inspect_clips:'Inspect clips',
+  creative_review:'Creative review',
   repair_failed_shots:'Repair failed shots', compose_manifest:'Prepare composition', render_film:'Render film', done:'Done',
 }
 const activeStatuses = new Set(['awaiting_authorization','waiting_for_planner','running','paused'])
@@ -84,7 +87,7 @@ Available output disk: ${formatBytes(preview.available_output_bytes)}
 Storage hard cap: ${formatBytes(maxBytes)}
 Retries per shot: ${maxRetries}${presetWarning}
 
-This confirms the declared local LTX generation scope. No jobs will be queued until a story planner is available; this build will save a durable request only.`
+This confirms the declared local LTX generation scope. If a local story planner is configured, the app will validate a structured plan against these limits, then use the existing single-worker LTX queue. Technical checks do not approve creative quality; the run will stop for creative review after generation.`
       if(!window.confirm(confirmation))return
       const run=await requestJson<FilmRun>(`/api/projects/${project.id}/film-runs`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...input,idempotency_key:pendingRequest.current.key,initial_confirmation:true})})
       pendingRequest.current=null
@@ -99,7 +102,7 @@ This confirms the declared local LTX generation scope. No jobs will be queued un
   return <div className="create-film-page">
     <section className="panel create-film-hero">
       <div className="section-kicker">FRAMEWORK · PROMPT TO FILM</div><h2>Create a film from one prompt</h2>
-      <p>Describe the story. Select only project-approved image references. FRAMEWORK will keep a durable record of the run and its checkpoints.</p>
+      <p>Describe the story and authorize its limits once. FRAMEWORK will plan, validate, queue eligible shots, and report progress. Generated clips remain pending creative review.</p>
       {!project?<div className="model-caution"><AlertTriangle size={14}/> Select or create a project before starting a film request. <button className="text-button" onClick={()=>onNavigate('Projects')}>Open Projects</button></div>:<>
         <div className="create-film-project"><Film size={15}/><span>Project</span><b>{project.name}</b></div>
         <label className="setting-field create-film-prompt"><span>STORY PROMPT</span><textarea maxLength={20000} value={prompt} onChange={event=>setPrompt(event.target.value)} placeholder="What story should the film tell? Describe the characters, what changes, and how it ends."/><small>{prompt.length.toLocaleString()} / 20,000</small></label>
@@ -115,29 +118,32 @@ This confirms the declared local LTX generation scope. No jobs will be queued un
           </div>
           <div className="create-film-estimate"><b>Approval preview</b><span>Up to {(maxShots*((selectedPreset?.frames??49)/(selectedPreset?.fps??24))).toFixed(1)}s of requested footage · {Math.ceil(maxRuntime/60)} minute time cap · {formatBytes(maxBytes)} output cap.</span><small>Click Create Film to get a read-only time estimate from local benchmark history and a size estimate from this project’s verified outputs before confirming. Missing measurements are shown as unavailable rather than guessed.</small></div>
         </details>
-        {capabilities&&!capabilities.general_story_planner.available&&<div className="create-film-limitation"><ShieldCheck size={15}/><div><b>Automation capability status</b><span>{capabilities.general_story_planner.detail} {capabilities.legacy_planner.detail} Creative QA remains manual; ffprobe only verifies technical media properties.</span><button className="text-button" onClick={()=>onNavigate('Story to Film')}>Open the existing production workflow</button></div></div>}
+        {capabilities&&<div className="create-film-limitation"><ShieldCheck size={15}/><div><b>Local story planning · {capabilities.general_story_planner.status.replaceAll('_',' ')}</b><span>{capabilities.general_story_planner.detail} {capabilities.general_story_planner.available?'The configured command is not pre-certified; each returned plan is schema and project-reference validated.':''} Creative QA remains manual; ffprobe only verifies technical media properties.</span></div></div>}
         <div className="create-film-actions"><button className="button primary" disabled={busy||!prompt.trim()} onClick={()=>void createFilm()}>{busy?<LoaderCircle className="spin" size={15}/>:<WandSparkles size={15}/>} Create Film</button><span>One initial confirmation records the generation authorization and budget. Creative review remains separate.</span></div>
       </>}
       {error&&<div className="model-caution"><AlertTriangle size={13}/>{error}</div>}
     </section>
-    <section className="panel create-film-runs"><div className="section-kicker">DURABLE RUN HISTORY</div><h2>Film runs</h2>{runs.length?runs.map(run=><FilmRunCard key={run.id} run={run} busy={busy} onControl={control}/>):<p className="empty-workspace">No film runs in this project yet.</p>}</section>
+    <section className="panel create-film-runs"><div className="section-kicker">DURABLE RUN HISTORY</div><h2>Film runs</h2>{runs.length?runs.map(run=><FilmRunCard key={run.id} run={run} busy={busy} onControl={control} onNavigate={onNavigate}/>):<p className="empty-workspace">No film runs in this project yet.</p>}</section>
   </div>
 }
 
-function FilmRunCard({run,busy,onControl}:{run:FilmRun;busy:boolean;onControl:(run:FilmRun,action:'pause'|'resume'|'cancel')=>void}){
+function FilmRunCard({run,busy,onControl,onNavigate}:{run:FilmRun;busy:boolean;onControl:(run:FilmRun,action:'pause'|'resume'|'cancel')=>void;onNavigate:(page:string)=>void}){
   const stageIndex=Math.max(0,run.completed_stages.length)
-  const progress=Math.round(stageIndex/9*100)
-  const blocked=run.status==='waiting_for_planner'||run.status==='needs_attention'
+  const progress=Math.round(stageIndex/10*100)
+  const blocked=run.status==='needs_attention'
+  const canRetry=blocked&&['understand_story','generate_shots'].includes(run.stage)&&!['not_configured','executable_missing','invalid_configuration'].includes(run.planner_status??'')
   return <article className="film-run-card">
     <header><div><b>{run.prompt.length>100?`${run.prompt.slice(0,100)}…`:run.prompt}</b><small>{new Date(run.updated_at).toLocaleString()} · {run.preset} · {run.budget.max_shots} shot cap</small></div><span className={`job-status ${run.status}`}>{run.status.replaceAll('_',' ')}</span></header>
     <div className="film-run-progress"><span style={{width:`${progress}%`}}/></div>
-    <ol className="film-run-timeline">{["understand_story","define_visual_bible","plan_scenes","anchor_visuals","generate_shots","inspect_clips","repair_failed_shots","compose_manifest","render_film","done"].map((stage,index)=>{
+    <ol className="film-run-timeline">{["understand_story","define_visual_bible","plan_scenes","anchor_visuals","generate_shots","inspect_clips","creative_review","repair_failed_shots","compose_manifest","render_film","done"].map((stage,index)=>{
       const complete=run.completed_stages.includes(stage);const current=run.stage===stage
       return <li className={`${complete?'complete':''} ${current?'current':''}`} key={stage}><span>{complete?<Check size={12}/>:index+1}</span><small>{stageLabels[stage]}</small></li>
     })}</ol>
     {blocked&&<div className="create-film-limitation"><AlertTriangle size={14}/><span>{run.error??'Waiting for a verified general story-planning capability. No shot jobs have been queued.'}</span></div>}
+    {run.status==='needs_review'&&<div className="create-film-limitation"><ShieldCheck size={14}/><div><span>All {run.generation_progress?.verified??0} clip(s) passed technical verification. Creative review is pending; no automatic visual approval or Remotion render occurred.</span><button className="text-button" onClick={()=>onNavigate('Story to Film')}>Review verified clips</button></div></div>}
+    {run.generation_progress&&<div className="film-run-shot-progress"><header><b>Local generation queue</b><span>{run.generation_progress.verified}/{run.generation_progress.total} technically verified · {run.generation_progress.progress}%</span></header>{run.generation_progress.shots.map((shot,index)=><div className="film-run-shot" key={`${index}-${shot.title}`}><span>{shot.scene_title} / {shot.title}</span><b className={`job-status ${shot.status}`}>{shot.status} {shot.status==='running'?`${shot.progress}%`:''}</b>{shot.events.slice(-1).map((event,eventIndex)=><small key={eventIndex}>{event.message}</small>)}</div>)}</div>}
     <div className="create-film-run-meta"><span>Authorization {run.status==='awaiting_authorization'?'not granted':'recorded'}</span><span>Generation jobs created: {run.generation_jobs_created??0}</span><span>Technical verification and creative approval remain separate.</span></div>
     {run.events.length>0&&<details><summary>Checkpoint log</summary><div className="create-film-log">{run.events.map((event,index)=><p key={`${event.revision}-${index}`}><time>{new Date(event.time).toLocaleTimeString()}</time> {event.message}</p>)}</div></details>}
-    <footer>{activeStatuses.has(run.status)&&run.status!=='awaiting_authorization'&&<button className="button secondary mini" disabled={busy} onClick={()=>onControl(run,run.status==='paused'?'resume':'pause')}>{run.status==='paused'?<Play size={12}/>:<Pause size={12}/>} {run.status==='paused'?'Resume':'Pause'}</button>}{!['cancelled','completed','failed'].includes(run.status)&&<button className="button secondary mini" disabled={busy} onClick={()=>onControl(run,'cancel')}><Square size={12}/> Cancel run</button>}</footer>
+    <footer>{((activeStatuses.has(run.status)&&run.status!=='awaiting_authorization')||canRetry)&&<button className="button secondary mini" disabled={busy} onClick={()=>onControl(run,run.status==='paused'||blocked?'resume':'pause')}>{run.status==='paused'||blocked?<Play size={12}/>:<Pause size={12}/>} {blocked?'Retry stage':run.status==='paused'?'Resume':'Pause'}</button>}{!['cancelled','completed','failed','needs_review'].includes(run.status)&&<button className="button secondary mini" disabled={busy} onClick={()=>onControl(run,'cancel')}><Square size={12}/> Cancel run</button>}</footer>
   </article>
 }

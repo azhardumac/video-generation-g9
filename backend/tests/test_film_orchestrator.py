@@ -114,8 +114,8 @@ def test_restart_recovers_running_orchestration_at_checkpoint_without_requeue(tm
 def test_plan_and_repair_results_must_stay_within_budget(tmp_path):
     db, project = make_db(tmp_path)
     run = FilmOrchestrator(db).create(project["id"], "request-7", run_request(), authorized=True)
-    with pytest.raises(FilmRunTransitionError, match="required budget estimate"):
-        enforce_generation_budget(run,{"shot_count":12},"plan_scenes")
+    with pytest.raises(FilmRunTransitionError, match="shot count"):
+        enforce_generation_budget(run,{"estimated_generation_seconds":1000},"plan_scenes")
     with pytest.raises(FilmRunTransitionError, match="shot count"):
         enforce_generation_budget(run,{"shot_count":13,"estimated_generation_seconds":1000,"estimated_output_bytes":1000},"plan_scenes")
     with pytest.raises(FilmRunTransitionError, match="time budget"):

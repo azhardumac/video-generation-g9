@@ -23,6 +23,7 @@ from .db import Database
 from .integrations import detect_integrations
 from .film_planner import UnsupportedStory, make_approved_fable_plan, validate_approved_fable
 from .film_orchestrator import FilmOrchestrator, FilmRunConflict, FilmRunTransitionError, STAGES
+from .story_planning import LocalStoryPlanner
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, GenerationSettings, Preset
 from .projects import IMAGE_TYPES, VIDEO_TYPES, scan_project
@@ -918,10 +919,10 @@ def list_storyboards(project_id: str | None = None):
 
 @app.get("/api/film-orchestration/capabilities")
 def film_orchestration_capabilities():
+    planner = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()
     return {
         "stages": list(STAGES),
-        "general_story_planner": {"available": False, "status": "not_configured",
-                                  "detail": "No local general-purpose story model is configured. Arbitrary prompts are not auto-expanded into scenes."},
+        "general_story_planner": planner,
         "legacy_planner": {"available": True, "status": "limited_fixture",
                            "detail": "The existing deterministic planner is limited to the approved Scorpion & Frog fable."},
         "technical_verification": {"available": True, "method": "ffprobe"},
@@ -963,8 +964,8 @@ def preview_film_run(project_id: str, request: CreateFilmRunRequest):
         "preview_only": True,
         "writes_database": False,
         "queues_jobs": False,
-        "general_story_planner_available": False,
-        "planner_message": "No general story planner is configured; scene count and story runtime cannot yet be inferred from arbitrary prompts.",
+        "general_story_planner_available": LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()["available"],
+        "planner_message": LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()["detail"],
         "requested_max_shots": request.budget.max_shots,
         "preset": request.preset,
         "frames": frames,
@@ -989,7 +990,24 @@ def preview_film_run(project_id: str, request: CreateFilmRunRequest):
 @app.get("/api/projects/{project_id}/film-runs")
 def list_film_runs(project_id: str):
     _project(project_id)
-    return film_orchestrator.list(project_id)
+    return [_film_run_status(run) for run in film_orchestrator.list(project_id)]
+
+
+def _film_run_status(run: dict) -> dict:
+    run["planner_status"] = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()["status"]
+    batch_id = run.get("film_batch_id") or run.get("checkpoint", {}).get("generate_shots", {}).get("film_batch_id")
+    batch = db.get_film_batch(batch_id) if batch_id else None
+    run["generation_jobs_created"] = batch["total_shots"] if batch else 0
+    run["generation_progress"] = ({"total": batch["total_shots"], "verified": batch["completed_shots"],
+                                    "queued": batch["queued_shots"], "failed": batch["failed_shots"],
+                                    "progress": batch["progress"],
+                                    "shots": [{"title": shot["title"], "scene_title": shot["scene_title"],
+                                               "status": shot["status"], "progress": shot.get("progress", 0),
+                                               "events": (shot.get("job") or {}).get("events", [])[-8:]}
+                                              for shot in batch["shots"]]}
+                                   if batch else None)
+    run["creative_review_status"] = "pending" if run["status"] == "needs_review" else None
+    return run
 
 
 @app.post("/api/projects/{project_id}/film-runs", status_code=201)
@@ -1036,10 +1054,12 @@ def create_film_run(project_id: str, request: CreateFilmRunRequest):
     except ValueError as exc:
         status = 409 if "Idempotency key" in str(exc) else 400
         raise HTTPException(status, str(exc)) from exc
-    run["generation_jobs_created"] = 0
-    run["planner_status"] = "not_configured" if run["status"] == "waiting_for_planner" else "awaiting_authorization"
-    run["message"] = ("The request and its budget were saved. A general story planner is not configured, so no shot plan or generation job was created."
-                      if request.initial_confirmation else "A dry request was saved. Explicit initial authorization is required before any future generation stage.")
+    run = _film_run_status(run)
+    planner_state = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()
+    run["planner_status"] = planner_state["status"]
+    run["message"] = ("The authorized request was saved and will be planned locally." if planner_state["available"] and request.initial_confirmation
+                      else planner_state["detail"] if request.initial_confirmation
+                      else "A dry request was saved. Explicit initial authorization is required before any future generation stage.")
     return run
 
 
@@ -1047,7 +1067,7 @@ def create_film_run(project_id: str, request: CreateFilmRunRequest):
 def get_film_run(run_id: str):
     run = film_orchestrator.get(run_id)
     _project(run["project_id"])
-    return run
+    return _film_run_status(run)
 
 
 def _film_run_control(run_id: str, request: FilmRunRevisionRequest, action: str):
@@ -1056,7 +1076,13 @@ def _film_run_control(run_id: str, request: FilmRunRevisionRequest, action: str)
             return film_orchestrator.pause(run_id, request.expected_revision)
         if action == "resume":
             return film_orchestrator.resume(run_id, request.expected_revision)
-        return film_orchestrator.cancel(run_id, request.expected_revision)
+        cancelled = film_orchestrator.cancel(run_id, request.expected_revision)
+        active_job_id = worker.active_job_id
+        if active_job_id:
+            budget = db.film_run_budget_for_job(active_job_id)
+            if budget and budget["run_id"] == run_id:
+                worker.cancel_job(active_job_id)
+        return cancelled
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except (RuntimeError, FilmRunTransitionError) as exc:
@@ -1408,15 +1434,17 @@ def generate_film(storyboard_id: str, request: GenerateFilmRequest):
             raise HTTPException(409, f"Shot '{shot['title']}' requests audio, but no audio capability is configured")
         if payload.get("prompt") != shot["prompt"]:
             raise HTTPException(409, f"Shot '{shot['title']}' saved prompt differs from its generation payload; save the shot plan again")
-        if len(shot.get("reference_ids") or []) != 1:
-            raise HTTPException(409, f"Shot '{shot['title']}' must have exactly one linked character reference for LTX conditioning")
-        reference = _validate_project_reference(project, payload.get("reference_image"))
-        if reference is None:
-            raise HTTPException(409, f"Shot '{shot['title']}' is missing its selected character image")
-        matches = [item for item in db.project_references(project["id"]) if item["id"] == shot["reference_ids"][0]
-                   and Path(item["path"]).resolve() == reference.resolve()]
-        if not matches:
-            raise HTTPException(409, f"Shot '{shot['title']}' reference is no longer linked to this project")
+        reference_ids = shot.get("reference_ids") or []
+        if len(reference_ids) > 1:
+            raise HTTPException(409, f"Shot '{shot['title']}' selects multiple images, but the installed LTX path supports one reference image per shot")
+        reference = _validate_project_reference(project, payload.get("reference_image")) if payload.get("reference_image") else None
+        if len(reference_ids) == 1:
+            matches = [item for item in db.project_references(project["id"]) if item["id"] == reference_ids[0]
+                       and reference and Path(item["path"]).resolve() == reference.resolve()]
+            if not matches:
+                raise HTTPException(409, f"Shot '{shot['title']}' reference is no longer linked to this project")
+        elif reference:
+            raise HTTPException(409, f"Shot '{shot['title']}' has an unassociated image path")
         try:
             safe_local_path(payload.get("output_location", ""), settings)
         except ValueError as exc:

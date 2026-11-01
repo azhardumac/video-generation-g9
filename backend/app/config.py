@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     ltx_executable: str = "~/AI-Video-Studio/src/ltx-2-mlx/.venv/bin/ltx-2-mlx"
     remotion_executable: str = "~/AI-Video-Studio/remotion-studio/node_modules/.bin/remotion"
     ffprobe_executable: str = "ffprobe"
+    # Optional local executable. Must accept a JSON request on stdin and emit
+    # one strict StoryPlan JSON object on stdout. No remote planner is used.
+    story_planner_command: str = ""
+    story_planner_timeout_seconds: int = Field(default=300, ge=10, le=1800)
     output_root: str = "~/AI-Video-Studio/outputs"
     allowed_path_roots: str = "~/AI-Video-Studio"
     preflight_max_swap_gb: float = Field(default=24.0, ge=0)
