@@ -199,7 +199,10 @@ official pinned `google-genai` SDK and the `generateContent` structured JSON API
 Only account-listed Flash models advertising `generateContent` support are
 selectable. FRAMEWORK validates every result against the strict Pydantic `StoryPlan` schema, project
 references, story order, identity/count consistency, shot limits, and generation
-budgets. Each run is limited to two planning requests (one optional schema
+budgets. The provider schema's scene, per-scene shot, and location caps and the
+response-token ceiling scale with the authorized shot budget. String length
+constraints remain enforced locally by `StoryPlan`; unsupported JSON Schema
+length keywords are not sent to Gemini. Each run is limited to two planning requests (one optional schema
 repair), with at most five planning attempts per hour and three explicit
 attempts per run. Returned
 token usage is saved when available; a dollar estimate is not fabricated.

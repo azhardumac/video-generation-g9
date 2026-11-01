@@ -112,13 +112,13 @@ def test_interrupted_or_failed_gemini_request_is_never_repeated_until_user_resum
     assert resumed["status"] == "waiting_for_planner"
 
 
-def test_existing_404_failed_run_recovers_only_after_explicit_resume(tmp_path):
+def test_existing_http_400_failed_run_recovers_only_after_explicit_resume(tmp_path):
     from app.gemini_planning import GeminiPlanningError
 
     db, _project, settings, _request, run, secrets = setup_run(tmp_path)
     calls = []
     outcomes = [
-        GeminiPlanningError("model_or_endpoint_incompatible", "404 model/endpoint mismatch", retryable_by_user=True),
+        GeminiPlanningError("invalid_request", "Gemini rejected the structured StoryPlan request safely.", retryable_by_user=True),
         PlannerResult(StoryPlan.model_validate(valid_plan()), {"provider": "gemini", "model": "gemini-3.8-flash",
             "request_count": 1, "usage": {"total_tokens": 100}, "cost_estimate": None}),
     ]
@@ -135,7 +135,7 @@ def test_existing_404_failed_run_recovers_only_after_explicit_resume(tmp_path):
         gemini_planner_factory=lambda *_: RecoveringPlanner(), ltx_ready=lambda: True)
     failed = engine.process_next()
     assert failed["status"] == "needs_attention"
-    assert failed["error"] == "404 model/endpoint mismatch"
+    assert failed["error"] == "Gemini rejected the structured StoryPlan request safely."
     assert db.film_run_planner_request(run["id"], include_result=False)["status"] == "failed"
     assert db.list_jobs(project_id="project-a") == []
     assert engine.process_next() is None
