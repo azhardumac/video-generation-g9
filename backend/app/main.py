@@ -218,6 +218,11 @@ class GeminiModelRequest(BaseModel):
     model: str = Field(min_length=1, max_length=120)
 
 
+class GeminiGenerationEndpointProbeRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=120)
+    confirmed: bool = False
+
+
 class GeminiReplanRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     planner_model: str = Field(min_length=1, max_length=120)
@@ -1080,6 +1085,31 @@ def test_gemini_connection():
                                               "connection_test_times": recent_tests})
     return {"connected": True, "status": "connected", "models": models, "model": selected,
             "detail": "Key accepted. Models were listed from this account; only available Flash-class models are selectable."}
+
+
+@app.post("/api/story-planner/gemini/test-generation")
+def test_gemini_generation_endpoint(payload: GeminiGenerationEndpointProbeRequest):
+    """Explicit, fixed-text API probe; does not create a film run or planner attempt."""
+    if not payload.confirmed:
+        raise HTTPException(400, "Confirm the potentially billable Gemini generation test before continuing.")
+    try:
+        key, _source = gemini_secret_store.get()
+    except SecretStoreError as exc:
+        raise HTTPException(409, str(exc)) from None
+    if not key:
+        raise HTTPException(409, "Gemini API key is missing. Connect it in Settings first.")
+    config = _gemini_planner_config()
+    if config["status"] != "connected":
+        raise HTTPException(409, "Test the Gemini connection and list account models before probing generation.")
+    if payload.model not in {item["id"] for item in config["models"]}:
+        raise HTTPException(400, "Choose a model returned by the latest successful Gemini account test.")
+    try:
+        return GeminiStoryPlanner(key, payload.model, settings.gemini_timeout_seconds).test_generation_endpoint()
+    except GeminiPlanningError as exc:
+        http_status = exc.diagnostics.get("http_status")
+        response_status = 502 if isinstance(http_status, int) and http_status >= 500 else 400
+        raise HTTPException(response_status, {"code": exc.code, "message": str(exc),
+                                               "diagnostics": exc.diagnostics}) from None
 
 
 @app.patch("/api/story-planner/gemini/model")
