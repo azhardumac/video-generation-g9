@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import json
 import shutil
 from statistics import median
 from uuid import UUID, uuid5, NAMESPACE_URL
@@ -12,19 +14,24 @@ from .film_orchestrator import FilmOrchestrator, FilmRunTransitionError, enforce
 from .integrations import detect_integrations
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, GenerationSettings
-from .story_planning import LocalStoryPlanner, PlannerOutputError, PlannerUnavailable, StoryPlan
+from .story_planning import LocalStoryPlanner, PlannerOutputError, PlannerUnavailable, PlannerResult, StoryPlan, StoryPlanner
+from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner
+from .gemini_secrets import GeminiSecretStore, SecretStoreError
 
 
 class FilmRunEngine:
     """Advance one durable stage per call; LTX jobs remain on LocalWorker's queue."""
 
-    def __init__(self, db, settings: Settings, planner: LocalStoryPlanner | None = None,
-                 ltx_ready=None):
+    def __init__(self, db, settings: Settings, planner: StoryPlanner | None = None,
+                 ltx_ready=None, secret_store: GeminiSecretStore | None = None,
+                 gemini_planner_factory=None):
         self.db = db
         self.settings = settings
         self.orchestrator = FilmOrchestrator(db)
         self.planner = planner or LocalStoryPlanner(settings.story_planner_command,
                                                     settings.story_planner_timeout_seconds)
+        self.secret_store = secret_store or GeminiSecretStore(settings.expanded(settings.gemini_secret_path))
+        self.gemini_planner_factory = gemini_planner_factory or GeminiStoryPlanner
         self.ltx_ready = ltx_ready or (lambda: detect_integrations(settings)["ltx"]["ready"])
 
     def process_next(self):
@@ -51,7 +58,7 @@ class FilmRunEngine:
             if run["stage"] == "inspect_clips":
                 return self._inspect(claimed)
             return self._block(claimed, f"Stage '{run['stage']}' has no verified implementation. No export or creative approval was attempted.")
-        except (PlannerUnavailable, PlannerOutputError, FilmRunTransitionError, ValueError, OSError) as exc:
+        except (PlannerUnavailable, PlannerOutputError, GeminiPlanningError, FilmRunTransitionError, ValueError, OSError) as exc:
             return self._block(claimed, str(exc))
         except Exception as exc:
             return self._block(claimed, f"Film stage failed safely: {exc}")
@@ -76,9 +83,9 @@ class FilmRunEngine:
             raise PlannerOutputError("A selected reference is no longer linked to this project")
         budget = run["budget"]
         request = run["request"]
-        planned = self.planner.plan({
+        common = {
             "prompt": run["prompt"], "project_id": project["id"],
-            "project_name": project["name"], "project_style_bible": project.get("style_bible", {}),
+            "project_style_bible": project.get("style_bible", {}),
             "project_aspect_ratio": project.get("aspect_ratio") or "9:16",
             "project_frame_rate": project.get("frame_rate") or 24,
             "project_reference_catalog": catalog,
@@ -89,7 +96,65 @@ class FilmRunEngine:
                 "video_continuation": False, "ic_lora": False,
                 "frames": request.get("generation_profile", {}).get("frames"),
                 "fps": request.get("generation_profile", {}).get("fps")},
-        })
+        }
+        provider = run.get("request", {}).get("planner_provider", "local")
+        if provider == "gemini":
+            if not run.get("request", {}).get("remote_processing_consent", {}).get("confirmed"):
+                raise GeminiPlanningError("cloud_opt_in_missing", "Gemini planning is blocked until the user explicitly opts in to remote prompt processing.")
+            # Do not send project names, asset names, notes, paths, image bytes,
+            # or video files to the cloud provider. IDs and categories are opaque.
+            remote_request = common | {
+                "project_id": None,
+                "project_reference_catalog": [{"id": item["id"], "category": item["category"]} for item in catalog],
+                "reference_privacy": "IDs and categories only; no filenames, notes, paths, or media are included.",
+                "budget": {key: run["budget"][key] for key in ("max_shots", "max_generation_seconds", "max_output_bytes")},
+            }
+            key, _source = self.secret_store.get()
+            model = run.get("request", {}).get("planner_model") or ""
+            if not key:
+                raise GeminiPlanningError("missing_key", "Gemini API key is missing. Connect Gemini in Settings, then resume this run.")
+            saved_models = self.db.get_setting("story_planner_gemini") or {}
+            if model not in {item.get("id") for item in saved_models.get("models", [])}:
+                raise GeminiPlanningError("model_unavailable", "The selected Gemini Flash model is not verified for the current account. Test the connection and select an available model in Settings.")
+            planner = self.gemini_planner_factory(key, model, self.settings.gemini_timeout_seconds)
+            fingerprint = hashlib.sha256(json.dumps({"provider": provider, "model": model, "input": remote_request},
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            reservation = self.db.reserve_film_run_planner_request(run["id"], provider, model, fingerprint)
+            if reservation["status"] == "completed":
+                stored = reservation.get("result") or {}
+                try:
+                    planned = StoryPlan.model_validate(stored["plan"])
+                    provenance = stored.get("provenance") or {}
+                except (KeyError, ValueError) as exc:
+                    raise PlannerOutputError("The saved Gemini plan is malformed; no repeat API request was made.") from exc
+            elif reservation["status"] == "failed":
+                raise GeminiPlanningError(reservation.get("error_code") or "previous_failure",
+                    "The prior Gemini planning request failed. Review the blocker and explicitly retry the stage to authorize another API attempt.",
+                    retryable_by_user=True)
+            elif reservation["status"] == "started" and not reservation.get("created"):
+                raise GeminiPlanningError("outcome_unknown",
+                    "A Gemini request was interrupted before its result was saved. Its remote outcome may be billable; FRAMEWORK did not repeat it. Explicitly retry this stage to authorize a new request.",
+                    retryable_by_user=True)
+            else:
+                try:
+                    result = planner.plan(remote_request)
+                    planned = result.plan if isinstance(result, PlannerResult) else result
+                    provenance = result.provenance if isinstance(result, PlannerResult) else {"provider": "gemini", "model": model}
+                    categories = {item["id"]: item["category"] for item in catalog}
+                    planned.validate_project_scope(selected_ids, categories)
+                    self.db.complete_film_run_planner_request(run["id"], {"plan": planned.model_dump(mode="json"), "provenance": provenance})
+                except GeminiPlanningError as exc:
+                    self.db.fail_film_run_planner_request(run["id"], exc.code)
+                    raise
+                except (PlannerOutputError, ValueError) as exc:
+                    self.db.fail_film_run_planner_request(run["id"], "invalid_output")
+                    raise PlannerOutputError(f"Gemini returned a StoryPlan that failed project validation: {exc}") from exc
+            self._last_planner_provenance = provenance
+        elif provider == "local":
+            planned = self.planner.plan(common)
+            self._last_planner_provenance = {"provider": "local", "mode": "configured-json-cli"}
+        else:
+            raise PlannerUnavailable("The selected story-planning provider is unsupported")
         categories = {item["id"]: item["category"] for item in catalog}
         return planned.validate_project_scope(selected_ids, categories)
 
@@ -108,6 +173,7 @@ class FilmRunEngine:
         if count > run["budget"]["max_shots"]:
             raise FilmRunTransitionError(f"The validated plan has {count} shots, exceeding the authorized {run['budget']['max_shots']} shot limit")
         checkpoint = plan.model_dump(mode="json")
+        checkpoint["planner_provenance"] = getattr(self, "_last_planner_provenance", {"provider": "local"})
         checkpoint["shot_count"] = count
         frames, fps = self._preset(run["request"]["preset"])
         benchmark = next((item for item in self.db.benchmarks()
@@ -224,7 +290,8 @@ class FilmRunEngine:
                     "output_location": str(output), "estimated_seconds": round(seconds_per_shot, 2),
                     "transition_after": shot.transition_after, "generation_payload": payload})
         metadata = {"planner_disclosure": "Structured plan produced by the explicitly configured local planner and validated against the project and run constraints.",
-                    "planner_mode": "local-structured-v1", "story_plan": plan.model_dump(mode="json"),
+                    "planner_mode": run["checkpoint"]["define_visual_bible"].get("planner_provenance", {}).get("provider", "local"),
+                    "planner_provenance": run["checkpoint"]["define_visual_bible"].get("planner_provenance", {}), "story_plan": plan.model_dump(mode="json"),
                     "scene_count": len(plan.scenes), "shot_count": len(rows), "preset": request["preset"],
                     "frames_per_shot": frames, "fps": fps, "width": width, "height": height,
                     "approved_reference_ids": sorted(selected),

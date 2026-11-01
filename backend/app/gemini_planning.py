@@ -1,0 +1,283 @@
+"""Google Gemini adapter for the provider-neutral, strict FRAMEWORK StoryPlan."""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from typing import Any
+
+from pydantic import ValidationError
+
+from .story_planning import PlannerOutputError, PlannerResult, StoryPlan, StoryPlanner
+
+MAX_OUTPUT_TOKENS = 8192
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_TRANSIENT_ATTEMPTS = 2  # Includes the first request; one bounded retry at most.
+MAX_SCHEMA_REPAIR_REQUESTS = 1
+_FLASH_ALLOWLIST = re.compile(r"^(?:models/)?gemini-[a-z0-9][a-z0-9.-]*flash[a-z0-9.-]*$", re.IGNORECASE)
+
+
+class GeminiPlanningError(RuntimeError):
+    def __init__(self, code: str, message: str, *, retryable_by_user: bool = False):
+        super().__init__(message)
+        self.code = code
+        self.retryable_by_user = retryable_by_user
+
+
+def _client(api_key: str, timeout_seconds: int):
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise GeminiPlanningError("sdk_missing", "The Google GenAI Python SDK is not installed in this backend environment.") from exc
+    return genai.Client(api_key=api_key, http_options=types.HttpOptions(
+        timeout=timeout_seconds * 1000,
+        retry_options=types.HttpRetryOptions(attempts=1),
+        base_url="https://generativelanguage.googleapis.com",
+        api_version="v1beta",
+    ))
+
+
+def _model_fields(model) -> tuple[str, str, tuple[str, ...]]:
+    if isinstance(model, dict):
+        name = model.get("name") or model.get("model") or ""
+        display = model.get("display_name") or model.get("displayName") or name
+        actions = model.get("supported_actions") or model.get("supportedActions") or []
+    else:
+        name = getattr(model, "name", "") or getattr(model, "model", "")
+        display = getattr(model, "display_name", None) or getattr(model, "displayName", None) or name
+        actions = getattr(model, "supported_actions", None) or getattr(model, "supportedActions", None) or []
+    normalized = str(name).removeprefix("models/")
+    return normalized, str(display), tuple(str(item) for item in actions)
+
+
+def _safe_usage(interaction) -> dict[str, int | None]:
+    usage = getattr(interaction, "usage", None)
+    if usage is None:
+        return {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+    if hasattr(usage, "model_dump"):
+        usage = usage.model_dump(by_alias=False, exclude_none=True)
+    if not isinstance(usage, dict):
+        return {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+    return {"input_tokens": usage.get("total_input_tokens"),
+            "output_tokens": usage.get("total_output_tokens"),
+            "total_tokens": usage.get("total_tokens")}
+
+
+def gemini_story_schema() -> dict[str, Any]:
+    """Compact supported JSON Schema subset; Pydantic remains the authority."""
+    def obj(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
+        return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
+
+    def string(description: str = "") -> dict[str, Any]:
+        return {"type": "string", **({"description": description} if description else {})}
+
+    def array(item: dict[str, Any], maximum: int, minimum: int = 0) -> dict[str, Any]:
+        return {"type": "array", "items": item, "minItems": minimum, "maxItems": maximum}
+
+    character = obj({"id": string(), "name": string(), "identity": string("Stable visual identity; preserve these attributes in every shot."),
+                     "distinguishing_traits": array(string(), 12, 1), "reference_ids": array(string(), 16)},
+                    ["id", "name", "identity", "distinguishing_traits", "reference_ids"])
+    location = obj({"id": string(), "name": string(), "description": string(), "scale": string(),
+                    "continuity_requirements": array(string(), 12, 1)},
+                   ["id", "name", "description", "scale", "continuity_requirements"])
+    shot = obj({"id": string(), "sequence": {"type": "integer", "minimum": 0}, "title": string(), "beat": string(),
+                "prompt": string(), "framing": string(), "character_layout": string(),
+                "characters_present": array(string(), 20, 1),
+                "expected_character_count": {"type": "integer", "minimum": 1, "maximum": 20},
+                "reference_ids": array(string(), 1), "caption": string(),
+                "transition_after": {"type": "string", "enum": ["cut", "dissolve", "fade"]}},
+               ["id", "sequence", "title", "beat", "prompt", "framing", "character_layout", "characters_present",
+                "expected_character_count", "reference_ids", "caption", "transition_after"])
+    scene = obj({"id": string(), "sequence": {"type": "integer", "minimum": 0}, "title": string(), "story_beat": string(),
+                 "location_id": string(), "characters_present": array(string(), 20, 1), "visual_description": string(),
+                 "framing": string(), "character_layout": string(), "continuity_requirements": array(string(), 16, 1),
+                 "expected_character_count": {"type": "integer", "minimum": 1, "maximum": 20},
+                 "shots": array(shot, 40, 1)},
+                ["id", "sequence", "title", "story_beat", "location_id", "characters_present", "visual_description",
+                 "framing", "character_layout", "continuity_requirements", "expected_character_count", "shots"])
+    return obj({"title": string(), "logline": string(), "visual_style": string(), "audio_requested": {"type": "boolean"},
+                "video_continuation_requested": {"type": "boolean"}, "ic_lora_requested": {"type": "boolean"},
+                "characters": array(character, 20, 1), "locations": array(location, 20, 1), "scenes": array(scene, 40, 1)},
+               ["title", "logline", "visual_style", "audio_requested", "video_continuation_requested", "ic_lora_requested",
+                "characters", "locations", "scenes"])
+
+
+class GeminiStoryPlanner(StoryPlanner):
+    provider = "gemini"
+
+    def __init__(self, api_key: str | None, model: str | None, timeout_seconds: int = 120, client_factory=None,
+                 sleeper=time.sleep):
+        self.api_key, self.model = api_key, model
+        self.timeout_seconds = timeout_seconds
+        self.client_factory = client_factory or _client
+        self.sleeper = sleeper
+
+    @staticmethod
+    def available_models(client) -> list[dict[str, str]]:
+        try:
+            models = client.models.list()
+            result = []
+            for model in models:
+                name, display, _actions = _model_fields(model)
+                if name and _FLASH_ALLOWLIST.fullmatch(name):
+                    result.append({"id": name, "display_name": display})
+            return sorted(result, key=lambda item: item["id"].casefold())
+        except Exception as exc:
+            raise GeminiStoryPlanner._classify_error(exc, "connection") from None
+
+    @classmethod
+    def _classify_error(cls, exc: Exception, context: str) -> GeminiPlanningError:
+        code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        if hasattr(code, "value"):
+            code = code.value
+        try:
+            status = int(code)
+        except (TypeError, ValueError):
+            status = None
+        class_name = type(exc).__name__.casefold()
+        safe_context = "Gemini connection test" if context == "connection" else "Gemini story planning"
+        if status in (401, 403):
+            return GeminiPlanningError("auth_denied", f"{safe_context} was denied. Check the Gemini API key, API access, and account permissions.")
+        if status == 429:
+            return GeminiPlanningError("rate_limit", f"Gemini rate or quota limit reached during {context}. Wait or review the account's current quota; no automatic retry was made.", retryable_by_user=True)
+        if status in (502, 503, 504):
+            return GeminiPlanningError("service_unavailable", f"Gemini is temporarily unavailable during {context}; the bounded transient retry limit was reached.", retryable_by_user=True)
+        if status == 400:
+            return GeminiPlanningError("invalid_request", "Gemini rejected the structured StoryPlan request. The selected model may not support this schema or interaction API.", retryable_by_user=True)
+        if "timeout" in class_name or isinstance(exc, TimeoutError):
+            return GeminiPlanningError("timeout", "Gemini did not finish before the configured request timeout. Its remote outcome is unknown; the run will not resend automatically.", retryable_by_user=True)
+        if "blocked" in class_name or "safety" in class_name:
+            return GeminiPlanningError("blocked_content", "Gemini blocked this story-planning request under its safety policy. Review the prompt and retry only if appropriate.", retryable_by_user=True)
+        if "connection" in class_name or "transport" in class_name:
+            return GeminiPlanningError("service_unavailable", f"Gemini could not be reached during {context}. Check network access; the run will not resend automatically after restart.", retryable_by_user=True)
+        return GeminiPlanningError("provider_error", f"Gemini {context} failed ({type(exc).__name__}). Details were omitted to protect prompt and credential privacy.", retryable_by_user=True)
+
+    def _require_key(self):
+        if not self.api_key:
+            raise GeminiPlanningError("missing_key", "Gemini API key is missing. Connect Gemini in Settings, then resume this run.")
+        if not self.model:
+            raise GeminiPlanningError("model_missing", "No account-verified Gemini Flash model is selected. Test the Gemini connection and choose an available model in Settings.")
+        if not _FLASH_ALLOWLIST.fullmatch(self.model):
+            raise GeminiPlanningError("model_invalid", "The selected Gemini model is not a supported Flash-class model from the verified account model list.")
+
+    def test_connection(self) -> list[dict[str, str]]:
+        self._require_key_for_test()
+        try:
+            return self.available_models(self.client_factory(self.api_key, self.timeout_seconds))
+        except GeminiPlanningError:
+            raise
+        except Exception as exc:
+            raise self._classify_error(exc, "connection") from None
+
+    def _require_key_for_test(self):
+        if not self.api_key:
+            raise GeminiPlanningError("missing_key", "Gemini API key is missing. Connect it in Settings first.")
+
+    @staticmethod
+    def _validate_output(text: str, request: dict[str, Any]) -> StoryPlan:
+        if not text or not text.strip():
+            raise PlannerOutputError("Gemini returned empty structured output")
+        if len(text.encode("utf-8")) > MAX_RESPONSE_BYTES:
+            raise PlannerOutputError("Gemini StoryPlan output exceeded the 8 MiB safety limit")
+        plan = StoryPlan.model_validate_json(text)
+        if len(plan.ordered_shots) > int(request["shot_budget"]):
+            raise PlannerOutputError("Gemini StoryPlan exceeds the authorized maximum shot count")
+        categories = {item["id"]: item["category"] for item in request.get("project_reference_catalog", [])}
+        return plan.validate_project_scope(set(request.get("allowed_reference_ids", [])), categories)
+
+    @staticmethod
+    def _privacy_filtered_request(request: dict[str, Any]) -> dict[str, Any]:
+        capabilities = request.get("model_capabilities") or {}
+        allowed_capabilities = {key: capabilities[key] for key in (
+            "text_to_video", "image_to_video", "max_reference_images_per_shot", "audio_generation",
+            "video_continuation", "ic_lora", "frames", "fps") if key in capabilities}
+        catalog = [{"id": item["id"], "category": item["category"]}
+                   for item in request.get("project_reference_catalog", [])
+                   if isinstance(item, dict) and item.get("id") and item.get("category")]
+        return {
+            "prompt": request.get("prompt", ""),
+            "project_style_bible": request.get("project_style_bible", {}),
+            "project_aspect_ratio": request.get("project_aspect_ratio"),
+            "project_frame_rate": request.get("project_frame_rate"),
+            "project_reference_catalog": catalog,
+            "allowed_reference_ids": [item["id"] for item in catalog],
+            "reference_privacy": "Opaque IDs and categories only. No images, filenames, notes, or paths are sent.",
+            "shot_budget": request.get("shot_budget"),
+            "budget": request.get("budget", {}),
+            "preset": request.get("preset"),
+            "model_capabilities": allowed_capabilities,
+        }
+
+    @staticmethod
+    def _prompt(request: dict[str, Any], repair: dict[str, str] | None = None) -> str:
+        input_json = json.dumps(GeminiStoryPlanner._privacy_filtered_request(request), ensure_ascii=False, separators=(",", ":"))
+        prompt = ("Create a film story plan using the user's prompt as the only plot source. Preserve distinct character identities, ")
+        prompt += ("causal chronology, location scale, visual continuity, camera framing, and exactly described character layout. "
+                   "Use only supplied opaque reference IDs; the planner cannot see reference images, names, or paths. Leave references unassigned when their identity is ambiguous. "
+                   "Do not invent approvals. Keep within the exact shot budget, preset, and local model capabilities. Set unsupported audio, continuation, and IC-LoRA flags accurately. "
+                   "Return a StoryPlan JSON object.\nINPUT_JSON:\n" + input_json)
+        if repair:
+            prompt += "\n\nThe prior response failed local validation. Repair it, preserving story facts. Validation error: " + repair["error"] + "\nINVALID_RESPONSE_JSON:\n" + repair["output"][:MAX_RESPONSE_BYTES]
+        return prompt
+
+    def _call(self, client, request_text: str):
+        for attempt in range(MAX_TRANSIENT_ATTEMPTS):
+            try:
+                interaction = client.interactions.create(
+                    model=self.model,
+                    input=request_text,
+                    response_format={"type": "text", "mime_type": "application/json", "schema": gemini_story_schema()},
+                    generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS},
+                    store=False,
+                )
+                status = getattr(interaction, "status", "completed")
+                if status in {"failed", "cancelled", "incomplete", "requires_continuation"}:
+                    raise GeminiPlanningError("incomplete_output", f"Gemini returned {status} instead of a complete StoryPlan. No generation jobs were queued.", retryable_by_user=True)
+                return interaction
+            except GeminiPlanningError:
+                raise
+            except Exception as exc:
+                classified = self._classify_error(exc, "story planning")
+                raw_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                if attempt + 1 < MAX_TRANSIENT_ATTEMPTS and str(raw_code) in {"502", "503", "504"}:
+                    self.sleeper(0.5 * (2 ** attempt))
+                    continue
+                raise classified from None
+
+    def plan(self, request: dict[str, Any]) -> PlannerResult:
+        self._require_key()
+        if len(str(request.get("prompt", "")).encode("utf-8")) > 20_000:
+            raise GeminiPlanningError("prompt_too_large", "Story prompt exceeds the 20,000 character planning limit.")
+        if len(json.dumps(request, ensure_ascii=False).encode("utf-8")) > 64 * 1024:
+            raise GeminiPlanningError("metadata_too_large", "Story-planning metadata exceeded the 64 KiB request cap.")
+        try:
+            client = self.client_factory(self.api_key, self.timeout_seconds)
+        except GeminiPlanningError:
+            raise
+        except Exception as exc:
+            raise self._classify_error(exc, "story planning") from None
+        response = self._call(client, self._prompt(request))
+        usages = [_safe_usage(response)]
+        output = getattr(response, "output_text", None)
+        output = output if isinstance(output, str) else ""
+        try:
+            plan = self._validate_output(output, request)
+        except (PlannerOutputError, ValidationError) as first_error:
+            # Exactly one bounded schema repair, charged against this run's two-call cap.
+            if len(output.encode("utf-8")) > MAX_RESPONSE_BYTES:
+                raise GeminiPlanningError("invalid_output", "Gemini returned malformed or oversized JSON. No shot jobs were queued.", retryable_by_user=True) from None
+            repaired = self._call(client, self._prompt(request, {"error": str(first_error)[:2000], "output": output}))
+            usages.append(_safe_usage(repaired))
+            try:
+                plan = self._validate_output(getattr(repaired, "output_text", None), request)
+            except (PlannerOutputError, ValidationError):
+                raise GeminiPlanningError("invalid_output", "Gemini output remained invalid after one bounded repair request. No shot jobs were queued.", retryable_by_user=True) from None
+        usage = {key: sum((item[key] or 0) for item in usages) if any(item[key] is not None for item in usages) else None
+                 for key in ("input_tokens", "output_tokens", "total_tokens")}
+        return PlannerResult(plan=plan, provenance={"provider": "gemini", "model": self.model,
+            "api": "Gemini Interactions API structured JSON", "sdk": "google-genai", "request_count": len(usages),
+            "usage": usage, "cost_estimate": None,
+            "billing_note": "Gemini billing/free-tier data policy varies by account and tier; review current Google AI Studio pricing.",
+            "privacy": "Only story prompt, project style text, preset/budget/capability metadata, and opaque selected-reference IDs/categories were sent. No files or filenames were uploaded."})

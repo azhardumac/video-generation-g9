@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # one strict StoryPlan JSON object on stdout. No remote planner is used.
     story_planner_command: str = ""
     story_planner_timeout_seconds: int = Field(default=300, ge=10, le=1800)
+    gemini_secret_path: str = "~/.config/framework/gemini-secret.json"
+    gemini_timeout_seconds: int = Field(default=120, ge=5, le=600)
+    gemini_api_key: str = Field(default="", repr=False)
     output_root: str = "~/AI-Video-Studio/outputs"
     allowed_path_roots: str = "~/AI-Video-Studio"
     preflight_max_swap_gb: float = Field(default=24.0, ge=0)

@@ -8,6 +8,7 @@ import FilmPlanPage from './FilmPlanPage'
 import SetupPage from './SetupPage'
 import SceneContinuityPage from './SceneContinuityPage'
 import CreateFilmPage from './CreateFilmPage'
+import GeminiConnectionPanel from './GeminiConnectionPanel'
 
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
 type Asset = { id: string; category: string; relative_path: string; path: string; name: string; size_bytes: number; mime_type: string }
@@ -221,6 +222,7 @@ function SettingsPage({ presets, selected, onSelect, onPresetsChanged, onSaved, 
   }
   async function recheck(){setRechecking(true);try{await onRecheck();onMessage('Local integrations and resource safeguards rechecked')}catch(error){onMessage(error instanceof Error?error.message:'Could not recheck local integrations')}finally{setRechecking(false)}}
   return <section className="panel settings-page"><div className="settings-presets-heading"><div><div className="section-kicker">LOCAL CONNECTIONS</div><h2>Integration status</h2></div><button className="button secondary" onClick={()=>void recheck()} disabled={rechecking}>{rechecking?'Checking…':'Recheck local status'}</button></div><p className="settings-intro">Checks local installations, cache presence, ffprobe, and resource safeguards. Checks are read-only; no model is downloaded and no generation starts.</p>
+    <GeminiConnectionPanel/>
     <div className="integration-grid">
       <IntegrationCard title="LTX-2.3 MLX · Q8" ready={Boolean(integrations?.ltx.ready)} detail={integrations?.ltx.weights_cached ? 'Runner and cached Q8 weights available' : integrations?.ltx.cache_available ? 'Hugging Face cache exists; expected Q8 weights missing. Use Setup for an explicit install.' : 'Hugging Face cache missing. Use Setup to opt in to a download; startup and generation never fetch weights.'} path={integrations?.ltx.root ?? 'Checking…'} secondaryPath={integrations?.ltx.hf_home} warning={Boolean(integrations && !integrations.ltx.weights_cached)}/>
       <IntegrationCard title="Remotion Studio" ready={Boolean(integrations?.remotion.ready)} detail={integrations?.remotion.version ? `CLI ${integrations.remotion.version}` : integrations?.remotion.cli_available ? 'CLI available' : 'CLI missing. Check REMOTION_STUDIO and REMOTION_EXECUTABLE in .env.'} path={integrations?.remotion.root ?? 'Checking…'}/>

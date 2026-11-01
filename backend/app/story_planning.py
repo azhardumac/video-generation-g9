@@ -11,7 +11,8 @@ import json
 import os
 import shutil
 import subprocess
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -150,8 +151,28 @@ class StoryPlan(StrictModel):
         return self
 
 
+@dataclass
+class PlannerResult:
+    """Validated plan plus safe provider provenance, shared across adapters."""
+
+    plan: StoryPlan
+    provenance: dict[str, Any]
+
+
+class StoryPlanner(Protocol):
+    """Provider-neutral contract consumed by the durable FilmRunEngine."""
+
+    provider: str
+
+    def plan(self, request: dict) -> StoryPlan | PlannerResult:
+        """Return a strict StoryPlan, optionally wrapped with provenance."""
+        ...
+
+
 class LocalStoryPlanner:
     """Call a user-configured local executable using JSON over stdin/stdout."""
+
+    provider = "local"
 
     def __init__(self, command_json: str = "", timeout_seconds: int = 300):
         self.command_json = command_json.strip()

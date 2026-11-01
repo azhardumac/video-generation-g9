@@ -20,7 +20,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration(target_version=7)
+        self._backup_before_migration(target_version=8)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -161,6 +161,12 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, revision INTEGER NOT NULL,
                     time TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS film_run_planner_requests (
+                    run_id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '',
+                    request_hash TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 1,
+                    result_json TEXT, usage_json TEXT, provenance_json TEXT,
+                    error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_film_run_events_order ON film_run_events(run_id,id);
                 CREATE TABLE IF NOT EXISTS film_run_shots (
                     id TEXT PRIMARY KEY, run_id TEXT NOT NULL, shot_key TEXT NOT NULL,
@@ -274,6 +280,7 @@ class Database:
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_film_plans_run ON film_plans(film_run_id) WHERE film_run_id IS NOT NULL")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_film_batches_run ON film_batches(film_run_id) WHERE film_run_id IS NOT NULL")
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(7,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(8,?)", (now_iso(),))
             for run in db.execute("SELECT id,revision,stage FROM film_runs WHERE status='running'"):
                 message = "Application restarted during orchestration; the run was paused at its last durable checkpoint."
                 db.execute("UPDATE film_runs SET status='paused',error=?,revision=revision+1,updated_at=? WHERE id=? AND status='running'",
@@ -726,6 +733,16 @@ class Database:
         authorization = request.get("authorization", {}) if status != "awaiting_authorization" else {}
         with self.lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            # A fresh browser idempotency key after refresh must not create a
+            # second active film request for the exact same authorized plan.
+            matching = db.execute("SELECT * FROM film_runs WHERE project_id=? AND request_hash=? "
+                                  "AND status IN ('awaiting_authorization','waiting_for_planner','running','paused','needs_attention') "
+                                  "ORDER BY created_at DESC LIMIT 1", (project_id, request_hash)).fetchone()
+            if matching:
+                result = self._film_run(matching)
+                result["created"] = False
+                result["deduplicated"] = True
+                return result
             db.execute("INSERT OR IGNORE INTO film_runs(id,project_id,idempotency_key,request_hash,prompt,request_json,reference_ids_json,preset,budget_json,authorization_json,status,stage,created_at,updated_at) "
                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        (run_id, project_id, idempotency_key, request_hash, request["prompt"],
@@ -743,6 +760,7 @@ class Database:
                            (run_id, 1, timestamp, "info", "Prompt and generation budget saved; no generation job was submitted."))
         result = self.get_film_run(row["id"])
         result["created"] = created
+        result["deduplicated"] = False
         return result
 
     def get_film_run(self, run_id: str):
@@ -771,6 +789,88 @@ class Database:
                              "AND json_extract(authorization_json,'$.confirmed')=1 "
                              "ORDER BY created_at,id LIMIT 1").fetchone()
             return self._film_run(row)
+
+    def film_run_planner_request(self, run_id: str, *, include_result: bool = True):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM film_run_planner_requests WHERE run_id=?", (run_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        for field in ("result_json", "usage_json", "provenance_json"):
+            raw = item.pop(field)
+            item[field.removesuffix("_json")] = json.loads(raw) if raw else None
+        if not include_result:
+            item.pop("result", None)
+        return item
+
+    def reserve_film_run_planner_request(self, run_id: str, provider: str, model: str, request_hash: str):
+        """Reserve one planning operation before network I/O; restarts never repeat it silently."""
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = db.execute("SELECT status,stage,authorization_json FROM film_runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise KeyError("Film run not found")
+            if run["status"] != "running" or run["stage"] != "understand_story":
+                raise FilmRunTransitionError("Planner requests can be reserved only during the authorized story-planning stage")
+            if not json.loads(run["authorization_json"] or "{}").get("confirmed"):
+                raise FilmRunTransitionError("Story planning requires explicit initial authorization")
+            existing = db.execute("SELECT * FROM film_run_planner_requests WHERE run_id=?", (run_id,)).fetchone()
+            if existing:
+                if existing["request_hash"] != request_hash or existing["provider"] != provider or existing["model"] != model:
+                    raise FilmRunConflict("This run already reserved a different story-planning request")
+                if existing["status"] in {"started", "completed", "failed"}:
+                    item = dict(existing)
+                    item["result"] = json.loads(item["result_json"]) if item.get("result_json") else None
+                    return item | {"created": False}
+                if existing["status"] != "retry_authorized":
+                    raise FilmRunConflict("This story-planning request is already reserved")
+                if existing["attempts"] >= 3:
+                    raise FilmRunTransitionError("This Gemini film run has reached its limit of three explicit planning attempts. Start a new run only after reviewing the prompt and expected account usage.")
+                if provider == "gemini":
+                    recent_attempts = db.execute("SELECT COALESCE(SUM(attempts),0) FROM film_run_planner_requests "
+                        "WHERE provider='gemini' AND julianday(updated_at)>=julianday('now','-1 hour')").fetchone()[0]
+                    if recent_attempts >= 5:
+                        raise FilmRunTransitionError("Gemini planning reached FRAMEWORK's limit of five planning attempts per hour. Wait before authorizing another request.")
+                db.execute("UPDATE film_run_planner_requests SET status='started',attempts=attempts+1,error_code=NULL,updated_at=? WHERE run_id=?",
+                           (timestamp, run_id))
+                item = dict(db.execute("SELECT * FROM film_run_planner_requests WHERE run_id=?", (run_id,)).fetchone())
+                return item | {"created": True}
+            if provider == "gemini":
+                recent_attempts = db.execute("SELECT COALESCE(SUM(attempts),0) FROM film_run_planner_requests "
+                    "WHERE provider='gemini' AND julianday(updated_at)>=julianday('now','-1 hour')").fetchone()[0]
+                if recent_attempts >= 5:
+                    raise FilmRunTransitionError("Gemini planning reached FRAMEWORK's limit of five planning attempts per hour. Wait before starting another request.")
+            db.execute("INSERT INTO film_run_planner_requests(run_id,provider,model,request_hash,status,attempts,created_at,updated_at) "
+                       "VALUES(?,?,?,?,'started',1,?,?)", (run_id, provider, model or "", request_hash, timestamp, timestamp))
+            item = dict(db.execute("SELECT * FROM film_run_planner_requests WHERE run_id=?", (run_id,)).fetchone())
+            return item | {"created": True}
+
+    def complete_film_run_planner_request(self, run_id: str, result: dict):
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status FROM film_run_planner_requests WHERE run_id=?", (run_id,)).fetchone()
+            if not row or row["status"] not in {"started", "completed"}:
+                raise FilmRunTransitionError("The story-planning request reservation is no longer active")
+            db.execute("UPDATE film_run_planner_requests SET status='completed',result_json=?,usage_json=?,provenance_json=?,error_code=NULL,updated_at=? WHERE run_id=?",
+                       (json.dumps(result, ensure_ascii=False),
+                        json.dumps(result.get("provenance", {}).get("usage", {}), sort_keys=True),
+                        json.dumps(result.get("provenance", {}), ensure_ascii=False, sort_keys=True), timestamp, run_id))
+        return self.film_run_planner_request(run_id)
+
+    def fail_film_run_planner_request(self, run_id: str, error_code: str):
+        with self.lock, self.connect() as db:
+            db.execute("UPDATE film_run_planner_requests SET status='failed',error_code=?,updated_at=? WHERE run_id=? AND status='started'",
+                       (error_code[:80], now_iso(), run_id))
+
+    def authorize_film_run_planner_retry(self, run_id: str):
+        """Called only after the user explicitly resumes a blocked planner stage."""
+        with self.lock, self.connect() as db:
+            row = db.execute("SELECT status FROM film_run_planner_requests WHERE run_id=?", (run_id,)).fetchone()
+            if row and row["status"] in {"started", "failed"}:
+                db.execute("UPDATE film_run_planner_requests SET status='retry_authorized',updated_at=? WHERE run_id=?",
+                           (now_iso(), run_id))
 
     def film_run_budget_for_job(self, job_id: str):
         with self.connect() as db:

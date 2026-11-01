@@ -10,6 +10,7 @@ from .db import Database
 from .storyboards import build_composition_manifest
 from .paths import safe_local_path
 from .film_run_engine import FilmRunEngine
+from .gemini_secrets import GeminiSecretStore
 
 
 class LocalWorker:
@@ -17,7 +18,8 @@ class LocalWorker:
         self.db, self.settings = db, settings
         self.adapter = LTXAdapter(settings)
         self.remotion = RemotionAdapter(settings)
-        self.film_runs = FilmRunEngine(db, settings)
+        self.film_runs = FilmRunEngine(db, settings, secret_store=GeminiSecretStore(
+            settings.expanded(settings.gemini_secret_path), env={"GEMINI_API_KEY": settings.gemini_api_key}))
         self.task = None
         self.active_task = None
         self.active_job_id = None
