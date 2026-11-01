@@ -209,6 +209,10 @@ class FilmRunRevisionRequest(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+class FilmRunArchiveRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+
 class FilmRunAuthorizationRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     confirmed: bool = False
@@ -1192,9 +1196,32 @@ def preview_film_run(project_id: str, request: CreateFilmRunRequest):
 
 
 @app.get("/api/projects/{project_id}/film-runs")
-def list_film_runs(project_id: str):
+def list_film_runs(project_id: str, include_archived: bool = False):
     _project(project_id)
-    return [_film_run_status(run) for run in film_orchestrator.list(project_id)]
+    return [_film_run_status(run) for run in film_orchestrator.list(project_id, include_archived=include_archived)]
+
+
+def _set_film_run_archived(project_id: str, run_id: str, request: FilmRunArchiveRequest, *, archived: bool):
+    _project(project_id)
+    try:
+        run = db.set_film_run_archived(project_id, run_id, request.expected_revision, archived=archived)
+    except FilmRunConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except FilmRunTransitionError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not run:
+        raise HTTPException(404, "Film run not found in this project")
+    return _film_run_status(run)
+
+
+@app.post("/api/projects/{project_id}/film-runs/{run_id}/archive")
+def archive_film_run(project_id: str, run_id: str, request: FilmRunArchiveRequest):
+    return _set_film_run_archived(project_id, run_id, request, archived=True)
+
+
+@app.post("/api/projects/{project_id}/film-runs/{run_id}/restore")
+def restore_film_run(project_id: str, run_id: str, request: FilmRunArchiveRequest):
+    return _set_film_run_archived(project_id, run_id, request, archived=False)
 
 
 def _film_run_status(run: dict) -> dict:
@@ -1219,7 +1246,7 @@ def _film_run_status(run: dict) -> dict:
         run["planner_status"] = LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability()["status"]
     batch_id = run.get("film_batch_id") or run.get("checkpoint", {}).get("generate_shots", {}).get("film_batch_id")
     batch = db.get_film_batch(batch_id) if batch_id else None
-    run["generation_jobs_created"] = batch["total_shots"] if batch else 0
+    run["generation_jobs_created"] = db.film_run_generation_job_count(run["id"])
     run["generation_progress"] = ({"total": batch["total_shots"], "verified": batch["completed_shots"],
                                     "queued": batch["queued_shots"], "failed": batch["failed_shots"],
                                     "progress": batch["progress"],

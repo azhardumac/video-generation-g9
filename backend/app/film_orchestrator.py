@@ -107,8 +107,8 @@ class FilmOrchestrator:
             raise KeyError("Film run not found")
         return run
 
-    def list(self, project_id: str):
-        return self.db.list_film_runs(project_id)
+    def list(self, project_id: str, *, include_archived: bool = False):
+        return self.db.list_film_runs(project_id, include_archived=include_archived)
 
     def authorize(self, run_id: str, expected_revision: int, confirmation: dict[str, Any]):
         run = self.get(run_id)
