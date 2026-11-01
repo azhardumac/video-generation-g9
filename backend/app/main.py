@@ -1240,50 +1240,51 @@ def restore_film_run(project_id: str, run_id: str, request: FilmRunArchiveReques
 
 
 def _review_job_state(project_id: str, storyboard: dict, shot: dict, job: dict | None):
-    """Resolve reviewability from an associated job, its current file, and recorded ffprobe result."""
+    """Resolve playback validity separately from creative-review eligibility."""
     if not job:
-        return None, None, None, "No generation job is associated with this storyboard shot."
+        return None, None, None, "No generation job is associated with this storyboard shot.", []
     job_id = job.get("id")
     if job.get("project_id") != project_id:
-        return job, None, None, "The associated generation job belongs to a different project."
+        return job, None, None, "The associated generation job belongs to a different project.", []
     if job.get("kind") != "generation":
-        return job, None, None, "The associated job is not an LTX generation job."
+        return job, None, None, "The associated job is not an LTX generation job.", []
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     if payload.get("shot_id") not in (None, shot.get("id")) or payload.get("storyboard_id") not in (None, storyboard.get("id")):
-        return job, None, None, "The job's saved shot/storyboard association does not match this shot."
+        return job, None, None, "The job's saved shot/storyboard association does not match this shot.", []
     if job.get("status") != "completed":
-        return job, None, None, f"The associated generation job is {job.get('status') or 'missing status'}, not completed."
+        return job, None, None, f"The associated generation job is {job.get('status') or 'missing status'}, not completed.", []
     if job.get("exit_code") != 0:
-        return job, None, None, "The associated generation job did not exit successfully."
-    if shot.get("settings_match") is False:
-        return job, None, None, "The clip was generated with settings that no longer match this shot."
+        return job, None, None, "The associated generation job did not exit successfully.", []
     recorded = (job.get("verification_metadata") or {}).get("verified_output")
     if not isinstance(recorded, dict):
-        return job, None, None, "The job has no recorded ffprobe-verified video metadata."
+        return job, None, None, "The job has no recorded ffprobe-verified video metadata.", []
     for field in ("width", "height", "fps", "frames"):
         value = recorded.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-            return job, None, None, f"The job's ffprobe metadata is missing a valid {field} value."
+            return job, None, None, f"The job's ffprobe metadata is missing a valid {field} value.", []
     expected = {"width": shot.get("width"), "height": shot.get("height"), "fps": shot.get("fps")}
     generation_payload = shot.get("generation_payload") if isinstance(shot.get("generation_payload"), dict) else {}
     expected["frames"] = generation_payload.get("frames") or generation_payload.get("duration_frames")
     for field, value in expected.items():
         if isinstance(value, (int, float)) and not isinstance(value, bool) and recorded.get(field) != value:
-            return job, None, None, f"The saved ffprobe {field} does not match this shot's expected settings."
+            return job, None, None, f"The saved ffprobe {field} does not match this shot's expected settings.", []
     result_path = job.get("result_path")
     if not result_path:
-        return job, None, None, "The completed job has no saved output path."
+        return job, None, None, "The completed job has no saved output path.", []
     try:
         output = safe_local_path(result_path, settings, must_exist=True)
     except (ValueError, FileNotFoundError, OSError):
-        return job, None, None, "The saved video is missing or outside the configured local output roots."
+        return job, None, None, "The saved video is missing or outside the configured local output roots.", []
     try:
         output_exists = output.is_file()
     except OSError:
-        return job, None, None, "The saved video file is not readable from the configured local output roots."
+        return job, None, None, "The saved video file is not readable from the configured local output roots.", []
     if not output_exists:
-        return job, None, None, "The saved video file is missing or is not a regular file."
-    return job, recorded, output, None
+        return job, None, None, "The saved video file is missing or is not a regular file.", []
+    mismatches = list(job.get("settings_mismatches") or [])
+    if not mismatches and job.get("settings_match") is False:
+        mismatches = ["settings_snapshot"]
+    return job, recorded, output, None, mismatches
 
 
 def _resolve_film_run_review_shots(project_id: str, storyboard: dict, batch: dict | None):
@@ -1299,26 +1300,36 @@ def _resolve_film_run_review_shots(project_id: str, storyboard: dict, batch: dic
             if candidate and candidate.get("id") not in {item.get("id") for item in candidates}:
                 candidates.append(candidate)
         state = None
+        playable_fallback = None
         for candidate in candidates:
             checked = _review_job_state(project_id, storyboard, shot, candidate)
-            if checked[3] is None:
+            if checked[3] is None and not checked[4]:
                 state = checked
                 break
+            if playable_fallback is None or (playable_fallback[3] is not None and checked[3] is None):
+                playable_fallback = checked
             if state is None:
                 state = checked
+        if playable_fallback is not None and (state is None or (state[3] is not None and playable_fallback[3] is None)):
+            state = playable_fallback
         if state is None:
-            state = (None, None, None, "No generation job is associated with this storyboard shot or its film batch.")
-        job, recorded, output, reason = state
-        verified = bool(job and recorded and output and not reason)
+            state = (None, None, None, "No generation job is associated with this storyboard shot or its film batch.", [])
+        job, recorded, output, technical_reason, mismatches = state
+        playable = bool(job and recorded and output and not technical_reason)
+        verified = bool(playable and not mismatches)
+        reason = technical_reason
+        if playable and mismatches:
+            reason = "Playback is available, but creative approval is blocked because these generation settings differ: " + ", ".join(mismatches) + ". Refresh eligibility after checking the shot settings."
         resolved.append({
             "shot_id": shot.get("id"), "job_id": job.get("id") if job else None,
-            "verified": verified, "reviewability_reason": reason,
+            "verified": verified, "playable": playable, "settings_mismatches": mismatches,
+            "reviewability_reason": reason,
             "title": shot.get("title") or batch_shot.get("title") or "Untitled shot",
             "scene_title": shot.get("scene_title") or batch_shot.get("scene_title") or "Scene",
-            "status": "verified" if verified else shot.get("status") or batch_shot.get("status") or "unavailable",
+            "status": "verified" if verified else "stale" if playable and mismatches else shot.get("status") or batch_shot.get("status") or "unavailable",
             "progress": (job or {}).get("progress", batch_shot.get("progress", 0)),
             "events": (job or {}).get("events", []),
-            "job": job, "recorded_output": recorded,
+            "job": job if playable else None, "recorded_output": recorded if playable else None,
             "result_path": str(output) if output else None,
         })
     return resolved
@@ -1366,11 +1377,12 @@ def _film_run_review_payload(project_id: str, run_id: str):
             "visual_description": shot.get("visual_description") or "",
             "framing": shot.get("framing") or "Not specified", "characters": character_roster,
             "expected_character_count": len(character_roster), "reference_ids": [item["id"] for item in references],
-            "references": references, "verified": resolved["verified"], "job_id": resolved["job_id"],
+            "references": references, "verified": resolved["verified"], "playable": resolved["playable"],
+            "settings_mismatches": resolved["settings_mismatches"], "job_id": resolved["job_id"],
             "reviewability_reason": resolved["reviewability_reason"],
             "job": ({"id": resolved["job_id"], "status": job.get("status"), "exit_code": job.get("exit_code"),
                      "result_path": resolved["result_path"], "verification_metadata": {"verified_output": resolved["recorded_output"]}}
-                    if resolved["verified"] else None),
+                    if resolved["playable"] else None),
             "creative_review": ({key: review[key] for key in ("id", "decision", "notes", "created_at")}
                                 if review else None),
             "creative_review_current": current_review,
@@ -1394,6 +1406,15 @@ def get_film_run_review(project_id: str, run_id: str):
     return _film_run_review_payload(project_id, run_id)
 
 
+@app.post("/api/projects/{project_id}/film-runs/{run_id}/shots/{shot_id}/eligibility-check")
+def recheck_film_run_shot_eligibility(project_id: str, run_id: str, shot_id: str):
+    """Re-resolve the saved job, current shot settings, and output file without mutating history."""
+    payload = _film_run_review_payload(project_id, run_id)
+    if not any(item["id"] == shot_id for item in payload["shots"]):
+        raise HTTPException(404, "Shot is not part of this film run")
+    return payload
+
+
 @app.post("/api/projects/{project_id}/film-runs/{run_id}/shots/{shot_id}/review")
 def review_film_run_shot(project_id: str, run_id: str, shot_id: str, request: FilmRunShotReviewRequest):
     payload = _film_run_review_payload(project_id, run_id)
@@ -1401,6 +1422,9 @@ def review_film_run_shot(project_id: str, run_id: str, shot_id: str, request: Fi
     if not shot:
         raise HTTPException(404, "Shot is not part of this film run")
     if not shot["verified"] or not shot.get("job"):
+        fields = ", ".join(shot.get("settings_mismatches") or [])
+        if shot.get("playable") and fields:
+            raise HTTPException(409, f"Playback is available, but creative approval remains blocked by changed generation settings: {fields}. Refresh eligibility and update the shot if those changes were intentional.")
         raise HTTPException(409, "Creative review requires the current shot output to remain technically verified")
     if request.job_id != shot.get("job_id"):
         raise HTTPException(409, "The selected generation job is no longer the canonical verified output for this shot; refresh before reviewing")

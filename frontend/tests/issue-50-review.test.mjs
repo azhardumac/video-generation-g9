@@ -94,7 +94,7 @@ test('generic clip review renders verified video, safe empty-reference state, an
     creative_review_status: 'pending', shots: [{ id: 'shot-gemini-1', title: 'Finds the lantern',
       scene_title: 'Dawn by the cottage', prompt: 'A small red fox finds a brass lantern in the dawn grass.',
       framing: 'Medium close-up', characters: ['Fox'], expected_character_count: 1,
-      reference_ids: [], references: [], verified: true,
+      reference_ids: [], references: [], verified: true, playable: true, settings_mismatches: [],
       job: { id: 'job-fox-1', status: 'completed', exit_code: 0, result_path: '/tmp/fox first shot.mp4',
         verification_metadata: { verified_output: { width: 448, height: 768, fps: 24, frames: 49 } } },
       creative_review: null, creative_review_current: false }] }
@@ -199,13 +199,32 @@ test('Clip Review shows the backend blocker and a refresh-verification action fo
   const data={run_id:'run-missing-media',project_id:'project-fox',run_revision:3,status:'needs_review',
     storyboard_id:'storyboard-missing-media',storyboard_revision:1,title:'Fox film',creative_review_status:'pending',
     shots:[{id:'shot-missing-media',title:'Lantern',scene_title:'Dawn',prompt:'Fox finds a lantern.',framing:'Close-up',
-      characters:['Fox'],expected_character_count:1,reference_ids:[],references:[],verified:false,job_id:'job-missing-media',
+      characters:['Fox'],expected_character_count:1,reference_ids:[],references:[],verified:false,playable:false,settings_mismatches:[],job_id:'job-missing-media',
       reviewability_reason:'The saved video is missing or outside the configured local output roots.',job:null,
       creative_review:null,creative_review_current:false}]}
   const html=renderToStaticMarkup(React.createElement(FilmRunReviewView,{data,shotId:'shot-missing-media',notes:'',
     onNotesChange(){},busy:false,error:'',onBack(){},onSelectShot(){},onReview(){},onContinueExport(){},onRefreshVerification(){}}))
   assert.match(html,/The saved video is missing or outside the configured local output roots/)
   assert.match(html,/Refresh verification/)
+  assert.match(html,/button class="button primary" disabled=""[\s\S]*?Approve clip/)
+})
+
+test('stale generation settings keep a verified MP4 playable but block creative approval and name the fields', () => {
+  const data={run_id:'run-stale-settings',project_id:'project-fox',run_revision:4,status:'needs_review',
+    storyboard_id:'storyboard-stale-settings',storyboard_revision:2,title:'Fox film',creative_review_status:'pending',
+    shots:[{id:'shot-stale-settings',title:'Lantern',scene_title:'Dawn',prompt:'Fox finds a lantern.',framing:'Close-up',
+      characters:['Fox'],expected_character_count:1,reference_ids:[],references:[],verified:false,playable:true,
+      settings_mismatches:['prompt','seed'],job_id:'job-stale-settings',
+      reviewability_reason:'Playback is available, but creative approval is blocked because these generation settings differ: prompt, seed.',
+      job:{id:'job-stale-settings',status:'completed',exit_code:0,result_path:'/tmp/fox.mp4',
+        verification_metadata:{verified_output:{width:448,height:768,fps:24,frames:49}}},
+      creative_review:null,creative_review_current:false}]}
+  const html=renderToStaticMarkup(React.createElement(FilmRunReviewView,{data,shotId:'shot-stale-settings',notes:'',
+    onNotesChange(){},busy:false,error:'',onBack(){},onSelectShot(){},onReview(){},onContinueExport(){},onRefreshVerification(){}}))
+  assert.match(html,/api\/media\/file\?path=%2Ftmp%2Ffox.mp4/)
+  assert.match(html,/Mismatched fields: <code>prompt, seed<\/code>/)
+  assert.match(html,/Refresh verification/)
+  assert.match(html,/Approve clip/)
   assert.match(html,/button class="button primary" disabled=""[\s\S]*?Approve clip/)
 })
 
