@@ -11,8 +11,9 @@ from pydantic import ValidationError
 from .story_planning import PlannerOutputError, PlannerResult, StoryPlan, StoryPlanner
 
 MAX_OUTPUT_TOKENS = 8192
-MIN_OUTPUT_TOKENS = 3072
+MIN_OUTPUT_TOKENS = 6144
 OUTPUT_TOKENS_PER_SHOT = 640
+ENDPOINT_PROBE_MAX_OUTPUT_TOKENS = 512
 MAX_STORY_SCENES = 40
 MAX_SHOTS_PER_SCENE = 40
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -20,6 +21,7 @@ MAX_SCHEMA_REPAIR_REQUESTS = 1
 STORY_PLAN_SCHEMA_VERSION = "storyplan-budgeted-v1"
 GEMINI_API_VERSION = "v1beta"
 GENERATION_ENDPOINT_PROBE_PROMPT = "Reply with exactly: FRAMEWORK Gemini endpoint check passed."
+_SUPPORTED_THINKING_MODEL = re.compile(r"^gemini-(?:3(?:\.\d+)?|2\.5)-", re.IGNORECASE)
 _FLASH_ALLOWLIST = re.compile(r"^(?:models/)?gemini-[a-z0-9][a-z0-9.-]*flash[a-z0-9.-]*$", re.IGNORECASE)
 
 
@@ -159,14 +161,18 @@ def _response_output_modalities(response) -> tuple[str, ...]:
 def _safe_usage(response) -> dict[str, int | None]:
     usage = getattr(response, "usage_metadata", None) or getattr(response, "usage", None)
     if usage is None:
-        return {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+        return {"input_tokens": None, "output_tokens": None, "thoughts_tokens": None, "total_tokens": None}
     if hasattr(usage, "model_dump"):
         usage = usage.model_dump(by_alias=False, exclude_none=True)
     if not isinstance(usage, dict):
-        return {"input_tokens": None, "output_tokens": None, "total_tokens": None}
-    return {"input_tokens": usage.get("prompt_token_count", usage.get("total_input_tokens")),
-            "output_tokens": usage.get("candidates_token_count", usage.get("total_output_tokens")),
-            "total_tokens": usage.get("total_token_count", usage.get("total_tokens"))}
+        return {"input_tokens": None, "output_tokens": None, "thoughts_tokens": None, "total_tokens": None}
+    def count(*keys):
+        value = next((usage[key] for key in keys if key in usage), None)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    return {"input_tokens": count("prompt_token_count", "total_input_tokens"),
+            "output_tokens": count("candidates_token_count", "total_output_tokens"),
+            "thoughts_tokens": count("thoughts_token_count", "total_thought_tokens"),
+            "total_tokens": count("total_token_count", "total_tokens")}
 
 
 def gemini_story_schema(shot_budget: int = MAX_STORY_SCENES) -> dict[str, Any]:
@@ -228,6 +234,100 @@ def _output_token_limit(shot_budget: int) -> int:
     except (TypeError, ValueError):
         shot_limit = 1
     return min(MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS + OUTPUT_TOKENS_PER_SHOT * shot_limit)
+
+
+def _thinking_config_for_model(model: str | None) -> dict[str, str] | None:
+    """Use supported low thinking for Gemini 3.x/2.5; leave older families untouched."""
+    normalized = str(model or "").removeprefix("models/")
+    return {"thinking_level": "low"} if _SUPPORTED_THINKING_MODEL.match(normalized) else None
+
+
+def _safe_enum(value, allowed: set[str]) -> str | None:
+    if value is None:
+        return None
+    normalized = getattr(value, "name", None) or getattr(value, "value", None) or value
+    if not isinstance(normalized, str):
+        return None
+    token = normalized.upper().rsplit(".", 1)[-1]
+    for prefix in ("FINISH_REASON_", "BLOCK_REASON_"):
+        token = token.removeprefix(prefix)
+    return token if token in allowed else None
+
+
+_SAFE_FINISH_REASONS = {"STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "LANGUAGE", "OTHER", "BLOCKLIST",
+                        "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "MALFORMED_RESPONSE",
+                        "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS", "CONTINUATION", "IMAGE_SAFETY",
+                        "IMAGE_PROHIBITED_CONTENT", "IMAGE_OTHER", "NO_IMAGE", "IMAGE_RECITATION"}
+_SAFE_BLOCK_REASONS = {"SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "OTHER", "IMAGE_SAFETY"}
+
+
+def _safe_response_metadata(response, *, max_output_tokens: int | None = None) -> dict[str, Any]:
+    """Return only safe enums and numeric usage; never include provider text/thoughts."""
+    candidates = getattr(response, "candidates", None) or []
+    finish_reasons = []
+    for candidate in candidates[:4]:
+        finish_reason = _safe_enum(getattr(candidate, "finish_reason", None), _SAFE_FINISH_REASONS)
+        if finish_reason:
+            finish_reasons.append(finish_reason)
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    block_reason = _safe_enum(getattr(prompt_feedback, "block_reason", None), _SAFE_BLOCK_REASONS)
+    usage = _safe_usage(response)
+    metadata: dict[str, Any] = {
+        "finish_reasons": finish_reasons,
+        "output_modalities": list(_response_output_modalities(response)),
+        "prompt_token_count": usage["input_tokens"],
+        "candidates_token_count": usage["output_tokens"],
+        "thoughts_token_count": usage["thoughts_tokens"],
+        "total_token_count": usage["total_tokens"],
+    }
+    if block_reason:
+        metadata["prompt_block_reason"] = block_reason
+    if max_output_tokens is not None:
+        metadata["max_output_tokens"] = max_output_tokens
+    return {key: value for key, value in metadata.items() if value not in (None, [], {})}
+
+
+def _response_failure(response, *, context: str, max_output_tokens: int) -> GeminiPlanningError | None:
+    metadata = _safe_response_metadata(response, max_output_tokens=max_output_tokens)
+    candidates = getattr(response, "candidates", None) or []
+    finish_reason = metadata.get("finish_reasons", [None])[0]
+    block_reason = metadata.get("prompt_block_reason")
+    text = None
+    try:
+        text = response.text
+    except Exception:
+        pass
+    if block_reason or finish_reason in {"SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT"}:
+        metadata["category"] = "safety_blocking"
+        message = "Gemini blocked this request under its safety policy. Review the story prompt or probe context, then retry only with explicit authorization."
+        return GeminiPlanningError("blocked_content", message, retryable_by_user=True, diagnostics=metadata)
+    if finish_reason in {"MAX_TOKENS", "CONTINUATION"}:
+        metadata["category"] = "output_token_exhaustion"
+        thoughts = metadata.get("thoughts_token_count")
+        thought_detail = f" The response reports {thoughts} thinking tokens before visible output." if thoughts is not None else ""
+        if context == "generation endpoint probe":
+            message = (f"Gemini returned HTTP 200 but stopped with {finish_reason} at the {max_output_tokens}-token output cap. "
+                       f"Thought tokens count toward that cap; use low thinking and a sufficient cap, then explicitly rerun the short probe.{thought_detail}")
+        else:
+            message = (f"Gemini stopped with {finish_reason} at the {max_output_tokens}-token output cap before completing the StoryPlan. "
+                       f"Thinking tokens share the cap; the plan was rejected and no shot jobs were queued.{thought_detail}")
+        return GeminiPlanningError("token_exhaustion", message, retryable_by_user=True, diagnostics=metadata)
+    modalities = set(metadata.get("output_modalities", []))
+    if isinstance(text, str) and text.strip():
+        return None
+    if "TEXT" not in modalities and modalities & {"AUDIO", "IMAGE", "VIDEO"}:
+        metadata["category"] = "unsupported_response_modality"
+        output_kinds = ", ".join(sorted(modalities)).lower()
+        message = (f"Gemini returned HTTP 200 with {output_kinds.upper()} output and no text. "
+                   f"This is a successful {output_kinds} response, not a text failure; this workflow needs text output for story planning.")
+        return GeminiPlanningError("non_text_response", message, retryable_by_user=True, diagnostics=metadata)
+    if finish_reason == "STOP":
+        metadata["category"] = "empty_text_response"
+        message = "Gemini stopped normally (STOP) but returned no visible text. No safety block or non-text output was reported; retry the probe only if you choose."
+    else:
+        metadata["category"] = "missing_text_output"
+        message = "Gemini returned HTTP 200 but no usable text, finish reason, safety block, or output modality was reported. The response is inconclusive; retry explicitly if desired."
+    return GeminiPlanningError("empty_response", message, retryable_by_user=True, diagnostics=metadata)
 
 
 class GeminiStoryPlanner(StoryPlanner):
@@ -311,7 +411,10 @@ class GeminiStoryPlanner(StoryPlanner):
                 message + cls._diagnostic_suffix(diagnostics),
                 retryable_by_user=True, diagnostics=diagnostics)
         if "timeout" in class_name or isinstance(exc, TimeoutError):
-            return GeminiPlanningError("timeout", "Gemini did not finish before the configured request timeout. Its remote outcome is unknown; the run will not resend automatically.", retryable_by_user=True)
+            if context == "generation endpoint probe":
+                diagnostics["category"] = "request_timeout"
+                return GeminiPlanningError("timeout", "The short Gemini endpoint test exceeded the configured request timeout. Its remote outcome is unknown; no automatic retry was made. You may run the probe again manually after reviewing the status.", retryable_by_user=True, diagnostics=diagnostics)
+            return GeminiPlanningError("timeout", "Gemini did not finish before the configured request timeout. Its remote outcome is unknown; the run will not resend automatically.", retryable_by_user=True, diagnostics=diagnostics)
         if "blocked" in class_name or "safety" in class_name:
             return GeminiPlanningError("blocked_content", "Gemini blocked this story-planning request under its safety policy. Review the prompt and retry only if appropriate.", retryable_by_user=True)
         if "connection" in class_name or "transport" in class_name:
@@ -402,17 +505,23 @@ class GeminiStoryPlanner(StoryPlanner):
             host = urlsplit(base_url).hostname or "generativelanguage.googleapis.com"
             model_id = self.model.removeprefix("models/")
             route = f"/{api_version}/models/{model_id}:generateContent"
+            request_config: dict[str, Any] = {"max_output_tokens": ENDPOINT_PROBE_MAX_OUTPUT_TOKENS}
+            thinking_config = _thinking_config_for_model(self.model)
+            if thinking_config:
+                request_config["thinking_config"] = thinking_config
             try:
                 response = client.models.generate_content(
                     model=self.model,
                     contents=GENERATION_ENDPOINT_PROBE_PROMPT,
-                    config={"max_output_tokens": 24},
+                    config=request_config,
                 )
             except Exception as exc:
                 error = self._classify_error(exc, "generation endpoint probe")
                 error.diagnostics.update({"model": model_id, "api_version": api_version,
                                           "endpoint_host": host, "endpoint_path": route,
-                                          "request_shape": "text_only_no_schema_no_media"})
+                                          "request_shape": "text_only_no_schema_no_media",
+                                          "max_output_tokens": ENDPOINT_PROBE_MAX_OUTPUT_TOKENS,
+                                          "thinking_level": (thinking_config or {}).get("thinking_level")})
                 if error.code == "model_or_endpoint_incompatible":
                     error.args = ("The account-listed model's basic generateContent request returned 404. "
                                   "The request used the pinned SDK route shown below; schema settings were not sent. "
@@ -420,29 +529,23 @@ class GeminiStoryPlanner(StoryPlanner):
                                   "the listed model is available to this key." + self._diagnostic_suffix(error.diagnostics),)
                 raise error from None
             modalities = _response_output_modalities(response)
-            try:
-                text = response.text
-            except Exception:
-                text = None
-            if not isinstance(text, str) or not text.strip():
-                has_audio = "AUDIO" in modalities and "TEXT" not in modalities
-                code = "non_text_response" if has_audio else "no_text_response"
-                category = "unsupported_response_modality" if has_audio else "missing_text_output"
-                message = ("Gemini returned HTTP 200 with audio output and no text. This is a successful audio response, "
-                           "but audio-only output cannot be used for StoryPlan generation. Choose a text-output model.") if has_audio else (
-                    "Gemini returned HTTP 200 but no usable text. The response did not prove an audio-only model; inspect "
-                    "the reported output modality or provider safety result before changing models.")
-                raise GeminiPlanningError(code, message,
-                    retryable_by_user=True,
-                    diagnostics={"http_status": 200, "model": model_id, "api_version": api_version,
-                                 "endpoint_host": host, "endpoint_path": route,
-                                 "request_shape": "text_only_no_schema_no_media",
-                                 "output_modalities": list(modalities) or ["UNKNOWN"], "category": category})
+            failure = _response_failure(response, context="generation endpoint probe",
+                                        max_output_tokens=ENDPOINT_PROBE_MAX_OUTPUT_TOKENS)
+            if failure:
+                failure.diagnostics.update({"http_status": 200, "model": model_id, "api_version": api_version,
+                                            "endpoint_host": host, "endpoint_path": route,
+                                            "request_shape": "text_only_no_schema_no_media",
+                                            "thinking_level": (thinking_config or {}).get("thinking_level")})
+                if not failure.diagnostics.get("output_modalities"):
+                    failure.diagnostics["output_modalities"] = list(modalities) or ["UNKNOWN"]
+                raise failure
+            text = response.text
+            response_metadata = _safe_response_metadata(response, max_output_tokens=ENDPOINT_PROBE_MAX_OUTPUT_TOKENS)
             return {"success": True, "http_status": 200, "model": model_id,
                     "api_version": api_version, "endpoint_host": host,
                     "endpoint_path": route, "request_shape": "text_only_no_schema_no_media",
-                    "output_modalities": list(modalities),
-                    "response_text": text.strip()[:240]}
+                    "response_text": text.strip()[:240], "thinking_level": (thinking_config or {}).get("thinking_level"),
+                    "response_metadata": response_metadata}
         except GeminiPlanningError:
             raise
         except Exception as exc:
@@ -500,8 +603,12 @@ class GeminiStoryPlanner(StoryPlanner):
         return prompt
 
     def _call(self, client, request_text: str, shot_budget: int, response_mode: str):
-        config = {"response_mime_type": "application/json",
-                  "max_output_tokens": _output_token_limit(shot_budget)}
+        output_token_limit = _output_token_limit(shot_budget)
+        config: dict[str, Any] = {"response_mime_type": "application/json",
+                                  "max_output_tokens": output_token_limit}
+        thinking_config = _thinking_config_for_model(self.model)
+        if thinking_config:
+            config["thinking_config"] = thinking_config
         if response_mode == "schema":
             config["response_json_schema"] = gemini_story_schema(shot_budget)
         elif response_mode != "json_only":
@@ -514,18 +621,14 @@ class GeminiStoryPlanner(StoryPlanner):
                 # rejects it; strict local StoryPlan validation is unchanged.
                 config=config,
             )
-            prompt_feedback = getattr(response, "prompt_feedback", None)
-            block_reason = getattr(prompt_feedback, "block_reason", None) if prompt_feedback else None
-            block_reason = getattr(block_reason, "name", block_reason)
-            if block_reason and str(block_reason).upper() not in {"UNSPECIFIED", "BLOCK_REASON_UNSPECIFIED", "0"}:
-                raise GeminiPlanningError("blocked_content", "Gemini blocked this story-planning request under its safety policy. Review the prompt and retry only if appropriate.", retryable_by_user=True)
-            candidates = getattr(response, "candidates", None) or []
-            finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
-            finish_reason = getattr(finish_reason, "name", finish_reason)
-            if str(finish_reason).upper() in {"MAX_TOKENS", "MAX_TOKENS_REACHED"}:
-                raise GeminiPlanningError("incomplete_output", "Gemini reached its output-token limit before completing the StoryPlan. Increase the story budget or simplify the request.", retryable_by_user=True)
-            if str(finish_reason).upper() in {"SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT"}:
-                raise GeminiPlanningError("blocked_content", "Gemini blocked this story-planning request under its safety policy. Review the prompt and retry only if appropriate.", retryable_by_user=True)
+            failure = _response_failure(response, context="story planning", max_output_tokens=output_token_limit)
+            if failure:
+                failure.diagnostics.update({"http_status": 200,
+                                           "model": self.model.removeprefix("models/"),
+                                           "response_mode": response_mode,
+                                           "max_output_tokens": output_token_limit,
+                                           "thinking_level": (thinking_config or {}).get("thinking_level")})
+                raise failure
             return response
         except GeminiPlanningError:
             raise
@@ -563,7 +666,7 @@ class GeminiStoryPlanner(StoryPlanner):
             except (PlannerOutputError, ValidationError):
                 raise GeminiPlanningError("invalid_output", "Gemini output remained invalid after one bounded repair request. No shot jobs were queued.", retryable_by_user=True) from None
         usage = {key: sum((item[key] or 0) for item in usages) if any(item[key] is not None for item in usages) else None
-                 for key in ("input_tokens", "output_tokens", "total_tokens")}
+                 for key in ("input_tokens", "output_tokens", "thoughts_tokens", "total_tokens")}
         return PlannerResult(plan=plan, provenance={"provider": "gemini", "model": self.model,
             "api": "Gemini generateContent API JSON Schema" if response_mode == "schema" else "Gemini generateContent API JSON-only fallback",
             "response_mode": response_mode, "sdk": "google-genai", "request_count": len(usages),

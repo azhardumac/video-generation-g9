@@ -1006,6 +1006,7 @@ def _gemini_planner_config() -> dict:
 def story_planner_config():
     config = _gemini_planner_config()
     return {"provider_default": "gemini", "gemini": config,
+            "gemini_timeout_seconds": settings.gemini_timeout_seconds,
             "local": LocalStoryPlanner(settings.story_planner_command, settings.story_planner_timeout_seconds).availability(),
             "privacy": {"uploads_media": False, "remote_fields": ["story prompt", "project style text", "preset and generation budget", "opaque selected-reference IDs and categories"],
                         "omitted_fields": ["reference images", "generated media", "file paths", "filenames", "reference notes", "entire project database"]}}
@@ -1116,7 +1117,8 @@ def test_gemini_generation_endpoint(payload: GeminiGenerationEndpointProbeReques
     except GeminiPlanningError as exc:
         http_status = exc.diagnostics.get("http_status")
         response_status = (502 if isinstance(http_status, int) and http_status >= 500 else
-                           422 if exc.code in {"non_text_response", "no_text_response"} else 400)
+                           504 if exc.code == "timeout" else
+                           422 if exc.code in {"non_text_response", "no_text_response", "token_exhaustion", "blocked_content", "empty_response"} else 400)
         raise HTTPException(response_status, {"code": exc.code, "message": str(exc),
                                                "diagnostics": exc.diagnostics}) from None
 
