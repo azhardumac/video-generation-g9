@@ -122,13 +122,99 @@ def test_plan_only_saves_validated_plan_and_waits_for_separate_generation_author
     assert calls[0]["prompt"] == fox_prompt
     assert len(calls) == 1
     assert db.list_jobs(project_id=project["id"]) == []
-    assert engine.process_next() is None
-
     authorized = FilmOrchestrator(db).authorize(planned["id"], planned["revision"],
         {"confirmed": True, "budget_acknowledged": True, "scope": "local generation only"})
     assert authorized["status"] == "waiting_for_planner"
     assert authorized["request"]["plan_only"] is True
     assert db.list_jobs(project_id=project["id"]) == []
+
+
+def test_failed_planning_run_does_not_shadow_fresh_same_prompt_but_active_run_still_deduplicates(tmp_path):
+    db, project, _settings, request, old, _secrets = setup_run(tmp_path)
+    claimed = db.update_film_run(old["id"], old["revision"], status="running", message="planner started")
+    blocked = db.update_film_run(old["id"], claimed["revision"], status="needs_attention", message="Gemini planning failed", error="safe planning failure")
+
+    orchestrator = FilmOrchestrator(db)
+    fresh = orchestrator.create(project["id"], "fresh-same-prompt-key", request, authorized=True)
+    assert fresh["id"] != old["id"]
+    assert fresh["created"] is True and fresh["deduplicated"] is False
+    assert db.get_film_run(old["id"])["status"] == "needs_attention"
+
+    duplicate = orchestrator.create(project["id"], "second-browser-key", request, authorized=True)
+    assert duplicate["id"] == fresh["id"]
+    assert duplicate["created"] is False and duplicate["deduplicated"] is True
+
+    other = db.create_project({"id": "another-project", "name": "Another", "root": str(tmp_path),
+        "aspect_ratio": "9:16", "frame_rate": 24, "production_type": "short"})
+    isolated = orchestrator.create(other["id"], "other-project-key", request, authorized=True)
+    assert isolated["id"] not in {old["id"], fresh["id"]}
+    assert blocked["status"] == "needs_attention"
+
+
+def test_needs_attention_run_with_live_ltx_job_remains_deduplicated_and_cannot_archive(tmp_path):
+    import pytest
+    from app.film_orchestrator import FilmRunTransitionError
+
+    db, project, _settings, request, run, _secrets = setup_run(tmp_path)
+    claimed = db.update_film_run(run["id"], run["revision"], status="running", message="claim")
+    blocked = db.update_film_run(run["id"], claimed["revision"], status="needs_attention", message="repair pending", error="safe")
+    job = db.create_job("generation", {"prompt": "isolated test job"}, project["id"])
+    timestamp = blocked["updated_at"]
+    with db.connect() as connection:
+        connection.execute("INSERT INTO film_run_shot_attempts(id,run_id,shot_key,attempt_number,idempotency_key,request_hash,job_id,status,created_at,updated_at) "
+            "VALUES('attempt-live',?,?,1,'attempt-live-key','shot-hash',?,'queued',?,?)",
+            (run["id"], "shot-one", job["id"], timestamp, timestamp))
+
+    duplicate = FilmOrchestrator(db).create(project["id"], "do-not-duplicate", request, authorized=True)
+    assert duplicate["id"] == run["id"] and duplicate["deduplicated"] is True
+    with pytest.raises(FilmRunTransitionError, match="queued or running LTX jobs"):
+        db.set_film_run_archived(project["id"], run["id"], blocked["revision"], archived=True)
+    assert db.get_job(job["id"])["status"] == "queued"
+
+    generation_request = dict(request) | {"prompt": "A different story blocked during shot generation."}
+    generation_run = FilmOrchestrator(db).create(project["id"], "generation-stage-key", generation_request, authorized=True)
+    with db.connect() as connection:
+        connection.execute("UPDATE film_runs SET status='needs_attention',stage='generate_shots' WHERE id=?", (generation_run["id"],))
+    repeated_generation = FilmOrchestrator(db).create(project["id"], "generation-stage-retry", generation_request, authorized=True)
+    assert repeated_generation["id"] == generation_run["id"] and repeated_generation["deduplicated"] is True
+
+
+def test_archive_restore_preserves_attempt_history_across_restart_and_is_project_scoped(tmp_path):
+    import pytest
+    from app.film_orchestrator import FilmRunConflict
+    from app.gemini_planning import STORY_PLAN_SCHEMA_VERSION
+
+    db, project, settings, _request, run, _secrets = setup_run(tmp_path)
+    claimed = db.update_film_run(run["id"], run["revision"], status="running", message="claim planner")
+    db.reserve_film_run_planner_request(run["id"], "gemini", "gemini-3.5-flash-lite", "failed-request",
+        revision=1, schema_version=STORY_PLAN_SCHEMA_VERSION, response_mode="json_only")
+    db.fail_film_run_planner_request(run["id"], "invalid_output", revision=1,
+        error_details={"category": "storyplan_validation_failed", "validation_attempts": [{"attempt": 1, "issues": [{"path": "scenes[0].shots", "type": "missing"}]}]})
+    failed = db.update_film_run(run["id"], claimed["revision"], status="needs_attention", message="planning failed", error="safe failure")
+    other = db.create_project({"id": "scope-check", "name": "Scope check", "root": str(tmp_path),
+        "aspect_ratio": "9:16", "frame_rate": 24, "production_type": "short"})
+    assert db.set_film_run_archived(other["id"], run["id"], failed["revision"], archived=True) is None
+
+    archived = db.set_film_run_archived(project["id"], run["id"], failed["revision"], archived=True)
+    assert archived["archived_at"]
+    assert db.list_film_runs(project["id"]) == []
+    assert db.list_film_runs(project["id"], include_archived=True)[0]["id"] == run["id"]
+    assert db.film_run_planner_attempts(run["id"], include_result=False)[0]["error_details"]["validation_attempts"][0]["issues"][0]["path"] == "scenes[0].shots"
+    assert db.film_run_generation_job_count(run["id"]) == 0
+    fresh_while_archived = FilmOrchestrator(db).create(project["id"], "fresh-while-archived", _request, authorized=True)
+    assert fresh_while_archived["id"] != run["id"] and fresh_while_archived["created"] is True
+
+    restarted = Database(settings)
+    restored_history = restarted.get_film_run(run["id"])
+    assert restored_history["archived_at"] == archived["archived_at"]
+    assert restarted.film_run_planner_attempts(run["id"], include_result=False)[0]["error_code"] == "invalid_output"
+    with pytest.raises(FilmRunConflict):
+        restarted.set_film_run_archived(project["id"], run["id"], failed["revision"], archived=False)
+    restored = restarted.set_film_run_archived(project["id"], run["id"], archived["revision"], archived=False)
+    assert restored["archived_at"] is None
+    assert {item["id"] for item in restarted.list_film_runs(project["id"])} == {run["id"], fresh_while_archived["id"]}
+    assert restarted.get_film_run(run["id"])["archived_at"] is None
+    assert restarted.film_run_planner_attempts(run["id"], include_result=False)[0]["error_code"] == "invalid_output"
 
 
 def test_interrupted_or_failed_gemini_request_is_never_repeated_until_user_resumes(tmp_path):

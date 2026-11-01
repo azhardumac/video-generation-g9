@@ -23,7 +23,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration(target_version=10)
+        self._backup_before_migration(target_version=11)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -156,7 +156,7 @@ class Database:
                     status TEXT NOT NULL, stage TEXT NOT NULL, completed_stages_json TEXT NOT NULL DEFAULT '[]',
                     checkpoint_json TEXT NOT NULL DEFAULT '{}', storyboard_id TEXT, film_batch_id TEXT,
                     render_job_id TEXT, error TEXT, revision INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    archived_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     UNIQUE(project_id,idempotency_key)
                 );
                 CREATE INDEX IF NOT EXISTS idx_film_runs_project_updated ON film_runs(project_id,updated_at DESC);
@@ -203,6 +203,9 @@ class Database:
                 shot_columns.add("reconciled_job_id")
             if "scene_id" not in shot_columns:
                 db.execute("ALTER TABLE storyboard_shots ADD COLUMN scene_id TEXT")
+            film_run_columns = {row[1] for row in db.execute("PRAGMA table_info(film_runs)")}
+            if "archived_at" not in film_run_columns:
+                db.execute("ALTER TABLE film_runs ADD COLUMN archived_at TEXT")
             shot_job_columns = {row[1] for row in db.execute("PRAGMA table_info(shot_jobs)")}
             if "settings_snapshot" not in shot_job_columns:
                 db.execute("ALTER TABLE shot_jobs ADD COLUMN settings_snapshot TEXT")
@@ -314,6 +317,7 @@ class Database:
                 db.execute("ALTER TABLE film_run_planner_attempts ADD COLUMN error_details_json TEXT")
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(9,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(10,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(11,?)", (now_iso(),))
             for run in db.execute("SELECT id,revision,stage FROM film_runs WHERE status='running'"):
                 message = "Application restarted during orchestration; the run was paused at its last durable checkpoint."
                 db.execute("UPDATE film_runs SET status='paused',error=?,revision=revision+1,updated_at=? WHERE id=? AND status='running'",
@@ -766,10 +770,19 @@ class Database:
         authorization = request.get("authorization", {}) if status != "awaiting_authorization" else {}
         with self.lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            # A fresh browser idempotency key after refresh must not create a
-            # second active film request for the exact same authorized plan.
+            # A fresh browser idempotency key must not duplicate active work.
+            # Old failed planning runs have no LTX workload and must not shadow
+            # a deliberate fresh request. Any active associated LTX job is
+            # protected regardless of run status; other blocked stages remain
+            # deduplicated to avoid replaying completed/partial production.
             matching = db.execute("SELECT * FROM film_runs WHERE project_id=? AND request_hash=? "
-                                  "AND status IN ('awaiting_authorization','waiting_for_planner','running','paused','needs_attention') "
+                                  "AND archived_at IS NULL AND ("
+                                  "status IN ('awaiting_authorization','waiting_for_planner','running','paused') OR "
+                                  "EXISTS(SELECT 1 FROM film_run_shot_attempts a JOIN jobs j ON j.id=a.job_id "
+                                  "WHERE a.run_id=film_runs.id AND j.status IN ('queued','running')) OR "
+                                  "EXISTS(SELECT 1 FROM film_batches b JOIN film_batch_shots bs ON bs.batch_id=b.id "
+                                  "JOIN jobs j ON j.id=bs.job_id WHERE b.film_run_id=film_runs.id AND j.status IN ('queued','running')) OR "
+                                  "(status='needs_attention' AND stage!='understand_story')) "
                                   "ORDER BY created_at DESC LIMIT 1", (project_id, request_hash)).fetchone()
             if matching:
                 result = self._film_run(matching)
@@ -805,15 +818,62 @@ class Database:
                     "SELECT revision,time,level,message FROM film_run_events WHERE run_id=? ORDER BY id", (run_id,))]
             return result
 
-    def list_film_runs(self, project_id: str, limit: int = 100):
+    def list_film_runs(self, project_id: str, limit: int = 100, *, include_archived: bool = False):
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM film_runs WHERE project_id=? ORDER BY updated_at DESC LIMIT ?",
-                              (project_id, limit))
+            if include_archived:
+                rows = db.execute("SELECT * FROM film_runs WHERE project_id=? ORDER BY updated_at DESC LIMIT ?",
+                                  (project_id, limit))
+            else:
+                rows = db.execute("SELECT * FROM film_runs WHERE project_id=? AND archived_at IS NULL "
+                                  "ORDER BY updated_at DESC LIMIT ?", (project_id, limit))
             runs = [self._film_run(row) for row in rows]
             for run in runs:
                 run["events"] = [dict(event) for event in db.execute(
                     "SELECT revision,time,level,message FROM film_run_events WHERE run_id=? ORDER BY id", (run["id"],))]
             return runs
+
+    def set_film_run_archived(self, project_id: str, run_id: str, expected_revision: int, *, archived: bool):
+        timestamp = now_iso()
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM film_runs WHERE id=? AND project_id=?", (run_id, project_id)).fetchone()
+            if not row:
+                return None
+            if int(row["revision"]) != expected_revision:
+                raise FilmRunConflict("Film run changed before the archive action; refresh and retry")
+            if archived:
+                if row["archived_at"]:
+                    return self._film_run(row)
+                if row["status"] not in {"needs_attention", "failed", "cancelled", "completed"}:
+                    raise FilmRunTransitionError("Only failed, cancelled, completed, or needs-attention film runs can be archived")
+                active_job = db.execute(
+                    "SELECT 1 FROM film_run_shot_attempts a JOIN jobs j ON j.id=a.job_id "
+                    "WHERE a.run_id=? AND j.status IN ('queued','running') "
+                    "UNION ALL SELECT 1 FROM film_batches b JOIN film_batch_shots bs ON bs.batch_id=b.id "
+                    "JOIN jobs j ON j.id=bs.job_id WHERE b.film_run_id=? AND j.status IN ('queued','running') LIMIT 1",
+                    (run_id, run_id)).fetchone()
+                if active_job:
+                    raise FilmRunTransitionError("This run still has queued or running LTX jobs; let them settle or cancel them before archiving")
+            elif not row["archived_at"]:
+                return self._film_run(row)
+
+            archived_at = timestamp if archived else None
+            new_revision = expected_revision + 1
+            db.execute("UPDATE film_runs SET archived_at=?,revision=?,updated_at=? WHERE id=? AND project_id=? AND revision=?",
+                       (archived_at, new_revision, timestamp, run_id, project_id, expected_revision))
+            message = ("Film run archived from the normal view; history and media are preserved." if archived
+                       else "Film run restored to the normal view; history and media are preserved.")
+            db.execute("INSERT INTO film_run_events(run_id,revision,time,level,message) VALUES(?,?,?,?,?)",
+                       (run_id, new_revision, timestamp, "info", message))
+        return self.get_film_run(run_id)
+
+    def film_run_generation_job_count(self, run_id: str) -> int:
+        with self.connect() as db:
+            row = db.execute("SELECT COUNT(DISTINCT job_id) FROM ("
+                "SELECT job_id FROM film_run_shot_attempts WHERE run_id=? AND job_id IS NOT NULL "
+                "UNION SELECT bs.job_id FROM film_batches b JOIN film_batch_shots bs ON bs.batch_id=b.id "
+                "WHERE b.film_run_id=? AND bs.job_id IS NOT NULL)", (run_id, run_id)).fetchone()
+            return int(row[0] or 0)
 
     def next_film_run(self):
         """Return the oldest explicitly authorized run awaiting a durable stage."""
