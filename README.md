@@ -195,8 +195,9 @@ Flash-class model listed as available to that account. The backend stores the
 key in a protected local file (`GEMINI_SECRET_PATH`, mode 0600) or reads
 `GEMINI_API_KEY` from the backend environment. The key is never returned to the
 browser or written to SQLite, film-run checkpoints, or logs. FRAMEWORK uses the
-official pinned `google-genai` SDK and Gemini structured JSON output, then
-validates every result against the strict Pydantic `StoryPlan` schema, project
+official pinned `google-genai` SDK and the `generateContent` structured JSON API.
+Only account-listed Flash models advertising `generateContent` support are
+selectable. FRAMEWORK validates every result against the strict Pydantic `StoryPlan` schema, project
 references, story order, identity/count consistency, shot limits, and generation
 budgets. Each run is limited to two planning requests (one optional schema
 repair), with at most five planning attempts per hour and three explicit
