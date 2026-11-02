@@ -285,20 +285,20 @@ class FilmRunEngine:
                 conditioning = "previous-shot" if previous_shot_id else "guide-image" if anchors else "text-only"
                 identity_lines = [f"{characters[cid].name}: {characters[cid].identity}; distinguishing traits: " + ", ".join(characters[cid].distinguishing_traits)
                                   for cid in shot.characters_present]
-                # A chained shot inherits identity, layout and style from its first frame; a short
+                framing = "Shot framing: " + shot.framing + ". Shot character layout: " + shot.character_layout
+                # A shot the worker chains inherits identity and style from its first frame; a short
                 # action-led prompt keeps LTX from freezing on that frame.
+                continuation_prompt = "\n".join([
+                    shot.prompt,
+                    f"Visual style: {plan.visual_style}",
+                    f"Location continuity: {location.name}. {location.description} Scale: {location.scale}",
+                    framing,
+                ])
                 prompt = "\n".join([
-                    shot.prompt,
-                    f"Visual style: {plan.visual_style}",
-                    f"Location continuity: {location.name}. {location.description} Scale: {location.scale}",
-                ] if previous_shot_id else [
-                    shot.prompt,
-                    f"Visual style: {plan.visual_style}",
-                    f"Location continuity: {location.name}. {location.description} Scale: {location.scale}",
+                    continuation_prompt,
                     "Character identity continuity: " + " | ".join(identity_lines),
                     "Scene character layout: " + scene.character_layout,
                     "Scene continuity: " + " | ".join(scene.continuity_requirements),
-                    "Shot framing: " + shot.framing + ". Shot character layout: " + shot.character_layout,
                     *[f"Project style bible: {line}" for line in style_lines],
                 ])
                 if len(prompt) > 4000:
@@ -316,6 +316,7 @@ class FilmRunEngine:
                         "style_bible_revision": project.get("style_bible_revision", 0)},
                     "style_context": plan.visual_style, "reference_conditioning": conditioning,
                     "reference_anchors": anchors, "reference_as_frame": False, "continue_from_shot_id": previous_shot_id,
+                    "continuation_prompt": continuation_prompt,
                     "reference_id": reference_id, "preflight_warnings": []}
                 previous_shot_id = shot_id
                 rows.append({"id": shot_id, "scene_title": saved_scene_title, "title": shot.title,

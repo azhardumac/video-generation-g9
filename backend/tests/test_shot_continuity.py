@@ -48,6 +48,7 @@ def _job(tmp_path):
     (tmp_path / "out").mkdir(exist_ok=True)
     return {"id": "job-2", "payload": {"film_batch_id": "batch", "continue_from_shot_id": "previous",
             "output_location": str(tmp_path / "out"), "reference_image": None,
+            "prompt": "frog waits\nCharacter identity continuity: frog", "continuation_prompt": "frog waits",
             "reference_anchors": [{"path": "/refs/frog.png", "frame_index": 0, "strength": 0.35, "binding": "guide"}]}}
 
 
@@ -64,6 +65,7 @@ def test_chained_shot_starts_on_previous_clip_last_frame(tmp_path, monkeypatch):
     monkeypatch.setattr(worker_module, "extract_last_frame", fake_extract)
     payload = asyncio.run(_worker(tmp_path, str(clip))._with_previous_shot(_job(tmp_path)))
     assert payload["continued_from_previous_shot"] is True
+    assert payload["prompt"] == "frog waits"
     assert payload["reference_anchors"] == [
         {"path": str((tmp_path / "out" / "job-2.continue.png").resolve()), "frame_index": 0, "strength": 1.0, "binding": "replace"}]
 
