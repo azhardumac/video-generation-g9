@@ -36,7 +36,10 @@ class GeminiSecretStore:
                 raise SecretStoreError("Gemini secret file exceeds the expected size")
             if os.name == "posix" and metadata.st_mode & 0o077:
                 raise SecretStoreError("Gemini secret file permissions are too broad; set its permissions to 0600")
-            raw = handle.read(4097)
+            try:
+                raw = handle.read(4097)
+            except UnicodeDecodeError as exc:
+                raise SecretStoreError("The protected Gemini secret file is malformed") from exc
         try:
             value = json.loads(raw).get("gemini_api_key")
         except (json.JSONDecodeError, AttributeError) as exc:

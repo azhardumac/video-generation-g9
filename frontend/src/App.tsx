@@ -11,6 +11,7 @@ import CreateFilmPage from './CreateFilmPage'
 import GeminiConnectionPanel from './GeminiConnectionPanel'
 import FilmRunReviewPage from './FilmRunReviewPage'
 import ErrorBoundary from './ErrorBoundary'
+import { apiErrorMessage } from './apiError'
 import { filmRunReviewTarget, type FilmRunReviewTarget } from './filmRunReviewNavigation'
 
 type Preset = { name: string; frames: number; fps: number; duration: number; status: string; visual_drift_warning?: boolean }
@@ -23,6 +24,8 @@ const nav = [
   { group: 'STUDIO', items: [['Create Film', WandSparkles], ['Overview', LayoutDashboard], ['Projects', FolderOpen], ['References', Image]] },
   { group: 'ADVANCED', items: [['Storyboard', ListVideo], ['Story to Film', Film], ['Scene continuity', ShieldCheck], ['Export / Remotion', Film], ['Generate video', WandSparkles], ['Job queue', Gauge], ['History & logs', History], ['Style bible', BookOpen], ['Setup', Download], ['Settings', Settings]] },
 ] as const
+const simpleNavItems = new Set(['Create Film', 'Projects', 'References', 'Setup'])
+const modeStorageKey = 'ai-video-studio-mode'
 const dateLabel = new Intl.DateTimeFormat('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }).format(new Date()).toUpperCase()
 const jobTitle = (job:Job) => job.payload.job_label || (job.kind === 'render' ? `Remotion render · ${job.payload.composition_id || 'storyboard composition'}` : job.payload.prompt || 'Untitled generation')
 const jobTypeLabel = (job:Job) => job.kind === 'render' ? `Remotion · ${job.payload.composition_id || 'StoryboardAssembly'}` : job.payload.preset || 'Generation'
@@ -50,8 +53,13 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [unsavedStoryboard, setUnsavedStoryboard] = useState(false)
   const setupInitialCheck = useRef(false)
+  const refreshing = useRef(false)
+  const [simpleMode, setSimpleMode] = useState(() => { try { return localStorage.getItem(modeStorageKey) !== 'advanced' } catch { return true } })
+  const visibleNav = nav.map(section => ({ group: simpleMode && section.group === 'ADVANCED' ? 'HELP' : section.group, items: section.items.filter(([label]) => !simpleMode || simpleNavItems.has(label)) })).filter(section => section.items.length)
 
   const refresh = async () => {
+    if (refreshing.current) return
+    refreshing.current = true
     try {
       const [p, h, i, projectResponse, activeResponse] = await Promise.all([fetch('/api/presets'), fetch('/api/health'), fetch('/api/integrations'), fetch('/api/projects'), fetch('/api/projects/active')])
       if (p.ok) setPresets(await p.json())
@@ -73,6 +81,7 @@ export default function App() {
       }
       setConnected(h.ok)
     } catch { setConnected(false) }
+    finally { refreshing.current = false }
   }
   useEffect(() => {
     const refreshResources=async()=>{try{const response=await fetch('/api/resources');if(response.ok)setResources(await response.json())}catch{}}
@@ -139,6 +148,19 @@ export default function App() {
     setPreset(name)
   }
 
+  function toggleMode(){
+    const next=!simpleMode
+    setSimpleMode(next)
+    try{localStorage.setItem(modeStorageKey,next?'simple':'advanced')}catch{}
+    if(next&&!simpleNavItems.has(active))navigate('Create Film')
+  }
+  async function createQuickProject(name:string){
+    const response=await fetch('/api/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})
+    const data=await response.json()
+    if(!response.ok)throw new Error(apiErrorMessage(data.detail,'Could not create project'))
+    await selectProject(data.id);setActive('Create Film')
+  }
+
   function navigate(label:string){
     if(active==='Storyboard'&&unsavedStoryboard&&!window.confirm('Discard unsaved storyboard changes and leave this page?'))return
     setActive(label)
@@ -154,8 +176,8 @@ export default function App() {
     <aside className="sidebar">
       <div className="brand"><div className="brand-mark"><Aperture size={20}/></div><div><strong>FRAMEWORK</strong><span>AI VIDEO STUDIO</span></div></div>
       <label className="project-switch-label" aria-label="Active project"><span className="project-icon">{activeProject?.name.slice(0,2).toUpperCase()??'—'}</span><select className="project-switch" aria-label="Active project" value={activeProject?.id??''} onChange={e=>void selectProject(e.target.value).catch(error=>setNotice(error.message))}><option value="">No active project</option>{projects.map(project=><option key={project.id} value={project.id}>{project.name}</option>)}</select><ChevronDown size={15}/></label>
-      <div className="nav-wrap">{nav.map(section => <div className="nav-section" key={section.group}><div className="nav-label">{section.group}</div>{section.items.map(([label, Icon]) => <button key={label} aria-label={label} title={label} onClick={() => navigate(label)} className={`nav-item ${active === label ? 'active' : ''}`}><Icon size={17}/><span>{label}</span>{label === 'Job queue' && jobs.some(j => j.status === 'queued' || j.status === 'running') && <i className="nav-dot"/>}</button>)}</div>)}</div>
-      <div className="sidebar-bottom"><div className="local-card"><div className="local-top"><span className={`status-dot ${connected ? 'online' : ''}`}/><b>{connected ? 'Local API connected' : 'API offline'}</b><span className="local-badge">LOCAL</span></div><p>{connected ? 'Project data is stored in the local SQLite database.' : 'Start the FastAPI service to connect.'}</p><div className="local-meta"><span><HardDrive size={13}/> SQLite</span><span><Aperture size={13}/> MLX</span></div></div></div>
+      <div className="nav-wrap">{visibleNav.map(section => <div className="nav-section" key={section.group}><div className="nav-label">{section.group}</div>{section.items.map(([label, Icon]) => <button key={label} aria-label={label} title={label} onClick={() => navigate(label)} className={`nav-item ${active === label ? 'active' : ''}`}><Icon size={17}/><span>{label}</span>{label === 'Job queue' && jobs.some(j => j.status === 'queued' || j.status === 'running') && <i className="nav-dot"/>}</button>)}</div>)}</div>
+      <div className="sidebar-bottom"><button className="mode-toggle" onClick={toggleMode} aria-pressed={!simpleMode} title={simpleMode?'Show every studio tool':'Hide advanced tools'}><SlidersHorizontal size={13}/><span>{simpleMode?'Simple mode':'Advanced mode'}</span><small>{simpleMode?'Show advanced tools':'Switch to simple'}</small></button><div className="local-card"><div className="local-top"><span className={`status-dot ${connected ? 'online' : ''}`}/><b>{connected ? 'Local API connected' : 'API offline'}</b><span className="local-badge">LOCAL</span></div><p>{connected ? 'Project data is stored in the local SQLite database.' : 'Start the FastAPI service to connect.'}</p><div className="local-meta"><span><HardDrive size={13}/> SQLite</span><span><Aperture size={13}/> MLX</span></div></div></div>
     </aside>
     <main className="main-content">
       <header className="topbar"><div className="breadcrumbs"><span>{activeProject?.name??'No project selected'}</span><span className="slash">/</span><b>{active}</b></div><div className="top-actions"><div className="local-indicator"><span className={`status-dot ${connected ? 'online' : ''}`}/>{connected ? 'Local mode' : 'API disconnected'}</div><span className="top-divider"/><span>{activeProject?'Project data stays local':'Select a project to begin'}</span></div></header>
@@ -163,7 +185,7 @@ export default function App() {
         <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> {dateLabel}</div><h1>{active === 'Overview' ? activeProject?.name??'Local video studio' : active}</h1><p className="subtitle">{active === 'Overview' ? activeProject?.description||'Create or select a project to start planning.' : 'A local-first production workspace.'}</p></div>{activeProject&&active!=='Create Film'&&<button className="button secondary" onClick={() => navigate('Create Film')}><WandSparkles size={16}/> Continue in Create Film</button>}</div>
         {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss"><X size={14}/></button></div>}
         <ErrorBoundary key={`${active}:${errorBoundaryRevision}`} onReset={()=>{setReviewTarget(null);setActive('Create Film');setErrorBoundaryRevision(value=>value+1)}}>
-        {active === 'Create Film' && <CreateFilmPage project={activeProject} presets={presets} onMessage={setNotice} onNavigate={navigate} onReview={openFilmRunReview} reviewTarget={reviewTarget} onCloseReview={()=>setReviewTarget(null)}/>}
+        {active === 'Create Film' && <CreateFilmPage project={activeProject} presets={presets} onMessage={setNotice} onNavigate={navigate} onReview={openFilmRunReview} reviewTarget={reviewTarget} onCloseReview={()=>setReviewTarget(null)} simple={simpleMode} onCreateProject={createQuickProject}/>}
         {active === 'Clip review' && <FilmRunReviewPage target={reviewTarget} onBack={()=>setActive('Create Film')} onContinueExport={()=>setActive('Create Film')}/>}
         {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onSaved={()=>activeProject?loadProjectSettings(activeProject.id):Promise.resolve()} onRecheck={recheckLocalStatus} onMessage={setNotice} integrations={integrations} resources={resources} projectId={activeProject?.id??null}/>}
         {active === 'Setup' && <SetupPage onMessage={setNotice} onContinue={()=>setActive('Overview')}/>}
@@ -189,8 +211,8 @@ export default function App() {
           <section className="panel presets-panel"><div className="panel-heading compact"><div><div className="section-kicker">TUNED TO YOUR MACHINE</div><h2>Generation presets</h2></div><button className="text-button" onClick={()=>setActive('Settings')}>All presets <ArrowUpRight size={13}/></button></div><div className="preset-list">{presets.map(p=><button key={p.name} onClick={()=>selectPreset(p.name,p.visual_drift_warning)} className={`preset-item ${preset===p.name?'selected':''}`}><div className="preset-mark"><span style={{height: `${Math.min(30,10+p.frames/8)}px`}}/></div><div className="preset-info"><b>{p.name}{p.name==='Standard'&&<span className="default-label">DEFAULT</span>}</b><small>{p.frames} frames <i/> {p.fps} fps <i/> {p.duration.toFixed(2)}s</small></div><span className={`preset-status ${p.visual_drift_warning?'warning':''}`}>{p.status}</span></button>)}</div><div className="benchmark-note"><Gauge size={14}/><span>Experimental 193f requires confirmation; it may show visual drift.</span></div></section>
         </div>
         </div></ErrorBoundary>
-        <div className="lower-grid"><section className="panel queue-panel"><div className="panel-heading compact"><div><div className="section-kicker">UP NEXT</div><h2>Recent activity</h2></div><button className="text-button" onClick={()=>setActive('Job queue')}>View queue <ArrowUpRight size={13}/></button></div>{jobs.length ? <div className="job-list">{jobs.slice(0,4).map(j=><div className="job-row" key={j.id}><div className={`job-icon ${j.status}`}><Film size={16}/></div><div className="job-copy"><b>{jobTitle(j)}</b><small>{jobTypeLabel(j)} · {new Date(j.created_at).toLocaleString()}</small></div><span className={`job-status ${j.status}`}>{j.status}</span>{j.status==='running'&&<div className="mini-progress"><span style={{width:`${j.progress}%`}}/></div>}</div>)}</div> : <div className="empty-state"><div className="empty-icon"><Film size={20}/></div><b>No jobs yet</b><span>Your creations and renders will show up here.</span><button className="text-button" onClick={()=>setActive('Generate video')}>Create your first video <ArrowUpRight size={13}/></button></div>}</section>
-            <section className="panel project-panel"><div className="panel-heading compact"><div><div className="section-kicker">YOUR WORKSPACE</div><h2>Projects</h2></div><button className="text-button" onClick={()=>setActive('Projects')}>Manage projects <ArrowUpRight size={13}/></button></div>{activeProject?<div className="empty-state"><div className="empty-icon"><FolderOpen size={20}/></div><b>{activeProject.name}</b><span>{activeProject.reference_count} references · {activeProject.shot_count} shots · {activeProject.job_count} jobs</span><button className="text-button" onClick={()=>setActive('Projects')}>Project settings <ArrowUpRight size={13}/></button></div>:<div className="empty-state"><b>No project selected</b><span>Create or open a project to see its production data.</span><button className="text-button" onClick={()=>setActive('Projects')}>Create or import a project <ArrowUpRight size={13}/></button></div>}</section></div>
+        {active === 'Overview' && <div className="lower-grid"><section className="panel queue-panel"><div className="panel-heading compact"><div><div className="section-kicker">UP NEXT</div><h2>Recent activity</h2></div><button className="text-button" onClick={()=>setActive('Job queue')}>View queue <ArrowUpRight size={13}/></button></div>{jobs.length ? <div className="job-list">{jobs.slice(0,4).map(j=><div className="job-row" key={j.id}><div className={`job-icon ${j.status}`}><Film size={16}/></div><div className="job-copy"><b>{jobTitle(j)}</b><small>{jobTypeLabel(j)} · {new Date(j.created_at).toLocaleString()}</small></div><span className={`job-status ${j.status}`}>{j.status}</span>{j.status==='running'&&<div className="mini-progress"><span style={{width:`${j.progress}%`}}/></div>}</div>)}</div> : <div className="empty-state"><div className="empty-icon"><Film size={20}/></div><b>No jobs yet</b><span>Your creations and renders will show up here.</span><button className="text-button" onClick={()=>setActive('Generate video')}>Create your first video <ArrowUpRight size={13}/></button></div>}</section>
+            <section className="panel project-panel"><div className="panel-heading compact"><div><div className="section-kicker">YOUR WORKSPACE</div><h2>Projects</h2></div><button className="text-button" onClick={()=>setActive('Projects')}>Manage projects <ArrowUpRight size={13}/></button></div>{activeProject?<div className="empty-state"><div className="empty-icon"><FolderOpen size={20}/></div><b>{activeProject.name}</b><span>{activeProject.reference_count} references · {activeProject.shot_count} shots · {activeProject.job_count} jobs</span><button className="text-button" onClick={()=>setActive('Projects')}>Project settings <ArrowUpRight size={13}/></button></div>:<div className="empty-state"><b>No project selected</b><span>Create or open a project to see its production data.</span><button className="text-button" onClick={()=>setActive('Projects')}>Create or import a project <ArrowUpRight size={13}/></button></div>}</section></div>}
         <footer className="footer"><span><span className="status-dot online"/> Everything runs locally</span><span><BookOpen size={13}/> Studio v0.1.0 <i/> <span>Made for the frames in your head.</span></span></footer>
         </div>
       </div>

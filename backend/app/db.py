@@ -973,8 +973,12 @@ class Database:
     def next_film_run(self):
         """Return the oldest explicitly authorized run awaiting a durable stage."""
         with self.connect() as db:
-            row = db.execute("SELECT * FROM film_runs WHERE status='waiting_for_planner' "
+            row = db.execute("SELECT * FROM film_runs r WHERE status='waiting_for_planner' "
                              "AND json_extract(authorization_json,'$.confirmed')=1 "
+                             "AND NOT (stage='inspect_clips' AND EXISTS (SELECT 1 FROM film_batch_shots bs "
+                             "JOIN jobs j ON j.id=bs.job_id WHERE bs.batch_id=COALESCE(r.film_batch_id,"
+                             "json_extract(r.checkpoint_json,'$.generate_shots.film_batch_id')) "
+                             "AND j.status IN ('queued','running'))) "
                              "ORDER BY created_at,id LIMIT 1").fetchone()
             return self._film_run(row)
 

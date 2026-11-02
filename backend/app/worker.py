@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import logging
 import time
 from pathlib import Path
 
@@ -11,6 +12,8 @@ from .storyboards import build_composition_manifest
 from .paths import safe_local_path
 from .film_run_engine import FilmRunEngine
 from .gemini_secrets import GeminiSecretStore
+
+logger = logging.getLogger(__name__)
 
 
 class LocalWorker:
@@ -42,28 +45,35 @@ class LocalWorker:
 
     async def run(self):
         while not self.stop_event.is_set():
-            pending = self.db.next_queued_job()
-            if pending:
-                budget = self.db.film_run_budget_for_job(pending["id"])
-                if budget and (budget["remaining_seconds"] <= 0 or budget["output_bytes"] >= budget["max_output_bytes"]):
-                    reason = ("Film run generation-time budget was exhausted; remaining queued shots were stopped."
-                              if budget["remaining_seconds"] <= 0 else
-                              "Film run output-storage budget was reached; remaining queued shots were stopped.")
-                    self.db.stop_film_run_queue_for_budget(budget["run_id"], reason)
-                    continue
-                self.active_job_id = pending["id"]
-                self.active_task = asyncio.create_task(self.execute(pending))
-                try:
-                    await self.active_task
-                finally:
-                    self.active_task = None
-                    self.active_job_id = None
-            else:
-                # Film orchestration shares this process with the existing
-                # single generation worker. It only creates queue records;
-                # the normal worker remains the only LTX process runner.
-                await asyncio.to_thread(self.film_runs.process_next)
-                await asyncio.sleep(0.5)
+            try:
+                await self._tick()
+            except Exception:
+                logger.exception("Worker loop iteration failed; retrying")
+                await asyncio.sleep(1)
+
+    async def _tick(self):
+        pending = self.db.next_queued_job()
+        if pending:
+            budget = self.db.film_run_budget_for_job(pending["id"])
+            if budget and (budget["remaining_seconds"] <= 0 or budget["output_bytes"] >= budget["max_output_bytes"]):
+                reason = ("Film run generation-time budget was exhausted; remaining queued shots were stopped."
+                          if budget["remaining_seconds"] <= 0 else
+                          "Film run output-storage budget was reached; remaining queued shots were stopped.")
+                self.db.stop_film_run_queue_for_budget(budget["run_id"], reason)
+                return
+            self.active_job_id = pending["id"]
+            self.active_task = asyncio.create_task(self.execute(pending))
+            try:
+                await self.active_task
+            finally:
+                self.active_task = None
+                self.active_job_id = None
+        else:
+            # Film orchestration shares this process with the existing
+            # single generation worker. It only creates queue records;
+            # the normal worker remains the only LTX process runner.
+            await asyncio.to_thread(self.film_runs.process_next)
+            await asyncio.sleep(0.5)
 
     async def execute(self, job: dict):
         job_id = job["id"]
@@ -136,7 +146,7 @@ class LocalWorker:
             if self.stop_event.is_set() and current and current["status"] != "cancelled":
                 self.db.update_job(job_id, status="queued", progress=0,
                                    elapsed_seconds=round(time.monotonic() - started, 2),
-                                   partial_output_path=partial if partial and partial.exists() else None)
+                                   partial_output_path=str(partial) if partial and partial.exists() else None)
                 self.db.event(job_id, "warning", "Worker stopped; job returned to queue")
             else:
                 if current and current["status"] != "cancelled":

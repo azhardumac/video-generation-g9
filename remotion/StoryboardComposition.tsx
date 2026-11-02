@@ -28,12 +28,13 @@ type Manifest = {
   shots: Shot[];
 };
 
-const ShotClip: React.FC<{ shot: Shot }> = ({shot}) => {
+const ShotClip: React.FC<{ shot: Shot; isLast: boolean }> = ({shot, isLast}) => {
   const frame = useCurrentFrame();
   const fadeIn = shot.transition_in_frames
     ? interpolate(frame, [0, shot.transition_in_frames], [0, 1], {extrapolateRight: 'clamp'})
     : 1;
-  const fadeOut = shot.transition_out_frames
+  // The next clip renders on top and fades in, so only the final clip fades to black.
+  const fadeOut = isLast && shot.transition_out_frames
     ? interpolate(frame, [shot.frames - shot.transition_out_frames, shot.frames], [1, 0], {extrapolateLeft: 'clamp'})
     : 1;
   return <AbsoluteFill style={{opacity: Math.min(fadeIn, fadeOut), backgroundColor: '#05070b'}}>
@@ -45,8 +46,8 @@ const ShotClip: React.FC<{ shot: Shot }> = ({shot}) => {
 };
 
 const StoryboardTimeline: React.FC<{manifest: Manifest}> = ({manifest}) => <AbsoluteFill style={{backgroundColor: '#05070b'}}>
-  {manifest.shots.map((shot) => <Sequence key={shot.shot_id} from={shot.start_frame} durationInFrames={shot.frames}>
-    <ShotClip shot={shot}/>
+  {manifest.shots.map((shot, index) => <Sequence key={shot.shot_id} from={shot.start_frame} durationInFrames={shot.frames}>
+    <ShotClip shot={shot} isLast={index === manifest.shots.length - 1}/>
   </Sequence>)}
 </AbsoluteFill>;
 
