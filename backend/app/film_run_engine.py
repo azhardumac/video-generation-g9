@@ -279,9 +279,9 @@ class FilmRunEngine:
                 ref_path = reference_paths.get(reference_id) if reference_id else None
                 shot_id = str(uuid5(UUID(run["id"]), f"shot:{shot.id}"))
                 # Later shots in a scene start on the previous clip's last frame (swapped in by the worker).
-                # Reference stills only guide weakly so their studio backdrop is never pinned as frame 0.
+                # Character sheets are never used as frames: even a weak anchor makes the clip open on their studio backdrop.
                 anchors = ([{"path": ref_path, "frame_index": 0, "strength": REFERENCE_GUIDE_STRENGTH, "binding": "guide"}]
-                           if ref_path else [])
+                           if ref_path and linked[reference_id].get("category") != "character" else [])
                 conditioning = "previous-shot" if previous_shot_id else "guide-image" if anchors else "text-only"
                 identity_lines = [f"{characters[cid].name}: {characters[cid].identity}; distinguishing traits: " + ", ".join(characters[cid].distinguishing_traits)
                                   for cid in shot.characters_present]
@@ -309,7 +309,7 @@ class FilmRunEngine:
                         "output_location": str(output), "framing": shot.framing,
                         "style_bible_revision": project.get("style_bible_revision", 0)},
                     "style_context": plan.visual_style, "reference_conditioning": conditioning,
-                    "reference_anchors": anchors, "continue_from_shot_id": previous_shot_id,
+                    "reference_anchors": anchors, "reference_as_frame": False, "continue_from_shot_id": previous_shot_id,
                     "reference_id": reference_id, "preflight_warnings": []}
                 previous_shot_id = shot_id
                 rows.append({"id": shot_id, "scene_title": saved_scene_title, "title": shot.title,
@@ -326,7 +326,7 @@ class FilmRunEngine:
                     "scene_count": len(plan.scenes), "shot_count": len(rows), "preset": request["preset"],
                     "frames_per_shot": frames, "fps": fps, "width": width, "height": height,
                     "approved_reference_ids": sorted(selected),
-                    "reference_limit_note": "Shots after the first in each scene start on the previous shot's last frame. A scene's first shot is guided weakly by at most one approved image; local conditioning does not guarantee identity consistency.",
+                    "reference_limit_note": "Shots after the first in each scene start on the previous shot's last frame. Character references are described in prompts but never used as video frames; other references guide shots weakly. Local conditioning does not guarantee identity consistency.",
                     "creative_quality_status": "pending_manual_review", "audio_available": False,
                     "model_capabilities": {"text_to_video": True, "image_to_video": True,
                         "max_reference_images_per_shot": 1, "audio_generation": False,

@@ -47,7 +47,7 @@ def build_ltx_command(executable: str, payload: dict, output_path: str, referenc
         for anchor in anchors:
             args += ["--image", anchor["path"], str(anchor.get("frame_index", 0)), str(anchor.get("strength", 1.0)),
                      *([anchor["binding"]] if anchor.get("binding") else [])]
-    elif reference_image:
+    elif reference_image and payload.get("reference_as_frame", True):
         args += ["--image", reference_image, "0", "1.0"]
     if payload.get("seed") is not None:
         args += ["--seed", str(payload["seed"])]

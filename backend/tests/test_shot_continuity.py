@@ -21,6 +21,12 @@ def test_ltx_command_passes_anchor_binding():
         "--image", "/out/prev.png", "0", "1.0", "replace", "--image", "/refs/frog.png", "0", "0.35", "guide"]
 
 
+def test_film_reference_kept_for_snapshots_is_not_pinned_as_first_frame():
+    payload = {"prompt": "river", "model": "m", "width": 448, "height": 768, "frames": 49, "fps": 24,
+               "reference_image": "/refs/frog.png", "reference_as_frame": False, "reference_anchors": []}
+    assert "--image" not in build_ltx_command("ltx", payload, "/out/job.partial.mp4", "/refs/frog.png")
+
+
 class _Db:
     def __init__(self, clip):
         self.clip, self.events = clip, []
