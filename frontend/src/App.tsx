@@ -140,7 +140,7 @@ export default function App() {
     if(unsavedStoryboard&&!window.confirm('Discard unsaved storyboard changes and switch projects?'))return
     const response=await fetch('/api/projects/active',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:projectId||null})})
     const data=await response.json();if(!response.ok)throw new Error(data.detail??'Could not switch project')
-    setActiveProject(data.project);setReviewTarget(null);setExportStoryboardId(null);setActive('Overview');await refresh()
+    setActiveProject(data.project);setReviewTarget(null);setExportStoryboardId(null);setActive(simpleMode?'Create Film':'Overview');await refresh()
   }
 
   function selectPreset(name: string, warning?: boolean) {
@@ -188,7 +188,7 @@ export default function App() {
         {active === 'Create Film' && <CreateFilmPage project={activeProject} presets={presets} onMessage={setNotice} onNavigate={navigate} onReview={openFilmRunReview} reviewTarget={reviewTarget} onCloseReview={()=>setReviewTarget(null)} simple={simpleMode} onCreateProject={createQuickProject}/>}
         {active === 'Clip review' && <FilmRunReviewPage target={reviewTarget} onBack={()=>setActive('Create Film')} onContinueExport={()=>setActive('Create Film')}/>}
         {active === 'Settings' && <SettingsPage presets={presets} selected={preset} onSelect={selectPreset} onPresetsChanged={refresh} onSaved={()=>activeProject?loadProjectSettings(activeProject.id):Promise.resolve()} onRecheck={recheckLocalStatus} onMessage={setNotice} integrations={integrations} resources={resources} projectId={activeProject?.id??null}/>}
-        {active === 'Setup' && <SetupPage onMessage={setNotice} onContinue={()=>setActive('Overview')}/>}
+        {active === 'Setup' && <SetupPage onMessage={setNotice} onContinue={()=>setActive(simpleMode?'Create Film':'Overview')}/>}
         {active === 'Job queue' && <JobsPage title="Local job queue" jobs={jobs.filter(j=>j.status==='queued'||j.status==='running'||j.status==='failed')} onChanged={refresh} onMessage={setNotice}/>}
         {active === 'History & logs' && <JobsPage title="Generation history" jobs={jobs.filter(j=>j.status==='completed'||j.status==='failed'||j.status==='cancelled')} onChanged={refresh} onMessage={setNotice}/>}
         {active === 'Projects' && <ProjectsPage projects={projects} activeId={activeProject?.id??null} onChanged={refreshProjects} onSelect={selectProject} onMessage={setNotice}/>}
