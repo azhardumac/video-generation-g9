@@ -57,6 +57,7 @@ def test_chained_shot_starts_on_previous_clip_last_frame(tmp_path, monkeypatch):
 
     monkeypatch.setattr(worker_module, "extract_last_frame", fake_extract)
     payload = asyncio.run(_worker(tmp_path, str(clip))._with_previous_shot(_job(tmp_path)))
+    assert payload["continued_from_previous_shot"] is True
     assert payload["reference_anchors"] == [
         {"path": str((tmp_path / "out" / "job-2.continue.png").resolve()), "frame_index": 0, "strength": 1.0, "binding": "replace"}]
 
@@ -73,8 +74,8 @@ def _shot(tmp_path, position, continues):
     output.write_bytes(b"clip")
     return {"id": f"s{position}", "position": position, "title": f"Shot {position}", "prompt": "p", "transition_after": "cut",
             "job": {"id": f"j{position}", "status": "completed", "result_path": str(output),
-                    "verification_metadata": {"verified_output": {"width": 448, "height": 768, "fps": 24, "frames": 49}},
-                    "payload": {"continue_from_shot_id": f"s{position - 1}" if continues else None}}}
+                    "verification_metadata": {"verified_output": {"width": 448, "height": 768, "fps": 24, "frames": 49},
+                                              "continued_from_previous_shot": continues}}}
 
 
 def test_manifest_drops_duplicated_first_frame_of_chained_shots(tmp_path):

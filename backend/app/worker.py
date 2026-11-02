@@ -110,12 +110,15 @@ class LocalWorker:
             if job["kind"] == "render":
                 result = await self.remotion.render(job["payload"], progress)
             else:
-                generation = self.adapter.generate(await self._with_previous_shot(job), progress)
+                payload = await self._with_previous_shot(job)
+                generation = self.adapter.generate(payload, progress)
                 result = (await asyncio.wait_for(generation, timeout=run_budget["remaining_seconds"])
                           if run_budget else await generation)
             result_path = result["output_path"] if isinstance(result, dict) else result
             metadata = result.get("metadata") if isinstance(result, dict) else None
             exit_code = result.get("exit_code", 0) if isinstance(result, dict) else 0
+            if job["kind"] != "render" and payload.get("continued_from_previous_shot"):
+                metadata = (metadata or {}) | {"continued_from_previous_shot": True}
             completed = self.db.complete_job(
                 job_id, progress=100, result_path=result_path, exit_code=exit_code,
                 elapsed_seconds=round(time.monotonic() - started, 2), verification_metadata=metadata,
@@ -195,7 +198,7 @@ class LocalWorker:
             self.db.event(job["id"], "warning", f"{exc}; this shot starts without frame continuity.")
             return payload
         self.db.event(job["id"], "info", "Continuing from the last frame of the previous shot: " + clip)
-        return payload | {"reference_image": None,
+        return payload | {"continued_from_previous_shot": True,
                           "reference_anchors": [{"path": str(frame), "frame_index": 0, "strength": 1.0, "binding": "replace"}]}
 
     def _partial_path(self, job: dict) -> Path | None:

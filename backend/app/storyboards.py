@@ -84,7 +84,7 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
             "frames": frames, "fps": fps, "caption": shot.get("caption", ""),
             "prompt": shot["prompt"], "job_id": job.get("id"),
             "transition_after": shot.get("transition_after", "dissolve"),
-            "continues_previous": bool((job.get("payload") or {}).get("continue_from_shot_id")),
+            "continues_previous": bool((job.get("verification_metadata") or {}).get("continued_from_previous_shot")),
             "settings_snapshot": job.get("settings_snapshot") or {
                 "prompt": job.get("payload", {}).get("prompt", ""),
                 "reference_image": job.get("payload", {}).get("reference_image") or None,
