@@ -285,7 +285,13 @@ class FilmRunEngine:
                 conditioning = "previous-shot" if previous_shot_id else "guide-image" if anchors else "text-only"
                 identity_lines = [f"{characters[cid].name}: {characters[cid].identity}; distinguishing traits: " + ", ".join(characters[cid].distinguishing_traits)
                                   for cid in shot.characters_present]
+                # A chained shot inherits identity, layout and style from its first frame; a short
+                # action-led prompt keeps LTX from freezing on that frame.
                 prompt = "\n".join([
+                    shot.prompt,
+                    f"Visual style: {plan.visual_style}",
+                    f"Location continuity: {location.name}. {location.description} Scale: {location.scale}",
+                ] if previous_shot_id else [
                     shot.prompt,
                     f"Visual style: {plan.visual_style}",
                     f"Location continuity: {location.name}. {location.description} Scale: {location.scale}",
