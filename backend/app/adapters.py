@@ -45,7 +45,8 @@ def build_ltx_command(executable: str, payload: dict, output_path: str, referenc
     anchors = payload.get("reference_anchors") or []
     if anchors:
         for anchor in anchors:
-            args += ["--image", anchor["path"], str(anchor.get("frame_index", 0)), str(anchor.get("strength", 1.0))]
+            args += ["--image", anchor["path"], str(anchor.get("frame_index", 0)), str(anchor.get("strength", 1.0)),
+                     *([anchor["binding"]] if anchor.get("binding") else [])]
     elif reference_image:
         args += ["--image", reference_image, "0", "1.0"]
     if payload.get("seed") is not None:
@@ -105,6 +106,22 @@ async def terminate_process_group(process: asyncio.subprocess.Process, grace_sec
         except ProcessLookupError:
             pass
     await process.wait()
+
+
+async def extract_last_frame(video: str, image: Path, settings: Settings) -> Path:
+    """Write the final frame of a verified clip as a still for the next shot's first-frame anchor."""
+    ffprobe = shutil.which(settings.ffprobe_executable)
+    sibling = Path(ffprobe).with_name("ffmpeg") if ffprobe else None
+    ffmpeg = str(sibling) if sibling and sibling.is_file() else shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise AdapterError("ffmpeg executable was not found")
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-v", "error", "-y", "-sseof", "-0.5", "-i", video, "-update", "1", "-frames:v", "1000", str(image),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, stderr = await process.communicate()
+    if process.returncode or not image.is_file():
+        raise AdapterError("Could not extract the previous shot's last frame: " + stderr.decode(errors="replace")[-500:])
+    return image
 
 
 class LTXAdapter:

@@ -19,6 +19,9 @@ from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner, STORY_PLAN
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
 
 
+# Low enough that a reference sheet steers identity without its backdrop becoming the opening frame.
+REFERENCE_GUIDE_STRENGTH = 0.35
+
 class FilmRunEngine:
     """Advance one durable stage per call; LTX jobs remain on LocalWorker's queue."""
 
@@ -260,6 +263,8 @@ class FilmRunEngine:
         characters = {item.id: item for item in plan.characters}
         locations = {item.id: item for item in plan.locations}
         seconds_per_shot = frames / fps
+        # One seed for the whole film keeps lighting, palette and texture consistent between shots.
+        film_seed = profile.get("seed") if profile.get("seed") is not None else UUID(run["id"]).int % 2**31
         rows, scene_rows = [], []
         for scene in plan.scenes:
             saved_scene_title = f"{scene.sequence + 1:02d}. {scene.title}"
@@ -268,9 +273,16 @@ class FilmRunEngine:
                                "estimated_seconds": round(seconds_per_shot * len(scene.shots), 2),
                                "transition_after": scene.shots[-1].transition_after})
             location = locations[scene.location_id]
+            previous_shot_id = None
             for shot in scene.shots:
                 reference_id = shot.reference_ids[0] if shot.reference_ids else None
                 ref_path = reference_paths.get(reference_id) if reference_id else None
+                shot_id = str(uuid5(UUID(run["id"]), f"shot:{shot.id}"))
+                # Later shots in a scene start on the previous clip's last frame (added by the worker).
+                # Reference stills only guide the scene's first shot so their studio backdrop is never pinned as frame 0.
+                anchors = ([{"path": ref_path, "frame_index": 0, "strength": REFERENCE_GUIDE_STRENGTH, "binding": "guide"}]
+                           if ref_path and previous_shot_id is None else [])
+                conditioning = "previous-shot" if previous_shot_id else "guide-image" if anchors else "text-only"
                 identity_lines = [f"{characters[cid].name}: {characters[cid].identity}; distinguishing traits: " + ", ".join(characters[cid].distinguishing_traits)
                                   for cid in shot.characters_present]
                 prompt = "\n".join([
@@ -289,16 +301,17 @@ class FilmRunEngine:
                     "prompt": prompt, "model": profile.get("model", "dgrauet/ltx-2.3-mlx-q8"),
                     "width": width, "height": height, "distilled_two_stage": profile.get("distilled_two_stage", True),
                     "low_ram": profile.get("low_ram", True), "audio": False,
-                    "seed": profile.get("seed"), "reference_image": ref_path,
+                    "seed": film_seed, "reference_image": None,
                     "output_location": str(output), "preset": request["preset"],
                 })
                 payload = generation.model_dump() | {"frames": frames, "fps": fps,
                     "shot_prompt": prompt, "shot_settings": {"width": width, "height": height, "fps": fps,
                         "output_location": str(output), "framing": shot.framing,
                         "style_bible_revision": project.get("style_bible_revision", 0)},
-                    "style_context": plan.visual_style, "reference_conditioning": "one-image" if ref_path else "text-only",
+                    "style_context": plan.visual_style, "reference_conditioning": conditioning,
+                    "reference_anchors": anchors, "continue_from_shot_id": previous_shot_id,
                     "reference_id": reference_id, "preflight_warnings": []}
-                shot_id = str(uuid5(UUID(run["id"]), f"shot:{shot.id}"))
+                previous_shot_id = shot_id
                 rows.append({"id": shot_id, "scene_title": saved_scene_title, "title": shot.title,
                     "prompt": prompt, "visual_description": shot.beat, "reference_image": ref_path,
                     "reference_ids": [reference_id] if reference_id else [], "preset": request["preset"],
@@ -313,7 +326,7 @@ class FilmRunEngine:
                     "scene_count": len(plan.scenes), "shot_count": len(rows), "preset": request["preset"],
                     "frames_per_shot": frames, "fps": fps, "width": width, "height": height,
                     "approved_reference_ids": sorted(selected),
-                    "reference_limit_note": "At most one approved image conditions each shot. Unreferenced characters rely on prompt descriptions; local image conditioning does not guarantee identity consistency.",
+                    "reference_limit_note": "Shots after the first in each scene start on the previous shot's last frame. A scene's first shot is guided weakly by at most one approved image; local conditioning does not guarantee identity consistency.",
                     "creative_quality_status": "pending_manual_review", "audio_available": False,
                     "model_capabilities": {"text_to_video": True, "image_to_video": True,
                         "max_reference_images_per_shot": 1, "audio_generation": False,

@@ -1520,6 +1520,12 @@ class Database:
             ids = [row[0] for row in db.execute("SELECT id FROM film_batches WHERE storyboard_id=? ORDER BY created_at DESC,id DESC", (storyboard_id,))]
         return [self.get_film_batch(batch_id) for batch_id in ids]
 
+    def film_batch_shot_output(self, batch_id: str, shot_id: str) -> str | None:
+        with self.connect() as db:
+            row = db.execute("SELECT j.result_path FROM film_batch_shots bs JOIN jobs j ON j.id=bs.job_id "
+                             "WHERE bs.batch_id=? AND bs.shot_id=? AND j.status='completed'", (batch_id, shot_id)).fetchone()
+        return row["result_path"] if row else None
+
     def list_film_batches_for_job(self, job_id: str):
         with self.connect() as db:
             ids = [row[0] for row in db.execute("SELECT DISTINCT batch_id FROM film_batch_shots WHERE job_id=?", (job_id,))]
