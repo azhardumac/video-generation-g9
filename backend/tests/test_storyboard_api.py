@@ -1037,3 +1037,20 @@ def test_project_can_be_created_from_a_name_only():
     assert len(roots) == 2
     assert all(root.parent == (_ROOT / "projects").resolve() and root.is_dir() for root in roots)
     assert first["aspect_ratio"] == "9:16" and first["production_type"] == "Short film"
+
+
+def test_editing_a_chained_shot_prompt_drops_the_planner_continuation_prompt():
+    from uuid import uuid4
+
+    payload = {"prompt": "Planner prompt", "shot_prompt": "Planner prompt", "continuation_prompt": "Planner action",
+               "frames": 49, "fps": 24}
+    project = api.create_project(api.ProjectCreateRequest(
+        name="Continuation edit", workspace_path=str(_ROOT / f"continuation-{uuid4().hex[:8]}"),
+        aspect_ratio="9:16", frame_rate=24, production_type="claymation"))
+    story = api.db.create_storyboard(project["id"], "Continuation edit", [
+        {"scene_title": "River", "title": "Kept", "prompt": "Planner prompt", "preset": "Short", "generation_payload": payload},
+        {"scene_title": "River", "title": "Edited", "prompt": "Planner prompt", "preset": "Short", "generation_payload": payload}])
+    kept, edited = story["shots"]
+    updated = api.update_storyboard(story["id"], api.StoryboardUpdate(revision=story["revision"], title=story["title"], shots=[
+        kept, edited | {"prompt": "The frog dives instead.", "prompt_reviewed": False}]))
+    assert [shot["generation_payload"].get("continuation_prompt") for shot in updated["shots"]] == ["Planner action", None]

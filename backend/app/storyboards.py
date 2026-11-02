@@ -84,6 +84,7 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
             "frames": frames, "fps": fps, "caption": shot.get("caption", ""),
             "prompt": shot["prompt"], "job_id": job.get("id"),
             "transition_after": shot.get("transition_after", "dissolve"),
+            "continues_previous": bool((job.get("verification_metadata") or {}).get("continued_from_previous_shot")),
             "settings_snapshot": job.get("settings_snapshot") or {
                 "prompt": job.get("payload", {}).get("prompt", ""),
                 "reference_image": job.get("payload", {}).get("reference_image") or None,
@@ -100,6 +101,10 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
     previous_frames = 0
     for index, clip in enumerate(clips):
         previous_transition = clips[index - 1].get("transition_after", "dissolve") if index else "cut"
+        # A chained shot's first frame duplicates the previous clip's last frame; drop it on hard cuts.
+        continues_previous = clip.pop("continues_previous")
+        clip["trim_start_frames"] = 1 if index and continues_previous and previous_transition in ("cut", "none") else 0
+        clip["frames"] -= clip["trim_start_frames"]
         overlap = min(transition_frames, previous_frames // 4, clip["frames"] // 4) if index and previous_transition not in ("cut", "none") else 0
         clip["transition_in_frames"] = overlap
         clip["start_frame"] = cursor - overlap

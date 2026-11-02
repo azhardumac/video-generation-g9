@@ -5,7 +5,7 @@ import logging
 import time
 from pathlib import Path
 
-from .adapters import LTXAdapter, RemotionAdapter
+from .adapters import AdapterError, LTXAdapter, RemotionAdapter, extract_last_frame
 from .config import Settings
 from .db import Database
 from .storyboards import build_composition_manifest
@@ -110,12 +110,15 @@ class LocalWorker:
             if job["kind"] == "render":
                 result = await self.remotion.render(job["payload"], progress)
             else:
-                generation = self.adapter.generate(job["payload"], progress)
+                payload = await self._with_previous_shot(job)
+                generation = self.adapter.generate(payload, progress)
                 result = (await asyncio.wait_for(generation, timeout=run_budget["remaining_seconds"])
                           if run_budget else await generation)
             result_path = result["output_path"] if isinstance(result, dict) else result
             metadata = result.get("metadata") if isinstance(result, dict) else None
             exit_code = result.get("exit_code", 0) if isinstance(result, dict) else 0
+            if job["kind"] != "render" and payload.get("continued_from_previous_shot"):
+                metadata = (metadata or {}) | {"continued_from_previous_shot": True}
             completed = self.db.complete_job(
                 job_id, progress=100, result_path=result_path, exit_code=exit_code,
                 elapsed_seconds=round(time.monotonic() - started, 2), verification_metadata=metadata,
@@ -177,6 +180,26 @@ class LocalWorker:
             if run_budget and isinstance(exc, asyncio.TimeoutError):
                 self.db.stop_film_run_queue_for_budget(run_budget["run_id"],
                     "The approved aggregate generation-time budget expired during a shot; remaining queued shots were stopped.")
+
+    async def _with_previous_shot(self, job: dict) -> dict:
+        """Start a chained film shot on the exact last frame of the previous shot in its scene."""
+        payload = job["payload"]
+        previous = payload.get("continue_from_shot_id")
+        if not previous or not payload.get("film_batch_id"):
+            return payload
+        clip = self.db.film_batch_shot_output(payload["film_batch_id"], previous)
+        if not clip or not Path(clip).is_file():
+            self.db.event(job["id"], "warning", "The previous shot has no verified clip; this shot starts without frame continuity.")
+            return payload
+        frame = safe_local_path(str(Path(payload["output_location"]).expanduser() / f"{job['id']}.continue.png"), self.settings)
+        try:
+            await extract_last_frame(clip, frame, self.settings)
+        except AdapterError as exc:
+            self.db.event(job["id"], "warning", f"{exc}; this shot starts without frame continuity.")
+            return payload
+        self.db.event(job["id"], "info", "Continuing from the last frame of the previous shot: " + clip)
+        return payload | {"continued_from_previous_shot": True, "prompt": payload.get("continuation_prompt", payload["prompt"]),
+                          "reference_anchors": [{"path": str(frame), "frame_index": 0, "strength": 1.0, "binding": "replace"}]}
 
     def _partial_path(self, job: dict) -> Path | None:
         payload = job["payload"]
