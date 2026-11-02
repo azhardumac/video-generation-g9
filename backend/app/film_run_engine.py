@@ -278,10 +278,10 @@ class FilmRunEngine:
                 reference_id = shot.reference_ids[0] if shot.reference_ids else None
                 ref_path = reference_paths.get(reference_id) if reference_id else None
                 shot_id = str(uuid5(UUID(run["id"]), f"shot:{shot.id}"))
-                # Later shots in a scene start on the previous clip's last frame (added by the worker).
-                # Reference stills only guide the scene's first shot so their studio backdrop is never pinned as frame 0.
+                # Later shots in a scene start on the previous clip's last frame (swapped in by the worker).
+                # Reference stills only guide weakly so their studio backdrop is never pinned as frame 0.
                 anchors = ([{"path": ref_path, "frame_index": 0, "strength": REFERENCE_GUIDE_STRENGTH, "binding": "guide"}]
-                           if ref_path and previous_shot_id is None else [])
+                           if ref_path else [])
                 conditioning = "previous-shot" if previous_shot_id else "guide-image" if anchors else "text-only"
                 identity_lines = [f"{characters[cid].name}: {characters[cid].identity}; distinguishing traits: " + ", ".join(characters[cid].distinguishing_traits)
                                   for cid in shot.characters_present]
@@ -301,7 +301,7 @@ class FilmRunEngine:
                     "prompt": prompt, "model": profile.get("model", "dgrauet/ltx-2.3-mlx-q8"),
                     "width": width, "height": height, "distilled_two_stage": profile.get("distilled_two_stage", True),
                     "low_ram": profile.get("low_ram", True), "audio": False,
-                    "seed": film_seed, "reference_image": None,
+                    "seed": film_seed, "reference_image": ref_path,
                     "output_location": str(output), "preset": request["preset"],
                 })
                 payload = generation.model_dump() | {"frames": frames, "fps": fps,

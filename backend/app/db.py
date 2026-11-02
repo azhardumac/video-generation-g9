@@ -1758,7 +1758,7 @@ class Database:
                     raise RuntimeError(f"Shot '{selected[shot_id]['title']}' is not failed or cancelled; completed shots are never duplicated")
                 shot = selected[shot_id]
                 payload = shot.get("generation_payload") or {}
-                if not payload.get("prompt") or not payload.get("reference_image"):
+                if not payload.get("prompt") or not payload.get("frames"):
                     raise RuntimeError(f"Shot '{shot['title']}' is missing its saved generation payload")
                 active = db.execute("SELECT 1 FROM shot_jobs sj JOIN jobs j ON j.id=sj.job_id WHERE sj.shot_id=? AND j.status IN ('queued','running') LIMIT 1", (shot_id,)).fetchone()
                 if active:
