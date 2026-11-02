@@ -220,7 +220,7 @@ export default function App() {
   </div>
 }
 function Stat({ icon, label, value, delta, accent=false }: { icon: React.ReactNode; label: string; value: string; delta: string; accent?: boolean }) {
-  return <div className="stat-card"><div className={`stat-icon ${accent?'accent':''}`}>{icon}</div><div className="stat-label">{label}</div><div className="stat-value">{value}</div><div className="stat-delta">{delta}</div></div>
+  return <div className="stat-card"><div className={`stat-icon ${accent?'accent':''}`}>{icon}</div><div className="stat-label">{label}</div><div className={`stat-value ${String(value).length>14?'long':''}`} title={String(value)}>{value}</div><div className="stat-delta">{delta}</div></div>
 }
 
 function formatBytes(value?: number | null) {
