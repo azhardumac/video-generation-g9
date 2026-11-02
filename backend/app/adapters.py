@@ -68,6 +68,10 @@ def _group_exists(pgid: int) -> bool:
         return True
 
 
+# Progress bars redraw with carriage returns, so one "line" can be very long.
+SUBPROCESS_LINE_LIMIT = 16 * 1024 * 1024
+
+
 async def terminate_process_group(process: asyncio.subprocess.Process, grace_seconds: float = 5.0) -> None:
     """Stop only the process group created for this adapter invocation."""
     if os.name != "posix":
@@ -137,6 +141,7 @@ class LTXAdapter:
         process = await asyncio.create_subprocess_exec(
             *args, cwd=str(working_dir), env=env, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT, start_new_session=(os.name == "posix"),
+            limit=SUBPROCESS_LINE_LIMIT,
         )
         output_text = []
         try:
@@ -152,6 +157,10 @@ class LTXAdapter:
             await terminate_process_group(process)
             if partial.exists():
                 await on_progress(0, f"Partial output retained: {partial}")
+            raise
+        except BaseException:
+            if process.returncode is None:
+                await terminate_process_group(process)
             raise
         if code:
             raise AdapterError(
@@ -213,6 +222,7 @@ class RemotionAdapter:
             process = await asyncio.create_subprocess_exec(
                 *args, cwd=str(working_dir), stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT, start_new_session=(os.name == "posix"), env=env,
+                limit=SUBPROCESS_LINE_LIMIT,
             )
         except OSError as exc:
             raise AdapterError(f"Could not start Remotion render on port {render_port}: {exc}") from exc
@@ -228,6 +238,10 @@ class RemotionAdapter:
             code = await process.wait()
         except asyncio.CancelledError:
             await terminate_process_group(process)
+            raise
+        except BaseException:
+            if process.returncode is None:
+                await terminate_process_group(process)
             raise
         if code:
             details = "\n".join(output_text)[-8000:]

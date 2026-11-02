@@ -4,6 +4,7 @@ import GeminiConnectionPanel, { type StoryPlannerConfig } from './GeminiConnecti
 import FilmRunExportPanel from './FilmRunExportPanel'
 import FilmRunReviewPage from './FilmRunReviewPage'
 import type { FilmRunReviewTarget } from './filmRunReviewNavigation'
+import { apiErrorMessage } from './apiError'
 
 type Project = { id: string; name: string }
 type Preset = { name: string; frames: number; fps: number; status: string; visual_drift_warning?: boolean }
@@ -35,16 +36,17 @@ const activeStatuses = new Set(['awaiting_authorization','waiting_for_planner','
 
 async function requestJson<T>(url:string,init?:RequestInit):Promise<T>{
   const response=await fetch(url,init);const data=await response.json()
-  if(!response.ok)throw new Error(data.detail??'The local API could not complete this action')
+  if(!response.ok)throw new Error(apiErrorMessage(data.detail,'The local API could not complete this action'))
   return data as T
 }
 function formatBytes(bytes:number){const units=['B','KB','MB','GB','TB'];let value=bytes,index=0;while(value>=1024&&index<units.length-1){value/=1024;index++}return `${value.toFixed(index>1?1:0)} ${units[index]}`}
 
-export default function CreateFilmPage({project,presets,onMessage,onNavigate,onReview,reviewTarget,onCloseReview}:{project:Project|null;presets:Preset[];onMessage:(message:string)=>void;onNavigate:(page:string)=>void;onReview:(runId:string,shotId:string)=>void;reviewTarget:FilmRunReviewTarget|null;onCloseReview:()=>void}){
+export default function CreateFilmPage({project,presets,onMessage,onNavigate,onReview,reviewTarget,onCloseReview,simple=false,onCreateProject}:{simple?:boolean;onCreateProject?:(name:string)=>Promise<void>;project:Project|null;presets:Preset[];onMessage:(message:string)=>void;onNavigate:(page:string)=>void;onReview:(runId:string,shotId:string)=>void;reviewTarget:FilmRunReviewTarget|null;onCloseReview:()=>void}){
   const [prompt,setPrompt]=useState('');const [references,setReferences]=useState<Reference[]>([]);const [selectedRefs,setSelectedRefs]=useState<string[]>([])
   const [preset,setPreset]=useState('Short');const [maxShots,setMaxShots]=useState(1);const [maxRetries,setMaxRetries]=useState(1);const [maxRuntime,setMaxRuntime]=useState(3600);const [maxBytes,setMaxBytes]=useState(8*1024**3)
   const [runs,setRuns]=useState<FilmRun[]>([]);const [capabilities,setCapabilities]=useState<Capabilities|null>(null);const [busy,setBusy]=useState(false);const [error,setError]=useState('')
   const [showArchived,setShowArchived]=useState(false)
+  const [newProjectName,setNewProjectName]=useState('')
   const [plannerProvider,setPlannerProvider]=useState<'gemini'|'local'>('gemini');const [geminiConfig,setGeminiConfig]=useState<StoryPlannerConfig|null>(null);const [remoteConsent,setRemoteConsent]=useState(false);const [responseMode,setResponseMode]=useState<'schema'|'json_only'>('schema')
   const pendingRequest=useRef<{signature:string;key:string}|null>(null)
   const projectId=project?.id
@@ -163,7 +165,7 @@ Technical checks do not approve creative quality; the run will stop for creative
     <section className="panel create-film-hero">
       <div className="section-kicker">FRAMEWORK · PROMPT TO FILM</div><h2>Create a film from one prompt</h2>
       <p>Describe the story and authorize its limits once. FRAMEWORK will plan, validate, queue eligible shots, and report progress. Generated clips remain pending creative review.</p>
-      {!project?<div className="model-caution"><AlertTriangle size={14}/> Select or create a project before starting a film request. <button className="text-button" onClick={()=>onNavigate('Projects')}>Open Projects</button></div>:<>
+      {!project?<form className="create-film-quick-project" onSubmit={event=>{event.preventDefault();if(!onCreateProject||!newProjectName.trim())return;setBusy(true);setError('');void onCreateProject(newProjectName.trim()).then(()=>setNewProjectName('')).catch(e=>setError(e instanceof Error?e.message:String(e))).finally(()=>setBusy(false))}}><label className="setting-field"><span>NAME YOUR FIRST PROJECT</span><input value={newProjectName} maxLength={120} onChange={event=>setNewProjectName(event.target.value)} placeholder="e.g. My first film"/></label><button className="button primary" type="submit" disabled={busy||!newProjectName.trim()||!onCreateProject}><WandSparkles size={15}/> Create project</button><button className="text-button" type="button" onClick={()=>onNavigate('Projects')}>Pick an existing project</button></form>:<>
         <div className="create-film-project"><Film size={15}/><span>Project</span><b>{project.name}</b></div>
         <label className="setting-field create-film-prompt"><span>STORY PROMPT</span><textarea maxLength={20000} value={prompt} onChange={event=>setPrompt(event.target.value)} placeholder="What story should the film tell? Describe the characters, what changes, and how it ends."/><small>{prompt.length.toLocaleString()} / 20,000</small></label>
         <div className="create-film-planner-choice"><div><div className="section-kicker">STORY PLANNING PROVIDER</div><p>Gemini API is recommended for general stories. Your selected planner only creates the structured plan; all video work remains local.</p></div><label><input type="radio" name="story-planner-provider" checked={plannerProvider==='gemini'} onChange={()=>{setPlannerProvider('gemini');setRemoteConsent(false)}}/> Gemini API <small>Recommended · cloud</small></label><label><input type="radio" name="story-planner-provider" checked={plannerProvider==='local'} onChange={()=>{setPlannerProvider('local');setRemoteConsent(false)}}/> Local planner <small>Optional · offline</small></label></div>
@@ -180,9 +182,9 @@ Technical checks do not approve creative quality; the run will stop for creative
           </div>
           <div className="create-film-estimate"><b>Approval preview</b><span>Up to {(maxShots*((selectedPreset?.frames??49)/(selectedPreset?.fps??24))).toFixed(1)}s of requested footage · {Math.ceil(maxRuntime/60)} minute time cap · {formatBytes(maxBytes)} output cap.</span><small>Plan Only does not authorize LTX generation; disk and benchmark checks are repeated before separate generation authorization. Create Film uses this budget after its confirmation.</small></div>
         </details>
-        {plannerProvider==='gemini'&&<label className="setting-field create-film-response-mode"><span>GEMINI RESPONSE FORMAT</span><select value={responseMode} onChange={event=>setResponseMode(event.target.value as 'schema'|'json_only')}><option value="schema">Structured JSON Schema</option><option value="json_only">JSON-only fallback · strict local validation</option></select><small>JSON-only omits provider-side schema enforcement if this model rejects it. FRAMEWORK still validates the full StoryPlan before saving or generation.</small></label>}
+        {plannerProvider==='gemini'&&!simple&&<label className="setting-field create-film-response-mode"><span>GEMINI RESPONSE FORMAT</span><select value={responseMode} onChange={event=>setResponseMode(event.target.value as 'schema'|'json_only')}><option value="schema">Structured JSON Schema</option><option value="json_only">JSON-only fallback · strict local validation</option></select><small>JSON-only omits provider-side schema enforcement if this model rejects it. FRAMEWORK still validates the full StoryPlan before saving or generation.</small></label>}
         {plannerProvider==='local'&&<div className="create-film-limitation"><ShieldCheck size={15}/><div><b>Optional local planner · {capabilities?.story_planners?.local.status.replaceAll('_',' ')??'checking'}</b><span>{capabilities?.story_planners?.local.detail??'Checking local planner availability.'} Every result is schema and project-scope validated.</span></div></div>}
-        <div className="create-film-actions"><button className="button primary" disabled={busy||!prompt.trim()||(plannerProvider==='gemini'&&!remoteConsent)} onClick={()=>void createFilm(false)}>{busy?<LoaderCircle className="spin" size={15}/>:<WandSparkles size={15}/>} Create Film</button><button className="button secondary" disabled={busy||!prompt.trim()||(plannerProvider==='gemini'&&!remoteConsent)} onClick={()=>void createFilm(true)}>{busy?<LoaderCircle className="spin" size={15}/>:<ShieldCheck size={15}/>} Plan Only / Test Planner</button><span>Plan Only saves a validated plan and stops before LTX generation. Create Film includes your confirmed local generation budget. Gemini calls require the explicit opt-in above; creative review remains separate.</span></div>
+        <div className="create-film-actions"><button className="button primary" disabled={busy||!prompt.trim()||(plannerProvider==='gemini'&&!remoteConsent)} onClick={()=>void createFilm(false)}>{busy?<LoaderCircle className="spin" size={15}/>:<WandSparkles size={15}/>} Create Film</button>{!simple&&<button className="button secondary" disabled={busy||!prompt.trim()||(plannerProvider==='gemini'&&!remoteConsent)} onClick={()=>void createFilm(true)}>{busy?<LoaderCircle className="spin" size={15}/>:<ShieldCheck size={15}/>} Plan Only / Test Planner</button>}<span>{simple?'You will see the time and storage limits and confirm them before anything is generated. Every clip waits for your review before export.':<>Plan Only saves a validated plan and stops before LTX generation. Create Film includes your confirmed local generation budget. Gemini calls require the explicit opt-in above; creative review remains separate.</>}</span></div>
       </>}
       {error&&<div className="model-caution"><AlertTriangle size={13}/>{error}</div>}
     </section>

@@ -79,11 +79,11 @@ ReferenceCategory = Literal["character", "scene", "style", "other"]
 
 class ProjectCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
-    workspace_path: str = Field(min_length=1, max_length=2000)
+    workspace_path: str = Field(default="", max_length=2000)
     description: str = Field(default="", max_length=2000)
-    aspect_ratio: AspectRatio
-    frame_rate: int = Field(ge=1, le=120)
-    production_type: str = Field(min_length=1, max_length=120)
+    aspect_ratio: AspectRatio = "9:16"
+    frame_rate: int = Field(default=24, ge=1, le=120)
+    production_type: str = Field(default="Short film", min_length=1, max_length=120)
 
 
 class ProjectImportRequest(BaseModel):
@@ -333,6 +333,17 @@ def _project(project_id: str, *, allow_archived: bool = False) -> dict:
 def _project_id_for_name(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")[:40] or "project"
     return f"{slug}-{uuid4().hex}"
+
+
+def _default_project_root(name: str) -> Path:
+    """Pick an unused directory under the first allowed root for one-click project creation."""
+    parent = settings.allowed_roots[0] / "projects"
+    parent.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")[:40] or "project"
+    candidate, suffix = parent / slug, 2
+    while candidate.exists():
+        candidate, suffix = parent / f"{slug}-{suffix}", suffix + 1
+    return candidate
 
 
 def _project_output(project: dict) -> Path:
@@ -702,7 +713,7 @@ def set_active_project(request: ActiveProjectRequest):
 @app.post("/api/projects", status_code=201)
 def create_project(request: ProjectCreateRequest):
     try:
-        root = safe_local_path(request.workspace_path, settings)
+        root = safe_local_path(request.workspace_path.strip() or str(_default_project_root(request.name)), settings)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not request.name.strip() or not request.production_type.strip():
@@ -867,6 +878,8 @@ async def upload_project_reference(project_id: str, request: Request,
     sent_mime = request.headers.get("content-type", "").split(";")[0].strip()
     if sent_mime not in (mime, "application/octet-stream"):
         raise HTTPException(400, "Upload MIME type does not match image content")
+    if replace_id and not db.get_project_reference(project_id, replace_id):
+        raise HTTPException(404, "Project reference not found")
     storage = _reference_storage_root(project, category)
     storage.mkdir(parents=True, exist_ok=True)
     stored_path = storage / f"{uuid4().hex}{Path(file_name).suffix.lower()}"
@@ -880,15 +893,11 @@ async def upload_project_reference(project_id: str, request: Request,
               "size_bytes": total, "content_hash": digest}
     try:
         if replace_id:
-            if not db.get_project_reference(project_id, replace_id):
-                raise HTTPException(404, "Project reference not found")
             return db.update_project_reference(project_id, replace_id, **{k:v for k,v in record.items() if k not in ("id", "project_id")})
         return db.add_project_reference(record)
     except sqlite3.IntegrityError as exc:
+        stored_path.unlink(missing_ok=True)
         raise HTTPException(409, "This image content is already linked to the project") from exc
-    finally:
-        # The upload is project-owned; keep it even when the old link is replaced or removed.
-        pass
 
 
 @app.patch("/api/projects/{project_id}/references/{reference_id}")

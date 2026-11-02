@@ -1028,3 +1028,12 @@ def test_generation_settings_compare_serialized_defaults_and_style_payload_safel
         {"reference_image":None,"style_context":"  felt puppet  ","output_location":"/tmp/outputs/./fox"},
         {"reference_image":"","style_context":"felt puppet","output_location":"/tmp/outputs/fox"},
     ) == []
+
+
+def test_project_can_be_created_from_a_name_only():
+    first = api.create_project(api.ProjectCreateRequest(name="Quick Start Film"))
+    second = api.create_project(api.ProjectCreateRequest(name="Quick Start Film"))
+    roots = {Path(first["root"]), Path(second["root"])}
+    assert len(roots) == 2
+    assert all(root.parent == (_ROOT / "projects").resolve() and root.is_dir() for root in roots)
+    assert first["aspect_ratio"] == "9:16" and first["production_type"] == "Short film"

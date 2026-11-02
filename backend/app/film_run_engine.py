@@ -42,8 +42,12 @@ class FilmRunEngine:
             batch = self._batch_for(run)
             if batch and batch["status"] == "running":
                 return None
-        claimed = self.db.update_film_run(run["id"], run["revision"], status="running",
-                                          message=f"Started prompt-first stage: {run['stage']}.")
+        try:
+            claimed = self.db.update_film_run(run["id"], run["revision"], status="running",
+                                              message=f"Started prompt-first stage: {run['stage']}.")
+        except RuntimeError:
+            # The run was paused, cancelled or edited after it was selected.
+            return None
         try:
             if run["stage"] == "understand_story":
                 return self._understand(claimed)

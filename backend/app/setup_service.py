@@ -40,6 +40,10 @@ def _row(component_id: str, title: str, status: str, detail: str, path: str | No
     return {"id": component_id, "title": title, "status": status, "detail": detail, "path": path}
 
 
+def _first_line(output: str) -> str:
+    return next(iter(output.splitlines()), "Version unavailable")
+
+
 def inspect_setup(settings: Settings, app_root: Path | None = None) -> dict[str, Any]:
     """Inspect executable versions and paths without network calls or file writes."""
     root = (app_root or Path(__file__).resolve().parents[2]).resolve()
@@ -47,10 +51,10 @@ def inspect_setup(settings: Settings, app_root: Path | None = None) -> dict[str,
 
     brew = shutil.which("brew")
     components.append(_row("homebrew", "Homebrew", "installed" if brew else "missing",
-                           _run([brew, "--version"]).splitlines()[0] if brew else "Install Homebrew to manage the local prerequisites.", brew))
+                           _first_line(_run([brew, "--version"])) if brew else "Install Homebrew to manage the local prerequisites.", brew))
     for name, label in (("git", "Git"), ("gh", "GitHub CLI"), ("ffmpeg", "FFmpeg"), ("ffprobe", "ffprobe"), ("uv", "uv")):
         executable = shutil.which(name)
-        version = _run([executable, "--version"]).splitlines()[0] if executable else ""
+        version = _first_line(_run([executable, "--version"])) if executable else ""
         components.append(_row(name, label, "installed" if executable else "missing",
                                version if executable else f"{label} is not on PATH.", executable))
 
