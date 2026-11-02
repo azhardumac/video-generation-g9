@@ -2373,6 +2373,9 @@ def update_storyboard(storyboard_id: str, payload: StoryboardUpdate):
             shot_value["reference_ids"] = [item["id"] for item in linked_references if Path(item["path"]).resolve() == reference.resolve()]
         generation_payload = shot_value.get("generation_payload") or {}
         if generation_payload:
+            if generation_payload.get("prompt") != shot_value["prompt"]:
+                # The planner's short chained prompt no longer matches an edited shot.
+                generation_payload.pop("continuation_prompt", None)
             generation_payload = generation_payload | {"prompt": shot_value["prompt"], "shot_prompt": shot_value["prompt"],
                                                         "reference_image": str(reference) if reference else None,
                                                         "reference_id": (shot_value.get("reference_ids") or [None])[0],
