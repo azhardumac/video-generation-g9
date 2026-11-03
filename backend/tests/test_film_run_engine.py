@@ -315,3 +315,14 @@ def test_time_estimate_only_uses_benchmarks_of_the_same_quality(tmp_path):
     assert db.benchmarks()[0]["quality"] == "draft"
     payload = db.list_jobs(project_id=project["id"])[0]["payload"]
     assert (payload["width"], payload["height"], payload["distilled_two_stage"]) == (576, 1024, True)
+
+
+def test_direct_jobs_are_benchmarked_as_draft_even_with_a_saved_quality(tmp_path, monkeypatch):
+    from app import main
+    from app.presets import GenerationSettings
+
+    monkeypatch.setattr(main, "resource_snapshot", lambda path: {})
+    monkeypatch.setattr(main.resource_preflight, "assess", lambda metrics: [])
+    config = GenerationSettings(prompt="A boat", quality="best", output_location=str(main.settings.expanded(main.settings.output_root)))
+    payload = main._generation_payload(config)
+    assert payload["quality"] == "draft" and payload["distilled_two_stage"] is True

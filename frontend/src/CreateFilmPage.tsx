@@ -23,7 +23,7 @@ type FilmRun = {
   completed_stages: string[]; error: string | null; events: { revision: number; level: string; message: string; time: string }[]
   generation_jobs_created?: number; planner_status?: string; message?: string
   storyboard_id?: string; creative_review_status?: string|null
-  request?: {quality?:Quality;planner_provider?:'gemini'|'local';planner_model?:string|null;planner_response_mode?:'schema'|'json_only';plan_only?:boolean;remote_processing_consent?:{confirmed?:boolean}}
+  request?: {generation_profile?:{quality?:Quality};planner_provider?:'gemini'|'local';planner_model?:string|null;planner_response_mode?:'schema'|'json_only';plan_only?:boolean;remote_processing_consent?:{confirmed?:boolean}}
   checkpoint?:{understand_story?:{title:string;logline:string;visual_style:string;scenes:{title:string;story_beat:string;shots:{title:string;prompt:string;framing:string}[]}[]}}
   planner_request?: {status:string;provider:string;model:string;revision:number;schema_version:string;response_mode?:string;attempts:number;remaining_attempts:number;error_code:string|null;error_details?:{http_status?:number;provider_status?:string;reason?:string;field_paths?:string[];category?:string;response_mode?:string;validation_attempts?:{attempt:number;issues:{path:string;type:string}[]}[]}|null}|null
   planner_attempts?: {revision:number;provider:string;model:string;schema_version:string;response_mode?:string;status:string;attempts:number;remaining_attempts:number;error_code:string|null;error_details?:Record<string,unknown>|null;consent:Record<string,unknown>|null}[]
@@ -78,7 +78,7 @@ export default function CreateFilmPage({project,presets,onMessage,onNavigate,onR
     const requestProvider=freshFrom?.request?.planner_provider??plannerProvider
     const requestPlanOnly=freshFrom?!!freshFrom.request?.plan_only:planOnly
     const requestPreset=freshFrom?.preset??preset
-    const requestQuality=freshFrom?.request?.quality??quality
+    const requestQuality=freshFrom?(freshFrom.request?.generation_profile?.quality??'draft'):quality
     const budget=freshFrom?.budget??{max_shots:maxShots,max_retries_per_shot:maxRetries,max_generation_seconds:maxRuntime,max_output_bytes:maxBytes}
     const requestModel=requestProvider==='gemini'?(geminiConfig?.gemini.model??freshFrom?.request?.planner_model??null):null
     const requestResponseMode=requestProvider==='gemini'?(freshFrom?.request?.planner_response_mode??responseMode):'schema'

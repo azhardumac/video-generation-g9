@@ -24,7 +24,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration(target_version=12)
+        self._backup_before_migration(target_version=13)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -332,6 +332,7 @@ class Database:
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(10,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(11,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(12,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(13,?)", (now_iso(),))
             for run in db.execute("SELECT id,revision,stage FROM film_runs WHERE status='running'"):
                 message = "Application restarted during orchestration; the run was paused at its last durable checkpoint."
                 db.execute("UPDATE film_runs SET status='paused',error=?,revision=revision+1,updated_at=? WHERE id=? AND status='running'",

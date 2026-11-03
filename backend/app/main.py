@@ -319,7 +319,8 @@ def _generation_payload(config: GenerationSettings, project_id: str | None = Non
     root = settings.expanded(settings.output_root)
     metrics = resource_snapshot(str(root if root.exists() else settings.allowed_roots[0]))
     warnings = resource_preflight.assess(metrics)
-    return config.model_dump() | {"frames": frames, "fps": fps, "output_location": str(output),
+    # Quality levels are applied only by film runs; a direct job keeps its configured sampler and size.
+    return config.model_dump() | {"quality": "draft", "frames": frames, "fps": fps, "output_location": str(output),
                                   "reference_image": str(reference) if reference else None,
                                   "preflight_warnings": warnings}
 
