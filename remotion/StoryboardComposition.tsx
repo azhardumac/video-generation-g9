@@ -22,6 +22,7 @@ type Shot = {
   has_audio?: boolean;
   audio_fade_in_frames?: number;
   audio_fade_out_frames?: number;
+  audio_gain_db?: number;
   caption: string;
 };
 type Manifest = {
@@ -56,10 +57,13 @@ const ramp = (f: number, length: number, fadeIn: number, fadeOut: number) => Mat
   fadeOut && f >= length - fadeOut ? (length - f) / (fadeOut + 1) : 1,
 );
 
-const ShotAudio: React.FC<{shot: Shot}> = ({shot}) => <Sequence from={shot.start_frame} durationInFrames={shot.frames}>
-  <Audio src={staticFile(shot.src)} startFrom={shot.trim_start_frames ?? 0}
-    volume={f => ramp(f, shot.frames, shot.audio_fade_in_frames ?? 0, shot.audio_fade_out_frames ?? 0)}/>
-</Sequence>;
+const ShotAudio: React.FC<{shot: Shot}> = ({shot}) => {
+  const gain = 10 ** ((shot.audio_gain_db ?? 0) / 20);
+  return <Sequence from={shot.start_frame} durationInFrames={shot.frames}>
+    <Audio src={staticFile(shot.src)} startFrom={shot.trim_start_frames ?? 0}
+      volume={f => gain * ramp(f, shot.frames, shot.audio_fade_in_frames ?? 0, shot.audio_fade_out_frames ?? 0)}/>
+  </Sequence>;
+};
 
 const StoryboardTimeline: React.FC<{manifest: Manifest}> = ({manifest}) => <AbsoluteFill style={{backgroundColor: '#05070b'}}>
   {manifest.shots.map((shot, index) => <Sequence key={shot.shot_id} from={shot.start_frame} durationInFrames={shot.frames}>

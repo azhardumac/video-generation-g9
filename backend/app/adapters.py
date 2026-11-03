@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import shutil
 import socket
 import signal
@@ -108,11 +109,28 @@ async def terminate_process_group(process: asyncio.subprocess.Process, grace_sec
     await process.wait()
 
 
-async def extract_last_frame(video: str, image: Path, settings: Settings) -> Path:
-    """Write the final frame of a verified clip as a still for the next shot's first-frame anchor."""
+def _ffmpeg_executable(settings: Settings) -> str | None:
     ffprobe = shutil.which(settings.ffprobe_executable)
     sibling = Path(ffprobe).with_name("ffmpeg") if ffprobe else None
-    ffmpeg = str(sibling) if sibling and sibling.is_file() else shutil.which("ffmpeg")
+    return str(sibling) if sibling and sibling.is_file() else shutil.which("ffmpeg")
+
+
+async def measure_audio_mean_db(video: str, settings: Settings) -> float | None:
+    """Mean audio level in dBFS, used to even out background sound between stitched shots."""
+    ffmpeg = _ffmpeg_executable(settings)
+    if not ffmpeg:
+        return None
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-hide_banner", "-nostats", "-i", video, "-vn", "-af", "volumedetect", "-f", "null", "-",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, stderr = await process.communicate()
+    match = re.search(r"mean_volume:\s*(-?[0-9.]+) dB", stderr.decode(errors="replace"))
+    return float(match.group(1)) if process.returncode == 0 and match else None
+
+
+async def extract_last_frame(video: str, image: Path, settings: Settings) -> Path:
+    """Write the final frame of a verified clip as a still for the next shot's first-frame anchor."""
+    ffmpeg = _ffmpeg_executable(settings)
     if not ffmpeg:
         raise AdapterError("ffmpeg executable was not found")
     process = await asyncio.create_subprocess_exec(
@@ -195,6 +213,8 @@ class LTXAdapter:
             if partial.exists():
                 exc.partial_output = str(partial)
             raise
+        if payload.get("audio"):
+            metadata["audio_mean_db"] = await measure_audio_mean_db(str(partial), self.settings)
         os.replace(partial, output)
         await on_progress(95, "Verified expected dimensions, frame rate, and frame count")
         return {"output_path": str(output), "metadata": metadata, "exit_code": 0}
