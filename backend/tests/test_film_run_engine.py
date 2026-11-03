@@ -404,3 +404,24 @@ def test_plan_only_authorization_checks_the_time_cap_with_the_runs_quality_and_s
         "available_output_bytes": 10**12, "estimated_output_within_cap": True, "generation_time_within_cap": True})
     main.authorize_film_run("run", main.FilmRunAuthorizationRequest(confirmed=True, budget_acknowledged=True, expected_revision=1))
     assert (seen[0].quality, seen[0].sound) == ("best", False)
+
+
+def test_film_run_chains_only_shots_that_keep_the_framing_and_names_each_shots_cast(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    plan = plan_data(second_shot=True)
+    first, second = plan["scenes"][0]["shots"]
+    second["framing"] = "Wide shot from the same hill"
+    close = second | {"id": "keeper-close-up", "sequence": 2, "title": "Mira waves",
+                      "framing": "Close-up", "characters_present": ["keeper"], "expected_character_count": 1}
+    plan["scenes"][0]["shots"].append(close)
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    create_run(db, project)
+    _queue_single_shot(engine)
+    payloads = sorted((job["payload"] for job in db.list_jobs(project_id=project["id"])), key=lambda p: p["shot_order"])
+    assert [p["continue_from_shot_id"] is not None for p in payloads] == [False, True, False]
+    assert [p["reference_conditioning"] for p in payloads] == ["text-only", "previous-shot", "text-only"]
+    assert payloads[1]["continue_from_shot_id"] == payloads[0]["shot_id"]
+    cast = "On screen: only one Mira; no other characters, duplicates or animals."
+    assert cast in payloads[2]["continuation_prompt"] and cast in payloads[2]["prompt"]
+    assert "one Noah" not in payloads[2]["prompt"]
+    assert "Scene character layout" not in payloads[0]["prompt"]

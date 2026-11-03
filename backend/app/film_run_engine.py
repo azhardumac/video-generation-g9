@@ -22,6 +22,18 @@ from .gemini_secrets import GeminiSecretStore, SecretStoreError
 # Low enough that a reference sheet steers identity without its backdrop becoming the opening frame.
 REFERENCE_GUIDE_STRENGTH = 0.35
 
+
+_FRAMING_CLASSES = (("extreme close", "extreme close-up"), ("medium close", "medium close-up"), ("close", "close-up"),
+                    ("medium wide", "medium wide"), ("medium-wide", "medium wide"), ("medium long", "medium wide"),
+                    ("medium", "medium"), ("extreme wide", "wide"), ("establishing", "wide"),
+                    ("wide", "wide"), ("long shot", "wide"))
+
+
+def _framing_class(framing: str) -> str:
+    text = framing.lower()
+    return next((label for key, label in _FRAMING_CLASSES if key in text), text.strip())
+
+
 class FilmRunEngine:
     """Advance one durable stage per call; LTX jobs remain on LocalWorker's queue."""
 
@@ -291,8 +303,12 @@ class FilmRunEngine:
                                "estimated_seconds": round(seconds_per_shot * len(scene.shots), 2),
                                "transition_after": scene.shots[-1].transition_after})
             location = locations[scene.location_id]
-            previous_shot_id = None
+            previous_shot_id = previous_framing = None
             for shot in scene.shots:
+                # A clip that starts on the previous clip's last frame keeps its composition, so only
+                # chain shots that keep the framing; a change of framing is a real cut.
+                framing_class = _framing_class(shot.framing)
+                continue_from = previous_shot_id if framing_class == previous_framing else None
                 reference_id = shot.reference_ids[0] if shot.reference_ids else None
                 ref_path = reference_paths.get(reference_id) if reference_id else None
                 shot_id = str(uuid5(UUID(run["id"]), f"shot:{shot.id}"))
@@ -300,10 +316,12 @@ class FilmRunEngine:
                 # Character sheets are never used as frames: even a weak anchor makes the clip open on their studio backdrop.
                 anchors = ([{"path": ref_path, "frame_index": 0, "strength": REFERENCE_GUIDE_STRENGTH, "binding": "guide"}]
                            if ref_path and linked[reference_id].get("category") != "character" else [])
-                conditioning = "previous-shot" if previous_shot_id else "guide-image" if anchors else "text-only"
+                conditioning = "previous-shot" if continue_from else "guide-image" if anchors else "text-only"
                 identity_lines = [f"{characters[cid].name}: {characters[cid].identity}; distinguishing traits: " + ", ".join(characters[cid].distinguishing_traits)
                                   for cid in shot.characters_present]
                 framing = "Shot framing: " + shot.framing + ". Shot character layout: " + shot.character_layout
+                cast = ("On screen: only " + ", ".join(f"one {characters[cid].name}" for cid in shot.characters_present)
+                        + "; no other characters, duplicates or animals.")
                 # A shot the worker chains inherits identity and style from its first frame; a short
                 # action-led prompt keeps LTX from freezing on that frame.
                 continuation_prompt = "\n".join([
@@ -311,12 +329,12 @@ class FilmRunEngine:
                     f"Visual style: {plan.visual_style}",
                     f"Location continuity: {location.name}. {location.description} Scale: {location.scale}",
                     framing,
+                    cast,
                     *([f"Sound: {shot.sound.strip()}"] if sound and shot.sound.strip() else []),
                 ])
                 prompt = "\n".join([
                     continuation_prompt,
                     "Character identity continuity: " + " | ".join(identity_lines),
-                    "Scene character layout: " + scene.character_layout,
                     "Scene continuity: " + " | ".join(scene.continuity_requirements),
                     *[f"Project style bible: {line}" for line in style_lines],
                 ])
@@ -334,10 +352,10 @@ class FilmRunEngine:
                         "output_location": str(output), "framing": shot.framing,
                         "style_bible_revision": project.get("style_bible_revision", 0)},
                     "style_context": plan.visual_style, "reference_conditioning": conditioning,
-                    "reference_anchors": anchors, "reference_as_frame": False, "continue_from_shot_id": previous_shot_id,
+                    "reference_anchors": anchors, "reference_as_frame": False, "continue_from_shot_id": continue_from,
                     "continuation_prompt": continuation_prompt,
                     "reference_id": reference_id, "preflight_warnings": []}
-                previous_shot_id = shot_id
+                previous_shot_id, previous_framing = shot_id, framing_class
                 rows.append({"id": shot_id, "scene_title": saved_scene_title, "title": shot.title,
                     "prompt": prompt, "visual_description": shot.beat, "reference_image": ref_path,
                     "reference_ids": [reference_id] if reference_id else [], "preset": request["preset"],
