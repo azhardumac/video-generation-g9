@@ -64,12 +64,13 @@ class FakePlanner:
         return self.value
 
 
-def create_run(db, project, max_shots=4, max_seconds=3600, max_output_bytes=8 * 1024**3):
+def create_run(db, project, max_shots=4, max_seconds=3600, max_output_bytes=8 * 1024**3, quality=None):
     request = {"prompt": "A lighthouse keeper guides a lost boat home before a storm.",
         "reference_ids": [], "reference_categories": [], "preset": "Short",
         "budget": {"max_shots": max_shots, "max_retries_per_shot": 1,
                    "max_generation_seconds": max_seconds, "max_output_bytes": max_output_bytes},
-        "generation_profile": {"frames": 49, "fps": 24, "width": 448, "height": 768},
+        "generation_profile": {"frames": 49, "fps": 24, "width": 448, "height": 768,
+                               **({"quality": quality} if quality else {})},
         "authorization": {"confirmed": True, "scope": "bounded local run"}}
     return FilmOrchestrator(db).create(project["id"], "test-key", request, authorized=True)
 
@@ -272,3 +273,45 @@ def test_output_storage_budget_stops_fake_adapter_and_preserves_partial_file(tmp
     assert Path(current["partial_output_path"]).stat().st_size == cap
     assert db.get_job(jobs[1]["id"])["status"] == "cancelled"
     assert db.get_film_run(run["id"])["status"] == "needs_attention"
+
+
+@pytest.mark.parametrize(("quality", "size", "expected"), [
+    ("draft", (448, 768), (448, 768)),
+    ("better", (448, 768), (576, 1024)),
+    ("best", (768, 432), (1024, 576)),
+    ("better", (640, 640), (832, 832)),
+])
+def test_quality_scales_resolution_on_the_two_stage_grid(quality, size, expected):
+    from app.presets import quality_dimensions
+
+    assert quality_dimensions(*size, quality) == expected
+
+
+def _queue_single_shot(engine):
+    while (run := engine.process_next())["stage"] != "inspect_clips":
+        assert run["status"] != "needs_attention", run.get("error")
+
+
+def test_best_quality_film_run_uses_dev_two_stage_at_higher_resolution(tmp_path):
+    from app.adapters import build_ltx_command
+
+    db, project, settings = make_db(tmp_path)
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan_data()), ltx_ready=lambda: True)
+    create_run(db, project, quality="best")
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert (payload["width"], payload["height"], payload["quality"]) == (576, 1024, "best")
+    assert payload["distilled_two_stage"] is False
+    command = build_ltx_command("ltx", payload, "/out/job.partial.mp4")
+    assert "--two-stage" in command and "--distilled" not in command
+
+
+def test_time_estimate_only_uses_benchmarks_of_the_same_quality(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    db.add_benchmark("Short", 49, 24, 2.04, elapsed_seconds=99999, quality="draft")
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan_data()), ltx_ready=lambda: True)
+    create_run(db, project, quality="better")
+    _queue_single_shot(engine)
+    assert db.benchmarks()[0]["quality"] == "draft"
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert (payload["width"], payload["height"], payload["distilled_two_stage"]) == (576, 1024, True)

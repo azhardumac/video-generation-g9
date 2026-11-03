@@ -30,7 +30,7 @@ from .gemini_planning import (GeminiPlanningError, GeminiStoryPlanner, STORY_PLA
                               _stored_model_is_text_eligible)
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
 from .paths import safe_local_path
-from .presets import BUILTIN_PRESETS, GenerationSettings, Preset
+from .presets import BUILTIN_PRESETS, GenerationSettings, Preset, Quality
 from .projects import IMAGE_TYPES, VIDEO_TYPES, scan_project
 from .resources import ResourcePreflight, resource_snapshot
 from .storyboards import ShotInput, StoryboardUpdate, build_composition_manifest
@@ -199,6 +199,7 @@ class CreateFilmRunRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20000)
     reference_ids: list[str] = Field(default_factory=list, max_length=16)
     preset: str = "Short"
+    quality: Quality = "draft"
     budget: FilmRunBudget = Field(default_factory=FilmRunBudget)
     idempotency_key: str = Field(min_length=1, max_length=128)
     initial_confirmation: bool = False
@@ -1183,7 +1184,8 @@ def preview_film_run(project_id: str, request: CreateFilmRunRequest):
             raise HTTPException(400, "Historical outputs cannot be silently attached to a new film run")
     frames, fps = _preset_frames(request.preset)
     benchmark = next((row for row in db.benchmarks()
-                      if row["frames"] == frames and row["fps"] == fps and row["elapsed_seconds"] is not None), None)
+                      if row["frames"] == frames and row["fps"] == fps and row.get("quality", "draft") == request.quality
+                      and row["elapsed_seconds"] is not None), None)
     samples = []
     for job in db.list_jobs(project_id=project_id, limit=1000):
         payload = job.get("payload", {})
@@ -1209,6 +1211,7 @@ def preview_film_run(project_id: str, request: CreateFilmRunRequest):
         "gemini_available": _gemini_planner_config()["status"] == "connected",
         "requested_max_shots": request.budget.max_shots,
         "preset": request.preset,
+        "quality": request.quality,
         "frames": frames,
         "fps": fps,
         "maximum_footage_seconds": round(request.budget.max_shots * frames / fps, 2),
@@ -1597,7 +1600,7 @@ def create_film_run(project_id: str, request: CreateFilmRunRequest):
             "media_uploaded": False} if request.planner_provider == "gemini" and request.remote_processing_consent else {}),
         "preset": request.preset,
         "budget": request.budget.model_dump(),
-        "generation_profile": {"frames": frames, "fps": fps, "width": 448, "height": 768},
+        "generation_profile": {"frames": frames, "fps": fps, "width": 448, "height": 768, "quality": request.quality},
         "authorization": ({"confirmed": True, "scope": ("Gemini story planning only; no LTX generation until separately authorized" if request.plan_only else "local LTX jobs within the declared shot/time/storage budget; Gemini planning explicitly opted in" if request.planner_provider == "gemini" else "local LTX jobs within the declared shot/time/storage budget")}
                           if request.initial_confirmation else {}),
     }

@@ -46,7 +46,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS benchmark_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, preset TEXT NOT NULL,
                     frames INTEGER NOT NULL, fps INTEGER NOT NULL, duration REAL NOT NULL,
-                    elapsed_seconds REAL, created_at TEXT NOT NULL
+                    elapsed_seconds REAL, created_at TEXT NOT NULL,
+                    quality TEXT NOT NULL DEFAULT 'draft'
                 );
                 CREATE TABLE IF NOT EXISTS projects (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL,
@@ -259,6 +260,8 @@ class Database:
             ):
                 if column not in scene_columns:
                     db.execute(f"ALTER TABLE storyboard_scenes ADD COLUMN {column} {declaration}")
+            if "quality" not in {row[1] for row in db.execute("PRAGMA table_info(benchmark_history)")}:
+                db.execute("ALTER TABLE benchmark_history ADD COLUMN quality TEXT NOT NULL DEFAULT 'draft'")
             existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             for column, declaration in (
                 ("exit_code", "INTEGER"),
@@ -545,10 +548,11 @@ class Database:
             db.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                        (key, json.dumps(value), now_iso()))
 
-    def add_benchmark(self, preset: str, frames: int, fps: int, duration: float, elapsed_seconds: float | None = None):
+    def add_benchmark(self, preset: str, frames: int, fps: int, duration: float, elapsed_seconds: float | None = None,
+                      quality: str = "draft"):
         with self.lock, self.connect() as db:
-            db.execute("INSERT INTO benchmark_history(preset,frames,fps,duration,elapsed_seconds,created_at) VALUES(?,?,?,?,?,?)",
-                       (preset, frames, fps, duration, elapsed_seconds, now_iso()))
+            db.execute("INSERT INTO benchmark_history(preset,frames,fps,duration,elapsed_seconds,created_at,quality) VALUES(?,?,?,?,?,?,?)",
+                       (preset, frames, fps, duration, elapsed_seconds, now_iso(), quality))
 
     def benchmarks(self):
         with self.connect() as db:

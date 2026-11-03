@@ -13,7 +13,7 @@ from .config import Settings
 from .film_orchestrator import FilmOrchestrator, FilmRunTransitionError, enforce_generation_budget
 from .integrations import detect_integrations
 from .paths import safe_local_path
-from .presets import BUILTIN_PRESETS, GenerationSettings
+from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, quality_dimensions
 from .story_planning import LocalStoryPlanner, PlannerOutputError, PlannerUnavailable, PlannerResult, StoryPlan, StoryPlanner
 from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner, STORY_PLAN_SCHEMA_VERSION
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
@@ -193,8 +193,10 @@ class FilmRunEngine:
         checkpoint["planner_provenance"] = getattr(self, "_last_planner_provenance", {"provider": "local"})
         checkpoint["shot_count"] = count
         frames, fps = self._preset(run["request"]["preset"])
+        quality = self._quality(run, self.db.get_setting(f"generation:{run['project_id']}") or self.db.get_setting("generation") or {})
         benchmark = next((item for item in self.db.benchmarks()
-                          if item["frames"] == frames and item["fps"] == fps and item.get("elapsed_seconds") is not None), None)
+                          if item["frames"] == frames and item["fps"] == fps and item.get("quality", "draft") == quality
+                          and item.get("elapsed_seconds") is not None), None)
         checkpoint["estimated_generation_seconds"] = round(float(benchmark["elapsed_seconds"]) * count) if benchmark else None
         if checkpoint["estimated_generation_seconds"] is not None and checkpoint["estimated_generation_seconds"] > run["budget"]["max_generation_seconds"]:
             raise FilmRunTransitionError("The measured local generation estimate exceeds this run's time budget")
@@ -238,6 +240,11 @@ class FilmRunEngine:
                                            result, status="waiting_for_planner",
                                            message=f"Saved validated plan '{storyboard['title']}' with {len(scenes)} scenes; generation is still queued nowhere.")
 
+    @staticmethod
+    def _quality(run: dict, profile: dict) -> str:
+        quality = run["request"].get("generation_profile", {}).get("quality") or profile.get("quality") or "draft"
+        return quality if quality in QUALITY_LEVELS else "draft"
+
     def _storyboard_rows(self, run: dict, plan: StoryPlan):
         project = self.db.get_project(run["project_id"])
         request = run["request"]
@@ -258,6 +265,11 @@ class FilmRunEngine:
                 raise PlannerOutputError("Historical media cannot be reused as a new film reference without separate approval")
             reference_paths[reference_id] = str(path)
         profile = self.db.get_setting(f"generation:{project['id']}") or self.db.get_setting("generation") or {}
+        quality = self._quality(run, profile)
+        width, height = quality_dimensions(width, height, quality)
+        distilled = QUALITY_LEVELS[quality]["distilled_two_stage"]
+        if distilled is None:
+            distilled = profile.get("distilled_two_stage", True)
         style_bible = project.get("style_bible", {})
         style_lines = [f"{key.replace('_', ' ').title()}: {value}" for key, value in style_bible.items() if isinstance(value, str) and value.strip()]
         characters = {item.id: item for item in plan.characters}
@@ -305,7 +317,7 @@ class FilmRunEngine:
                     raise PlannerOutputError(f"The validated prompt for '{shot.title}' exceeds LTX's 4,000 character limit")
                 generation = GenerationSettings.model_validate(profile | {
                     "prompt": prompt, "model": profile.get("model", "dgrauet/ltx-2.3-mlx-q8"),
-                    "width": width, "height": height, "distilled_two_stage": profile.get("distilled_two_stage", True),
+                    "width": width, "height": height, "distilled_two_stage": distilled, "quality": quality,
                     "low_ram": profile.get("low_ram", True), "audio": False,
                     "seed": film_seed, "reference_image": ref_path,
                     "output_location": str(output), "preset": request["preset"],
