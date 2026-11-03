@@ -394,7 +394,7 @@ def test_plan_only_authorization_checks_the_time_cap_with_the_runs_quality_and_s
     from app import main
 
     run = {"id": "run", "project_id": "project", "status": "awaiting_authorization", "stage": "define_visual_bible",
-           "prompt": "A frog", "reference_ids": [], "preset": "Short", "budget": {"max_shots": 1},
+           "prompt": "A frog", "reference_ids": [], "preset": "Short", "budget": {"max_shots": 1, "max_output_bytes": 2**30},
            "checkpoint": {"understand_story": {"title": "Frog"}},
            "request": {"plan_only": True, "generation_profile": {"quality": "best", "audio": False}}}
     seen = []
