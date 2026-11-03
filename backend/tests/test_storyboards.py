@@ -418,7 +418,7 @@ def test_manifest_plays_clip_sound_with_short_fades_at_cuts_and_dissolve_length_
 def test_manifest_drops_the_last_frame_of_sound_clips_before_hard_cuts_so_sound_covers_every_slot(tmp_path):
     shots = []
     for index, (transition, audio, chained) in enumerate((
-            ("cut", True, False), ("cut", True, True), ("cut", False, False), ("cut", True, False), ("fade", True, False))):
+            ("cut", True, False), ("cut", True, True), ("cut", False, False), ("cut", True, True), ("fade", True, False))):
         path = tmp_path / f"clip-{index}.mp4"
         path.write_bytes(b"test-only verified fixture")
         shots.append({"id": f"shot-{index}", "position": index, "title": f"Shot {index}",
@@ -428,6 +428,6 @@ def test_manifest_drops_the_last_frame_of_sound_clips_before_hard_cuts_so_sound_
                     "verified_output": {"width": 576, "height": 1024, "fps": 24, "frames": 49}}}})
     clips = build_composition_manifest({"id": "sound", "revision": 1, "title": "Sound", "shots": shots}, tmp_path)["shots"]
     assert [(c["trim_start_frames"], c["trim_end_frames"], c["frames"], c["start_frame"]) for c in clips] == [
-        (0, 1, 48, 0), (1, 1, 47, 48), (0, 0, 49, 95), (0, 1, 48, 144), (0, 0, 49, 192)]
+        (0, 1, 48, 0), (0, 1, 48, 48), (0, 0, 49, 96), (1, 1, 47, 145), (0, 0, 49, 192)]
     # LTX audio for a 49-frame clip lasts ~2.010 s; each sound slot, from the clip's trimmed start, must fit inside it.
     assert all((c["trim_start_frames"] + c["frames"]) / 24 <= 2.010 for c in clips if c["has_audio"] and c["trim_end_frames"])

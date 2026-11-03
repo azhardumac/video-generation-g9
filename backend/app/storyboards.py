@@ -105,9 +105,10 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
     previous_frames = 0
     for index, clip in enumerate(clips):
         previous_transition = clips[index - 1].get("transition_after", "dissolve") if index else "cut"
-        # A chained shot's first frame duplicates the previous clip's last frame; drop it on hard cuts.
         continues_previous = clip.pop("continues_previous")
-        clip["trim_start_frames"] = 1 if index and continues_previous and previous_transition in ("cut", "none") else 0
+        # A chained shot's first frame duplicates the previous clip's last frame; show it once at a hard cut.
+        clip["trim_start_frames"] = 1 if (index and continues_previous and previous_transition in ("cut", "none")
+                                          and not clips[index - 1]["trim_end_frames"]) else 0
         # LTX audio ends ~30 ms before its video. Dropping the last frame before a hard cut keeps each clip's
         # sound covering its whole slot, so cuts stay gapless without shifting sound off its picture.
         cut_out = index + 1 < len(clips) and clip.get("transition_after", "dissolve") in ("cut", "none")
