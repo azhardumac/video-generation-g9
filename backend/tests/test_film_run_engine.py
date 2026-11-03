@@ -437,3 +437,14 @@ def test_film_run_cuts_instead_of_chaining_when_a_character_leaves_the_shot(tmp_
     _queue_single_shot(engine)
     payloads = sorted((job["payload"] for job in db.list_jobs(project_id=project["id"])), key=lambda p: p["shot_order"])
     assert [p["continue_from_shot_id"] for p in payloads] == [None, None]
+
+
+def test_character_references_are_keyed_past_the_kept_frames_and_other_references_guide_the_opening():
+    from app.film_run_engine import CHARACTER_REFERENCE_TAIL_FRAMES, reference_anchor_plan
+
+    anchors, generate = reference_anchor_plan("/refs/frog.png", "character", 97)
+    assert generate == 97 + CHARACTER_REFERENCE_TAIL_FRAMES
+    assert anchors == [{"path": "/refs/frog.png", "frame_index": generate - 1, "strength": 0.3, "binding": "guide"}]
+    assert reference_anchor_plan("/refs/river.png", "location", 97) == (
+        [{"path": "/refs/river.png", "frame_index": 0, "strength": 0.35, "binding": "guide"}], 97)
+    assert reference_anchor_plan(None, None, 97) == ([], 97)

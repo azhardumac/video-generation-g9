@@ -200,6 +200,7 @@ class LocalWorker:
             return payload
         self.db.event(job["id"], "info", "Continuing from the last frame of the previous shot: " + clip)
         return payload | {"continued_from_previous_shot": True, "prompt": payload.get("continuation_prompt", payload["prompt"]),
+                          "generate_frames": payload.get("frames"),
                           "reference_anchors": [{"path": str(frame), "frame_index": 0, "strength": 1.0, "binding": "replace"}]}
 
     def _partial_path(self, job: dict) -> Path | None:

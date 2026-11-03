@@ -272,3 +272,23 @@ def test_measure_audio_levels_reads_volumedetect_and_tolerates_missing_audio(mon
     settings = Settings(_env_file=None, allowed_path_roots=str(tmp_path))
     assert asyncio.run(adapters.measure_audio_levels("clip.mp4", settings)) == {"mean_db": -37.4, "peak_db": -4.2}
     assert asyncio.run(adapters.measure_audio_levels("clip.mp4", settings)) is None
+
+
+def test_ltx_command_generates_the_reference_tail_and_trim_keeps_only_the_planned_frames(tmp_path):
+    import shutil
+    import subprocess
+    from app import adapters
+
+    payload = {"prompt": "p", "model": "m", "width": 64, "height": 64, "frames": 9, "generate_frames": 41, "fps": 24}
+    args = build_ltx_command("ltx", payload, "out.mp4")
+    assert args[args.index("--frames") + 1] == "41"
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg is not installed")
+    clip = tmp_path / "clip.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=24", "-f", "lavfi",
+                    "-i", "sine=frequency=440", "-frames:v", "41", "-t", "1.708", "-pix_fmt", "yuv420p", str(clip)], check=True)
+    settings = Settings(_env_file=None, allowed_path_roots=str(tmp_path))
+    asyncio.run(adapters.trim_to_frames(clip, 9, 24, settings))
+    metadata = asyncio.run(verify_video(str(clip), settings, {"width": 64, "height": 64, "fps": 24, "frames": 9}))
+    assert metadata["verified_output"]["frames"] == 9
+    assert not (tmp_path / "clip.trim.mp4").exists()

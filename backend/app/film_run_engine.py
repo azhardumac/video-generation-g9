@@ -21,6 +21,20 @@ from .gemini_secrets import GeminiSecretStore, SecretStoreError
 
 # Low enough that a reference sheet steers identity without its backdrop becoming the opening frame.
 REFERENCE_GUIDE_STRENGTH = 0.35
+CHARACTER_REFERENCE_STRENGTH = 0.3
+# LTX turns the clip into a guide image ~3 latents (~22 frames) before its keyframe. A character sheet is
+# keyed this far past the kept frames, so its identity pull reaches the shot but its studio backdrop is cut off.
+CHARACTER_REFERENCE_TAIL_FRAMES = 32
+
+
+def reference_anchor_plan(ref_path: str | None, category: str | None, frames: int) -> tuple[list[dict], int]:
+    """Return a hard-cut shot's image anchors and how many frames LTX should generate before trimming to `frames`."""
+    if not ref_path:
+        return [], frames
+    if category == "character":
+        generate = frames + CHARACTER_REFERENCE_TAIL_FRAMES
+        return [{"path": ref_path, "frame_index": generate - 1, "strength": CHARACTER_REFERENCE_STRENGTH, "binding": "guide"}], generate
+    return [{"path": ref_path, "frame_index": 0, "strength": REFERENCE_GUIDE_STRENGTH, "binding": "guide"}], frames
 
 
 _FRAMING_CLASSES = (("extreme close", "extreme close-up"), ("medium close", "medium close-up"), ("close", "close-up"),
@@ -314,11 +328,11 @@ class FilmRunEngine:
                 reference_id = shot.reference_ids[0] if shot.reference_ids else None
                 ref_path = reference_paths.get(reference_id) if reference_id else None
                 shot_id = str(uuid5(UUID(run["id"]), f"shot:{shot.id}"))
-                # Later shots in a scene start on the previous clip's last frame (swapped in by the worker).
-                # Character sheets are never used as frames: even a weak anchor makes the clip open on their studio backdrop.
-                anchors = ([{"path": ref_path, "frame_index": 0, "strength": REFERENCE_GUIDE_STRENGTH, "binding": "guide"}]
-                           if ref_path and linked[reference_id].get("category") != "character" else [])
-                conditioning = "previous-shot" if continue_from else "guide-image" if anchors else "text-only"
+                # Chained shots start on the previous clip's last frame (swapped in by the worker) instead.
+                anchors, generate_frames = (([], frames) if continue_from else
+                    reference_anchor_plan(ref_path, linked[reference_id].get("category") if ref_path else None, frames))
+                conditioning = ("previous-shot" if continue_from else "character-tail-guide" if generate_frames > frames
+                                else "guide-image" if anchors else "text-only")
                 identity_lines = [f"{characters[cid].name}: {characters[cid].identity}; distinguishing traits: " + ", ".join(characters[cid].distinguishing_traits)
                                   for cid in shot.characters_present]
                 framing = "Shot framing: " + shot.framing + ". Shot character layout: " + shot.character_layout
@@ -349,7 +363,7 @@ class FilmRunEngine:
                     "seed": film_seed, "reference_image": ref_path,
                     "output_location": str(output), "preset": request["preset"],
                 })
-                payload = generation.model_dump() | {"frames": frames, "fps": fps,
+                payload = generation.model_dump() | {"frames": frames, "generate_frames": generate_frames, "fps": fps,
                     "shot_prompt": prompt, "shot_settings": {"width": width, "height": height, "fps": fps,
                         "output_location": str(output), "framing": shot.framing,
                         "style_bible_revision": project.get("style_bible_revision", 0)},
@@ -372,7 +386,7 @@ class FilmRunEngine:
                     "scene_count": len(plan.scenes), "shot_count": len(rows), "preset": request["preset"],
                     "frames_per_shot": frames, "fps": fps, "width": width, "height": height,
                     "approved_reference_ids": sorted(selected),
-                    "reference_limit_note": "Shots after the first in each scene start on the previous shot's last frame. Character references are described in prompts but never used as video frames; other references guide shots weakly. Local conditioning does not guarantee identity consistency.",
+                    "reference_limit_note": "Shots that keep the previous shot's framing and cast start on its last frame. Other shots are guided by one character reference keyed just past the end of the clip and trimmed off, so it is never shown; other references guide shots weakly. Local conditioning does not guarantee identity consistency.",
                     "creative_quality_status": "pending_manual_review", "audio_available": sound,
                     "model_capabilities": {"text_to_video": True, "image_to_video": True,
                         "max_reference_images_per_shot": 1, "audio_generation": sound,

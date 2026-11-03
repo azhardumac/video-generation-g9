@@ -40,7 +40,7 @@ def build_ltx_command(executable: str, payload: dict, output_path: str, referenc
     args = [
         executable, "generate", "--prompt", payload["prompt"], "--model", payload["model"],
         "--width", str(payload["width"]), "--height", str(payload["height"]),
-        "--frames", str(payload["frames"]), "--frame-rate", str(payload["fps"]),
+        "--frames", str(payload.get("generate_frames") or payload["frames"]), "--frame-rate", str(payload["fps"]),
         "--output", output_path,
     ]
     anchors = payload.get("reference_anchors") or []
@@ -138,6 +138,31 @@ async def measure_audio_levels(video: str, settings: Settings) -> dict[str, floa
     return {"mean_db": float(mean.group(1)), "peak_db": float(peak.group(1))}
 
 
+async def trim_to_frames(video: Path, frames: int, fps: int, settings: Settings) -> None:
+    """Keep only the first `frames` frames (and matching audio) of a clip, in place."""
+    ffmpeg = _ffmpeg_executable(settings)
+    if not ffmpeg:
+        raise AdapterError("ffmpeg executable was not found")
+    trimmed = video.with_name(video.stem + ".trim.mp4")
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-v", "error", "-y", "-i", str(video), "-frames:v", str(frames), "-t", f"{frames / fps:.6f}",
+        "-c:v", "libx264", "-crf", "14", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", str(trimmed),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    try:
+        _, stderr = await process.communicate()
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        trimmed.unlink(missing_ok=True)
+        raise
+    if process.returncode or not trimmed.is_file():
+        trimmed.unlink(missing_ok=True)
+        raise AdapterError("Could not trim the clip to its planned length: " + stderr.decode(errors="replace")[-500:])
+    os.replace(trimmed, video)
+
+
 async def extract_last_frame(video: str, image: Path, settings: Settings) -> Path:
     """Write the final frame of a verified clip as a still for the next shot's first-frame anchor."""
     ffmpeg = _ffmpeg_executable(settings)
@@ -214,6 +239,9 @@ class LTXAdapter:
                 partial_output=str(partial) if partial.exists() else None,
             )
         try:
+            if (payload.get("generate_frames") or payload["frames"]) > payload["frames"]:
+                await on_progress(92, "Trimming the reference-guided tail off the clip")
+                await trim_to_frames(partial, payload["frames"], payload["fps"], self.settings)
             metadata = await verify_video(
                 str(partial), self.settings,
                 expected={"width": payload["width"], "height": payload["height"],
