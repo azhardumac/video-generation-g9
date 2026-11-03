@@ -30,7 +30,7 @@ from .gemini_planning import (GeminiPlanningError, GeminiStoryPlanner, STORY_PLA
                               _stored_model_is_text_eligible)
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
 from .paths import safe_local_path
-from .presets import BUILTIN_PRESETS, GenerationSettings, Preset, Quality
+from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, Preset, Quality
 from .projects import IMAGE_TYPES, VIDEO_TYPES, scan_project
 from .resources import ResourcePreflight, resource_snapshot
 from .storyboards import ShotInput, StoryboardUpdate, build_composition_manifest
@@ -199,7 +199,7 @@ class CreateFilmRunRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20000)
     reference_ids: list[str] = Field(default_factory=list, max_length=16)
     preset: str = "Short"
-    quality: Quality = "draft"
+    quality: Quality = "better"
     budget: FilmRunBudget = Field(default_factory=FilmRunBudget)
     idempotency_key: str = Field(min_length=1, max_length=128)
     initial_confirmation: bool = False
@@ -2420,6 +2420,17 @@ def archive_storyboard(storyboard_id: str):
         raise HTTPException(409, str(exc)) from exc
 
 
+def _apply_film_run_quality(payload: dict, storyboard_id: str):
+    """A shot regenerated from a film run's storyboard keeps that run's sampler; its size is already on the shot."""
+    quality = db.film_run_quality(storyboard_id)
+    if quality not in QUALITY_LEVELS:
+        return
+    distilled = QUALITY_LEVELS[quality]["distilled_two_stage"]
+    if distilled is not None:
+        payload["distilled_two_stage"] = distilled
+    payload["quality"] = quality
+
+
 @app.post("/api/storyboards/{storyboard_id}/shots/{shot_id}/generate", status_code=201)
 def queue_storyboard_shot(storyboard_id: str, shot_id: str, request: ShotGenerateRequest | None = None):
     request = request or ShotGenerateRequest()
@@ -2448,6 +2459,7 @@ def queue_storyboard_shot(storyboard_id: str, shot_id: str, request: ShotGenerat
                          "width": width, "height": height, "output_location": output_location,
                          "seed": shot["seed"], "reference_image": str(reference) if reference else None})
     payload = _generation_payload(config, project["id"], fps_override=fps)
+    _apply_film_run_quality(payload, storyboard_id)
     shot_settings = {"style_context": style_context, "style_bible_revision": story.get("style_bible_revision", 0),
                      "width": width, "height": height, "fps": fps, "output_location": payload["output_location"],
                      "framing": shot.get("framing", ""), "aspect_ratio": project.get("aspect_ratio")}

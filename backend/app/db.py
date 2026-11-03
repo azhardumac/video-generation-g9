@@ -909,6 +909,14 @@ class Database:
         result["deduplicated"] = False
         return result
 
+    def film_run_quality(self, storyboard_id: str) -> str | None:
+        with self.connect() as db:
+            row = db.execute("SELECT request_json FROM film_runs WHERE storyboard_id=? ORDER BY created_at DESC LIMIT 1",
+                             (storyboard_id,)).fetchone()
+        if row is None:
+            return None
+        return (json.loads(row["request_json"] or "{}").get("generation_profile") or {}).get("quality") or "draft"
+
     def get_film_run(self, run_id: str):
         with self.connect() as db:
             row = db.execute("SELECT * FROM film_runs WHERE id=?", (run_id,)).fetchone()

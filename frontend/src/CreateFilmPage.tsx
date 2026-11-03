@@ -11,9 +11,9 @@ type Preset = { name: string; frames: number; fps: number; status: string; visua
 type Reference = { id: string; name: string; category: string; mime_type: string }
 type Quality = 'draft'|'better'|'best'
 const QUALITY_OPTIONS:{value:Quality;label:string;detail:string}[] = [
-  {value:'draft',label:'Draft',detail:'Fastest. Good for checking the story and timing.'},
-  {value:'better',label:'Better',detail:'Sharper: about 1.8× the pixels. Takes noticeably longer.'},
-  {value:'best',label:'Best',detail:'Sharpest, with the full model. Much slower; use for final shots.'},
+  {value:'draft',label:'Draft',detail:'Lowest detail. Good for checking the story and timing.'},
+  {value:'better',label:'Better',detail:'Recommended. Much sharper, about the same time as Draft.'},
+  {value:'best',label:'Best',detail:'Full model: cleaner characters, about 5× slower per shot. For final shots.'},
 ]
 type FilmRun = {
   id: string; project_id: string; prompt: string; reference_ids: string[]; preset: string; updated_at: string
@@ -52,7 +52,7 @@ export default function CreateFilmPage({project,presets,onMessage,onNavigate,onR
   const [preset,setPreset]=useState('Short');const [maxShots,setMaxShots]=useState(1);const [maxRetries,setMaxRetries]=useState(1);const [maxRuntime,setMaxRuntime]=useState(3600);const [maxBytes,setMaxBytes]=useState(8*1024**3)
   const [runs,setRuns]=useState<FilmRun[]>([]);const [capabilities,setCapabilities]=useState<Capabilities|null>(null);const [busy,setBusy]=useState(false);const [error,setError]=useState('')
   const [showArchived,setShowArchived]=useState(false)
-  const [quality,setQuality]=useState<Quality>('draft')
+  const [quality,setQuality]=useState<Quality>('better')
   const [newProjectName,setNewProjectName]=useState('')
   const [plannerProvider,setPlannerProvider]=useState<'gemini'|'local'>('gemini');const [geminiConfig,setGeminiConfig]=useState<StoryPlannerConfig|null>(null);const [remoteConsent,setRemoteConsent]=useState(false);const [responseMode,setResponseMode]=useState<'schema'|'json_only'>('schema')
   const pendingRequest=useRef<{signature:string;key:string}|null>(null)

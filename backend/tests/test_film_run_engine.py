@@ -326,3 +326,21 @@ def test_direct_jobs_are_benchmarked_as_draft_even_with_a_saved_quality(tmp_path
     config = GenerationSettings(prompt="A boat", quality="best", output_location=str(main.settings.expanded(main.settings.output_root)))
     payload = main._generation_payload(config)
     assert payload["quality"] == "draft" and payload["distilled_two_stage"] is True
+
+
+@pytest.mark.parametrize(("quality", "distilled"), [("best", False), ("better", True), ("draft", True)])
+def test_storyboard_regenerate_keeps_the_film_run_quality(tmp_path, monkeypatch, quality, distilled):
+    from app import main
+
+    db, project, settings = make_db(tmp_path)
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan_data()), ltx_ready=lambda: True)
+    run = create_run(db, project, quality=quality)
+    _queue_single_shot(engine)
+    storyboard_id = db.get_film_run(run["id"])["storyboard_id"]
+    monkeypatch.setattr(main, "db", db)
+    payload = {"quality": "draft", "distilled_two_stage": True}
+    main._apply_film_run_quality(payload, storyboard_id)
+    assert payload == {"quality": quality, "distilled_two_stage": distilled}
+    untouched = {"quality": "draft", "distilled_two_stage": True}
+    main._apply_film_run_quality(untouched, "not-a-film-storyboard")
+    assert untouched == {"quality": "draft", "distilled_two_stage": True}
