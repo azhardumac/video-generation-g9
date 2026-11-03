@@ -435,7 +435,8 @@ def test_manifest_drops_the_last_frame_of_sound_clips_before_hard_cuts_so_sound_
 
 def test_manifest_brings_each_shots_sound_halfway_to_the_films_median_level(tmp_path):
     shots = []
-    for index, (audio, level) in enumerate(((True, -23.0), (True, -45.0), (True, -37.0), (False, None), (True, None))):
+    for index, (audio, level) in enumerate(((True, -23.0), (True, -45.0), (True, -37.0), (False, None), (True, None),
+                                            (True, -91.0))):
         path = tmp_path / f"clip-{index}.mp4"
         path.write_bytes(b"test-only verified fixture")
         shots.append({"id": f"shot-{index}", "position": index, "title": f"Shot {index}",
@@ -444,5 +445,6 @@ def test_manifest_brings_each_shots_sound_halfway_to_the_films_median_level(tmp_
                 "settings_match": True, "verification_metadata": {"audio_mean_db": level,
                     "verified_output": {"width": 576, "height": 1024, "fps": 24, "frames": 49}}}})
     clips = build_composition_manifest({"id": "sound", "revision": 1, "title": "Sound", "shots": shots}, tmp_path)["shots"]
-    assert [clip["audio_gain_db"] for clip in clips] == [-7.0, 4.0, 0.0, 0.0, 0.0]
+    # A silent clip (-91 dB) is left alone and does not pull the median down.
+    assert [clip["audio_gain_db"] for clip in clips] == [-7.0, 4.0, 0.0, 0.0, 0.0, 0.0]
     assert all("audio_mean_db" not in clip for clip in clips)

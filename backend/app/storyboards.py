@@ -53,6 +53,7 @@ class StoryboardUpdate(BaseModel):
 AUDIO_CUT_FADE_FRAMES = 2
 AUDIO_LEVEL_MATCH = 0.5
 AUDIO_MAX_GAIN_DB = 12.0
+AUDIO_SILENCE_DB = -70.0
 
 
 def build_composition_manifest(storyboard: dict, public_root: Path, transition_frames: int = 8) -> dict:
@@ -136,6 +137,9 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
         clip["audio_fade_out_frames"] = cut_fade if cut_out else clip["transition_out_frames"]
     # Bring each shot's sound halfway to the film's median level: background stays even across cuts,
     # while deliberately loud or quiet moments keep some of their contrast.
+    for clip in clips:
+        if clip["audio_mean_db"] is not None and clip["audio_mean_db"] < AUDIO_SILENCE_DB:
+            clip["audio_mean_db"] = None
     levels = sorted(clip["audio_mean_db"] for clip in clips if clip["has_audio"] and clip["audio_mean_db"] is not None)
     median = (levels[(len(levels) - 1) // 2] + levels[len(levels) // 2]) / 2 if levels else None
     for clip in clips:
