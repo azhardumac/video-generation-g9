@@ -50,7 +50,7 @@ class StoryboardUpdate(BaseModel):
         return self
 
 
-AUDIO_CUT_FADE_FRAMES = 3
+AUDIO_CUT_FADE_FRAMES = 2
 
 
 def build_composition_manifest(storyboard: dict, public_root: Path, transition_frames: int = 8) -> dict:
@@ -121,10 +121,14 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
             clip["transition_out_frames"] = min(transition_frames, clip["frames"] // 4)
         else:
             clip["transition_out_frames"] = 0
-        # Audio follows a dissolve's overlap; on a hard cut both sides get a short fade so the join doesn't click.
+        # LTX audio ends ~30 ms before its video, so on a hard cut the next shot's sound starts one frame early
+        # (in sync for chained shots, whose trimmed duplicate frame it covers) and both sides get a short fade.
+        cut_in = bool(index) and not clip["transition_in_frames"]
+        cut_out = index + 1 < len(clips) and not clip["transition_out_frames"]
         cut_fade = min(AUDIO_CUT_FADE_FRAMES, clip["frames"] // 4)
-        clip["audio_fade_in_frames"] = clip["transition_in_frames"] or (cut_fade if index else 0)
-        clip["audio_fade_out_frames"] = clip["transition_out_frames"] or (cut_fade if index + 1 < len(clips) else 0)
+        clip["audio_lead_frames"] = 1 if cut_in else 0
+        clip["audio_fade_in_frames"] = cut_fade if cut_in else clip["transition_in_frames"]
+        clip["audio_fade_out_frames"] = cut_fade if cut_out else clip["transition_out_frames"]
     width, height, fps = canvas
     return {
         "schema_version": 1,

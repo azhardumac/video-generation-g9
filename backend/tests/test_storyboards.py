@@ -412,6 +412,5 @@ def test_manifest_plays_clip_sound_with_short_fades_at_cuts_and_dissolve_length_
                     "width": 448, "height": 768, "fps": 24, "frames": 49}}}})
     clips = build_composition_manifest({"id": "sound", "revision": 1, "title": "Sound", "shots": shots}, tmp_path)["shots"]
     assert [clip["has_audio"] for clip in clips] == [True, True, False]
-    assert (clips[0]["audio_fade_in_frames"], clips[0]["audio_fade_out_frames"]) == (0, 3)
-    assert (clips[1]["audio_fade_in_frames"], clips[1]["audio_fade_out_frames"]) == (3, 8)
-    assert (clips[2]["audio_fade_in_frames"], clips[2]["audio_fade_out_frames"]) == (8, 8)
+    assert [(clip["audio_lead_frames"], clip["audio_fade_in_frames"], clip["audio_fade_out_frames"]) for clip in clips] == [
+        (0, 0, 2), (1, 2, 8), (0, 8, 8)]
