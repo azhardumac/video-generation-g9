@@ -388,3 +388,19 @@ def test_sound_run_time_estimate_ignores_silent_benchmarks(tmp_path):
     payload = db.list_jobs(project_id=project["id"])[0]["payload"]
     assert payload["audio"] is True
     assert db.benchmarks()[0]["audio"] == 0
+
+
+def test_plan_only_authorization_checks_the_time_cap_with_the_runs_quality_and_sound(monkeypatch):
+    from app import main
+
+    run = {"id": "run", "project_id": "project", "status": "awaiting_authorization", "stage": "define_visual_bible",
+           "prompt": "A frog", "reference_ids": [], "preset": "Short", "budget": {"max_shots": 1},
+           "checkpoint": {"understand_story": {}},
+           "request": {"plan_only": True, "generation_profile": {"quality": "best", "audio": False}}}
+    seen = []
+    monkeypatch.setattr(main.film_orchestrator, "get", lambda run_id: run)
+    monkeypatch.setattr(main.film_orchestrator, "authorize", lambda *args: {"authorized": True})
+    monkeypatch.setattr(main, "preview_film_run", lambda project_id, request: seen.append(request) or {
+        "available_output_bytes": 10**12, "estimated_output_within_cap": True, "generation_time_within_cap": True})
+    main.authorize_film_run("run", main.FilmRunAuthorizationRequest(confirmed=True, budget_acknowledged=True, expected_revision=1))
+    assert (seen[0].quality, seen[0].sound) == ("best", False)

@@ -1781,6 +1781,8 @@ def authorize_film_run(run_id: str, request: FilmRunAuthorizationRequest):
             saved = run["request"]
             preview_request = CreateFilmRunRequest(prompt=run["prompt"], reference_ids=run["reference_ids"],
                 preset=run["preset"], budget=FilmRunBudget.model_validate(run["budget"]),
+                quality=saved.get("generation_profile", {}).get("quality") or "draft",
+                sound=bool(saved.get("generation_profile", {}).get("audio")),
                 idempotency_key="plan-only-generation-authorization", initial_confirmation=True,
                 planner_provider=saved.get("planner_provider", "local"), planner_model=saved.get("planner_model"),
                 planner_response_mode=saved.get("planner_response_mode", "schema"), plan_only=True,
