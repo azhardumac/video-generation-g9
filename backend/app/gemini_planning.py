@@ -824,6 +824,8 @@ class GeminiStoryPlanner(StoryPlanner):
                    "Do not invent approvals. Keep within the exact shot budget, preset, and local model capabilities. "
                    "When model_capabilities.audio_generation is true, give each shot a short sound line naming the ambience and sound effects heard in it "
                    "(for example 'rushing current, one frog croak'); otherwise leave sound empty. "
+                   "When a shot's beat contains spoken dialogue, put that line in caption prefixed with the speaker's name "
+                   "(for example 'Scorpion: \"I could not help it.\"'); leave caption empty for shots without dialogue. "
                    "Return only the JSON object specified for this response mode.\nINPUT_JSON:\n" + input_json)
         if request.get("response_mode") == "json_only":
             contract = json.dumps(gemini_creative_schema(int(request.get("shot_budget", 1))),
