@@ -9,6 +9,12 @@ import { apiErrorMessage } from './apiError'
 type Project = { id: string; name: string }
 type Preset = { name: string; frames: number; fps: number; status: string; visual_drift_warning?: boolean }
 type Reference = { id: string; name: string; category: string; mime_type: string }
+type Quality = 'draft'|'better'|'best'
+const QUALITY_OPTIONS:{value:Quality;label:string;detail:string}[] = [
+  {value:'draft',label:'Draft',detail:'Lowest detail. Good for checking the story and timing.'},
+  {value:'better',label:'Better',detail:'Recommended. Much sharper, about the same time as Draft.'},
+  {value:'best',label:'Best',detail:'Full model: cleaner characters, about 5× slower per shot. For final shots.'},
+]
 type FilmRun = {
   id: string; project_id: string; prompt: string; reference_ids: string[]; preset: string; updated_at: string
   archived_at?: string|null; deduplicated?:boolean
@@ -17,7 +23,7 @@ type FilmRun = {
   completed_stages: string[]; error: string | null; events: { revision: number; level: string; message: string; time: string }[]
   generation_jobs_created?: number; planner_status?: string; message?: string
   storyboard_id?: string; creative_review_status?: string|null
-  request?: {planner_provider?:'gemini'|'local';planner_model?:string|null;planner_response_mode?:'schema'|'json_only';plan_only?:boolean;remote_processing_consent?:{confirmed?:boolean}}
+  request?: {generation_profile?:{quality?:Quality};planner_provider?:'gemini'|'local';planner_model?:string|null;planner_response_mode?:'schema'|'json_only';plan_only?:boolean;remote_processing_consent?:{confirmed?:boolean}}
   checkpoint?:{understand_story?:{title:string;logline:string;visual_style:string;scenes:{title:string;story_beat:string;shots:{title:string;prompt:string;framing:string}[]}[]}}
   planner_request?: {status:string;provider:string;model:string;revision:number;schema_version:string;response_mode?:string;attempts:number;remaining_attempts:number;error_code:string|null;error_details?:{http_status?:number;provider_status?:string;reason?:string;field_paths?:string[];category?:string;response_mode?:string;validation_attempts?:{attempt:number;issues:{path:string;type:string}[]}[]}|null}|null
   planner_attempts?: {revision:number;provider:string;model:string;schema_version:string;response_mode?:string;status:string;attempts:number;remaining_attempts:number;error_code:string|null;error_details?:Record<string,unknown>|null;consent:Record<string,unknown>|null}[]
@@ -46,6 +52,7 @@ export default function CreateFilmPage({project,presets,onMessage,onNavigate,onR
   const [preset,setPreset]=useState('Short');const [maxShots,setMaxShots]=useState(1);const [maxRetries,setMaxRetries]=useState(1);const [maxRuntime,setMaxRuntime]=useState(3600);const [maxBytes,setMaxBytes]=useState(8*1024**3)
   const [runs,setRuns]=useState<FilmRun[]>([]);const [capabilities,setCapabilities]=useState<Capabilities|null>(null);const [busy,setBusy]=useState(false);const [error,setError]=useState('')
   const [showArchived,setShowArchived]=useState(false)
+  const [quality,setQuality]=useState<Quality>('better')
   const [newProjectName,setNewProjectName]=useState('')
   const [plannerProvider,setPlannerProvider]=useState<'gemini'|'local'>('gemini');const [geminiConfig,setGeminiConfig]=useState<StoryPlannerConfig|null>(null);const [remoteConsent,setRemoteConsent]=useState(false);const [responseMode,setResponseMode]=useState<'schema'|'json_only'>('schema')
   const pendingRequest=useRef<{signature:string;key:string}|null>(null)
@@ -71,11 +78,12 @@ export default function CreateFilmPage({project,presets,onMessage,onNavigate,onR
     const requestProvider=freshFrom?.request?.planner_provider??plannerProvider
     const requestPlanOnly=freshFrom?!!freshFrom.request?.plan_only:planOnly
     const requestPreset=freshFrom?.preset??preset
+    const requestQuality=freshFrom?(freshFrom.request?.generation_profile?.quality??'draft'):quality
     const budget=freshFrom?.budget??{max_shots:maxShots,max_retries_per_shot:maxRetries,max_generation_seconds:maxRuntime,max_output_bytes:maxBytes}
     const requestModel=requestProvider==='gemini'?(geminiConfig?.gemini.model??freshFrom?.request?.planner_model??null):null
     const requestResponseMode=requestProvider==='gemini'?(freshFrom?.request?.planner_response_mode??responseMode):'schema'
     const consentGiven=requestProvider==='gemini'&&(remoteConsent||!!freshFrom?.request?.remote_processing_consent?.confirmed)
-    const input={prompt:(freshFrom?.prompt??prompt).trim(),reference_ids:freshFrom?.reference_ids??selectedRefs,preset:requestPreset,budget,planner_provider:requestProvider,
+    const input={prompt:(freshFrom?.prompt??prompt).trim(),reference_ids:freshFrom?.reference_ids??selectedRefs,preset:requestPreset,quality:requestQuality,budget,planner_provider:requestProvider,
       planner_model:requestModel,planner_response_mode:requestResponseMode,plan_only:requestPlanOnly,
       remote_processing_consent:consentGiven}
     const signature=JSON.stringify(input)
@@ -102,6 +110,7 @@ ${freshFrom?'This creates a new film run and idempotency key using the current F
 
 Maximum authorized shots: ${budget.max_shots}
 Maximum footage at ${requestPreset}: ${preview.maximum_footage_seconds.toFixed(1)} seconds
+Video quality: ${QUALITY_OPTIONS.find(item=>item.value===requestQuality)?.label??requestQuality}
 ${timeEstimate}
 ${sizeEstimate}
 Generation time cap: ${Math.ceil(budget.max_generation_seconds/60)} minutes
@@ -168,6 +177,7 @@ Technical checks do not approve creative quality; the run will stop for creative
       {!project?<form className="create-film-quick-project" onSubmit={event=>{event.preventDefault();if(!onCreateProject||!newProjectName.trim())return;setBusy(true);setError('');void onCreateProject(newProjectName.trim()).then(()=>setNewProjectName('')).catch(e=>setError(e instanceof Error?e.message:String(e))).finally(()=>setBusy(false))}}><label className="setting-field"><span>NAME YOUR FIRST PROJECT</span><input value={newProjectName} maxLength={120} onChange={event=>setNewProjectName(event.target.value)} placeholder="e.g. My first film"/></label><button className="button primary" type="submit" disabled={busy||!newProjectName.trim()||!onCreateProject}><WandSparkles size={15}/> Create project</button><button className="text-button" type="button" onClick={()=>onNavigate('Projects')}>Pick an existing project</button></form>:<>
         <div className="create-film-project"><Film size={15}/><span>Project</span><b>{project.name}</b></div>
         <label className="setting-field create-film-prompt"><span>STORY PROMPT</span><textarea maxLength={20000} value={prompt} onChange={event=>setPrompt(event.target.value)} placeholder="What story should the film tell? Describe the characters, what changes, and how it ends."/><small>{prompt.length.toLocaleString()} / 20,000</small></label>
+        <div className="create-film-planner-choice create-film-quality"><div><div className="section-kicker">VIDEO QUALITY</div><p>Higher quality looks sharper but each shot takes longer to generate.</p></div>{QUALITY_OPTIONS.map(option=><label key={option.value}><input type="radio" name="film-quality" checked={quality===option.value} onChange={()=>setQuality(option.value)}/> {option.label} <small>{option.detail}</small></label>)}</div>
         <div className="create-film-planner-choice"><div><div className="section-kicker">STORY PLANNING PROVIDER</div><p>Gemini API is recommended for general stories. Your selected planner only creates the structured plan; all video work remains local.</p></div><label><input type="radio" name="story-planner-provider" checked={plannerProvider==='gemini'} onChange={()=>{setPlannerProvider('gemini');setRemoteConsent(false)}}/> Gemini API <small>Recommended · cloud</small></label><label><input type="radio" name="story-planner-provider" checked={plannerProvider==='local'} onChange={()=>{setPlannerProvider('local');setRemoteConsent(false)}}/> Local planner <small>Optional · offline</small></label></div>
         {plannerProvider==='gemini'&&<><GeminiConnectionPanel compact onConfig={setGeminiConfig}/><label className="gemini-consent"><input type="checkbox" checked={remoteConsent} onChange={event=>setRemoteConsent(event.target.checked)}/><span>I opt in to send the disclosed prompt and minimal planning metadata to Google Gemini for this film run. No reference image or generated media is uploaded.</span></label>{geminiConfig?.gemini.status!=='connected'&&<div className="model-caution"><AlertTriangle size={13}/>{geminiConfig?.gemini.detail??'Connect and test a Gemini API key before planning. No cloud request is made automatically.'}</div>}</>}
         <details className="create-film-advanced"><summary>References and generation budget</summary>

@@ -1,4 +1,23 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
+
+Quality = Literal["draft", "better", "best"]
+
+# Draft keeps the configured profile. Better/Best render ~1.8x the pixels (each side x4/3, kept
+# on LTX's 64 px two-stage grid); Best also swaps the distilled sampler for the dev model + CFG.
+QUALITY_LEVELS: dict[str, dict] = {
+    "draft": {"scale": 1.0, "distilled_two_stage": None},
+    "better": {"scale": 4 / 3, "distilled_two_stage": True},
+    "best": {"scale": 4 / 3, "distilled_two_stage": False},
+}
+
+
+def quality_dimensions(width: int, height: int, quality: str) -> tuple[int, int]:
+    scale = QUALITY_LEVELS[quality]["scale"]
+    if scale == 1.0:
+        return width, height
+    return tuple(max(64, round(side * scale / 64) * 64) for side in (width, height))
 
 
 SCORPION_FROG_MOONLIT_RIVERBANK_PROMPT = (
@@ -46,6 +65,7 @@ class GenerationSettings(BaseModel):
     reference_image: str | None = None
     output_location: str | None = None
     preset: str = "Standard"
+    quality: Quality = "draft"
 
     @model_validator(mode="after")
     def validate_resolution(self):

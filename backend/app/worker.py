@@ -132,7 +132,8 @@ class LocalWorker:
                 try:
                     self.db.add_benchmark(payload["preset"], payload["frames"], payload["fps"],
                                           round(payload["frames"] / payload["fps"], 2),
-                                          elapsed_seconds=round(time.monotonic() - started, 2))
+                                          elapsed_seconds=round(time.monotonic() - started, 2),
+                                          quality=payload.get("quality", "draft"))
                 except Exception as exc:
                     self.db.event(job_id, "warning", "Video completed, but benchmark history could not be updated: " + str(exc))
             self.db.event(job_id, "info", "Job completed; verified output: " + result_path)
