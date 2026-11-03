@@ -18,6 +18,9 @@ type Shot = {
   transition_in_frames: number;
   transition_out_frames: number;
   trim_start_frames?: number;
+  has_audio?: boolean;
+  audio_fade_in_frames?: number;
+  audio_fade_out_frames?: number;
   caption: string;
 };
 type Manifest = {
@@ -38,8 +41,15 @@ const ShotClip: React.FC<{ shot: Shot; isLast: boolean }> = ({shot, isLast}) => 
   const fadeOut = isLast && shot.transition_out_frames
     ? interpolate(frame, [shot.frames - shot.transition_out_frames, shot.frames], [1, 0], {extrapolateLeft: 'clamp'})
     : 1;
+  const audioIn = shot.audio_fade_in_frames ?? 0;
+  const audioOut = shot.audio_fade_out_frames ?? 0;
+  // Ramps both sides of each join so neighbouring shots' sound blends instead of jumping.
+  const volume = (f: number) => Math.min(
+    audioIn ? interpolate(f, [0, audioIn], [0, 1], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'}) : 1,
+    audioOut ? interpolate(f, [shot.frames - audioOut, shot.frames], [1, 0], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'}) : 1,
+  );
   return <AbsoluteFill style={{opacity: Math.min(fadeIn, fadeOut), backgroundColor: '#05070b'}}>
-    <OffthreadVideo src={staticFile(shot.src)} startFrom={shot.trim_start_frames ?? 0} muted style={{width: '100%', height: '100%', objectFit: 'cover'}} />
+    <OffthreadVideo src={staticFile(shot.src)} startFrom={shot.trim_start_frames ?? 0} muted={!shot.has_audio} volume={volume} style={{width: '100%', height: '100%', objectFit: 'cover'}} />
     {shot.caption.trim() && <div style={{position: 'absolute', left: '7%', right: '7%', bottom: '8%', padding: '18px 22px',
       color: 'white', backgroundColor: 'rgba(5,8,14,.68)', borderRadius: 12, fontFamily: 'Arial, sans-serif',
       fontSize: 34, lineHeight: 1.25, textAlign: 'center', textShadow: '0 2px 8px #000'}}>{shot.caption}</div>}

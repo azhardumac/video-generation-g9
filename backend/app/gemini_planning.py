@@ -55,6 +55,8 @@ class _CreativeShot(_CreativeOutlineModel):
     reference_ids: list[str] = Field(default_factory=list, max_length=1,
         description="Only approved IDs already assigned to a character present in this shot; otherwise [].")
     caption: str = Field(default="", max_length=1000)
+    sound: str = Field(default="", max_length=400,
+        description="Ambience and sound effects heard in this shot when audio_generation is available; otherwise ''.")
     transition_after: str = Field(default="cut", pattern="^(cut|dissolve|fade)$")
 
 
@@ -273,7 +275,7 @@ def gemini_story_schema(shot_budget: int = MAX_STORY_SCENES) -> dict[str, Any]:
                 "prompt": string(), "framing": string(), "character_layout": string(),
                 "characters_present": array(string(), 20, 1),
                 "expected_character_count": {"type": "integer", "minimum": 1, "maximum": 20},
-                "reference_ids": array(string(), 1), "caption": string(),
+                "reference_ids": array(string(), 1), "caption": string(), "sound": string(),
                 "transition_after": {"type": "string", "enum": ["cut", "dissolve", "fade"]}},
                ["id", "sequence", "title", "beat", "prompt", "framing", "character_layout", "characters_present",
                 "expected_character_count", "reference_ids", "caption", "transition_after"])
@@ -311,7 +313,7 @@ _KNOWN_OUTPUT_FIELDS = {
     "video_continuation_requested", "ic_lora_requested", "id", "name", "identity", "distinguishing_traits",
     "reference_ids", "description", "scale", "continuity_requirements", "sequence", "story_beat",
     "location_id", "location_name", "characters_present", "visual_description", "framing", "character_layout",
-    "expected_character_count", "shots", "beat", "prompt", "caption", "transition_after",
+    "expected_character_count", "shots", "beat", "prompt", "caption", "sound", "transition_after",
 }
 
 
@@ -431,7 +433,7 @@ def _compile_creative_outline(text: str, request: dict[str, Any]) -> StoryPlan:
                 "title": shot.title, "beat": shot.beat, "prompt": shot.prompt, "framing": shot.framing,
                 "character_layout": shot.character_layout, "characters_present": shot_character_ids,
                 "expected_character_count": len(shot_character_ids), "reference_ids": shot.reference_ids,
-                "caption": shot.caption, "transition_after": shot.transition_after})
+                "caption": shot.caption, "sound": shot.sound, "transition_after": shot.transition_after})
         scenes.append({"id": f"scene-{scene_index + 1}", "sequence": scene_index, "title": scene.title,
             "story_beat": scene.story_beat, "location_id": location_id, "characters_present": scene_character_ids,
             "visual_description": scene.visual_description, "framing": scene.framing,
@@ -820,6 +822,8 @@ class GeminiStoryPlanner(StoryPlanner):
         prompt += ("causal chronology, location scale, visual continuity, camera framing, and exactly described character layout. "
                    "Use only supplied opaque reference IDs; the planner cannot see reference images, names, or paths. Leave references unassigned when their identity is ambiguous. "
                    "Do not invent approvals. Keep within the exact shot budget, preset, and local model capabilities. "
+                   "When model_capabilities.audio_generation is true, give each shot a short sound line naming the ambience and sound effects heard in it "
+                   "(for example 'rushing current, one frog croak'); otherwise leave sound empty. "
                    "Return only the JSON object specified for this response mode.\nINPUT_JSON:\n" + input_json)
         if request.get("response_mode") == "json_only":
             contract = json.dumps(gemini_creative_schema(int(request.get("shot_budget", 1))),

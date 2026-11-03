@@ -64,13 +64,14 @@ class FakePlanner:
         return self.value
 
 
-def create_run(db, project, max_shots=4, max_seconds=3600, max_output_bytes=8 * 1024**3, quality=None):
+def create_run(db, project, max_shots=4, max_seconds=3600, max_output_bytes=8 * 1024**3, quality=None, sound=None):
     request = {"prompt": "A lighthouse keeper guides a lost boat home before a storm.",
         "reference_ids": [], "reference_categories": [], "preset": "Short",
         "budget": {"max_shots": max_shots, "max_retries_per_shot": 1,
                    "max_generation_seconds": max_seconds, "max_output_bytes": max_output_bytes},
         "generation_profile": {"frames": 49, "fps": 24, "width": 448, "height": 768,
-                               **({"quality": quality} if quality else {})},
+                               **({"quality": quality} if quality else {}),
+                               **({"audio": sound} if sound is not None else {})},
         "authorization": {"confirmed": True, "scope": "bounded local run"}}
     return FilmOrchestrator(db).create(project["id"], "test-key", request, authorized=True)
 
@@ -329,18 +330,50 @@ def test_direct_jobs_are_benchmarked_as_draft_even_with_a_saved_quality(tmp_path
 
 
 @pytest.mark.parametrize(("quality", "distilled"), [("best", False), ("better", True), ("draft", True)])
-def test_storyboard_regenerate_keeps_the_film_run_quality(tmp_path, monkeypatch, quality, distilled):
+def test_storyboard_regenerate_keeps_the_film_run_quality_and_sound(tmp_path, monkeypatch, quality, distilled):
     from app import main
 
     db, project, settings = make_db(tmp_path)
     engine = FilmRunEngine(db, settings, planner=FakePlanner(plan_data()), ltx_ready=lambda: True)
-    run = create_run(db, project, quality=quality)
+    run = create_run(db, project, quality=quality, sound=True)
     _queue_single_shot(engine)
     storyboard_id = db.get_film_run(run["id"])["storyboard_id"]
     monkeypatch.setattr(main, "db", db)
-    payload = {"quality": "draft", "distilled_two_stage": True}
-    main._apply_film_run_quality(payload, storyboard_id)
-    assert payload == {"quality": quality, "distilled_two_stage": distilled}
-    untouched = {"quality": "draft", "distilled_two_stage": True}
-    main._apply_film_run_quality(untouched, "not-a-film-storyboard")
-    assert untouched == {"quality": "draft", "distilled_two_stage": True}
+    payload = {"quality": "draft", "distilled_two_stage": True, "audio": False}
+    main._apply_film_run_profile(payload, storyboard_id)
+    assert payload == {"quality": quality, "distilled_two_stage": distilled, "audio": True}
+    untouched = {"quality": "draft", "distilled_two_stage": True, "audio": False}
+    main._apply_film_run_profile(untouched, "not-a-film-storyboard")
+    assert untouched == {"quality": "draft", "distilled_two_stage": True, "audio": False}
+
+
+def test_sound_film_run_generates_audio_and_puts_the_sound_line_in_both_prompts(tmp_path):
+    from app.adapters import build_ltx_command
+
+    db, project, settings = make_db(tmp_path)
+    plan = plan_data()
+    plan["audio_requested"] = True
+    plan["scenes"][0]["shots"][0]["sound"] = "foghorn, waves against the rocks"
+    planner = FakePlanner(plan)
+    engine = FilmRunEngine(db, settings, planner=planner, ltx_ready=lambda: True)
+    create_run(db, project, sound=True)
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert payload["audio"] is True
+    assert "Sound: foghorn, waves against the rocks" in payload["prompt"]
+    assert "Sound: foghorn, waves against the rocks" in payload["continuation_prompt"]
+    assert "--no-audio" not in build_ltx_command("ltx", payload, "/out/job.partial.mp4")
+
+
+def test_silent_film_run_drops_the_sound_line_and_mutes_ltx(tmp_path):
+    from app.adapters import build_ltx_command
+
+    db, project, settings = make_db(tmp_path)
+    plan = plan_data()
+    plan["scenes"][0]["shots"][0]["sound"] = "foghorn"
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    create_run(db, project, sound=False)
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert payload["audio"] is False and "Sound:" not in payload["prompt"]
+    assert "--no-audio" in build_ltx_command("ltx", payload, "/out/job.partial.mp4")

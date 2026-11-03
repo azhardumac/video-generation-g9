@@ -99,7 +99,7 @@ class FilmRunEngine:
             "allowed_reference_ids": sorted(selected_ids),
             "shot_budget": budget["max_shots"], "preset": request["preset"],
             "model_capabilities": {"text_to_video": True, "image_to_video": True,
-                "max_reference_images_per_shot": 1, "audio_generation": False,
+                "max_reference_images_per_shot": 1, "audio_generation": self._sound(run),
                 "video_continuation": False, "ic_lora": False,
                 "frames": request.get("generation_profile", {}).get("frames"),
                 "fps": request.get("generation_profile", {}).get("fps")},
@@ -182,8 +182,9 @@ class FilmRunEngine:
 
     def _understand(self, run: dict):
         plan = self._plan(run)
-        if plan.audio_requested or plan.video_continuation_requested or plan.ic_lora_requested:
-            unsupported = [name for name, requested in (("audio", plan.audio_requested),
+        audio_requested = plan.audio_requested and not self._sound(run)
+        if audio_requested or plan.video_continuation_requested or plan.ic_lora_requested:
+            unsupported = [name for name, requested in (("audio", audio_requested),
                 ("video continuation", plan.video_continuation_requested), ("IC-LoRA", plan.ic_lora_requested)) if requested]
             raise PlannerOutputError("The validated plan requires unsupported local capability: " + ", ".join(unsupported) + ". No shot jobs were queued.")
         count = len(plan.ordered_shots)
@@ -241,6 +242,10 @@ class FilmRunEngine:
                                            message=f"Saved validated plan '{storyboard['title']}' with {len(scenes)} scenes; generation is still queued nowhere.")
 
     @staticmethod
+    def _sound(run: dict) -> bool:
+        return bool(run["request"].get("generation_profile", {}).get("audio"))
+
+    @staticmethod
     def _quality(run: dict, profile: dict) -> str:
         quality = run["request"].get("generation_profile", {}).get("quality") or profile.get("quality") or "draft"
         return quality if quality in QUALITY_LEVELS else "draft"
@@ -270,6 +275,7 @@ class FilmRunEngine:
         distilled = QUALITY_LEVELS[quality]["distilled_two_stage"]
         if distilled is None:
             distilled = profile.get("distilled_two_stage", True)
+        sound = self._sound(run)
         style_bible = project.get("style_bible", {})
         style_lines = [f"{key.replace('_', ' ').title()}: {value}" for key, value in style_bible.items() if isinstance(value, str) and value.strip()]
         characters = {item.id: item for item in plan.characters}
@@ -305,6 +311,7 @@ class FilmRunEngine:
                     f"Visual style: {plan.visual_style}",
                     f"Location continuity: {location.name}. {location.description} Scale: {location.scale}",
                     framing,
+                    *([f"Sound: {shot.sound.strip()}"] if sound and shot.sound.strip() else []),
                 ])
                 prompt = "\n".join([
                     continuation_prompt,
@@ -318,7 +325,7 @@ class FilmRunEngine:
                 generation = GenerationSettings.model_validate(profile | {
                     "prompt": prompt, "model": profile.get("model", "dgrauet/ltx-2.3-mlx-q8"),
                     "width": width, "height": height, "distilled_two_stage": distilled, "quality": quality,
-                    "low_ram": profile.get("low_ram", True), "audio": False,
+                    "low_ram": profile.get("low_ram", True), "audio": sound,
                     "seed": film_seed, "reference_image": ref_path,
                     "output_location": str(output), "preset": request["preset"],
                 })
@@ -346,9 +353,9 @@ class FilmRunEngine:
                     "frames_per_shot": frames, "fps": fps, "width": width, "height": height,
                     "approved_reference_ids": sorted(selected),
                     "reference_limit_note": "Shots after the first in each scene start on the previous shot's last frame. Character references are described in prompts but never used as video frames; other references guide shots weakly. Local conditioning does not guarantee identity consistency.",
-                    "creative_quality_status": "pending_manual_review", "audio_available": False,
+                    "creative_quality_status": "pending_manual_review", "audio_available": sound,
                     "model_capabilities": {"text_to_video": True, "image_to_video": True,
-                        "max_reference_images_per_shot": 1, "audio_generation": False,
+                        "max_reference_images_per_shot": 1, "audio_generation": sound,
                         "video_continuation": False, "ic_lora": False},
                     "style_bible_revision": project.get("style_bible_revision", 0), "style_bible_snapshot": style_bible}
         return rows, scene_rows, metadata

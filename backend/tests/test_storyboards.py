@@ -398,3 +398,20 @@ def test_film_batch_running_job_recovers_as_failed_after_database_restart(tmp_pa
     recovered = restarted.get_film_batch(batch["id"])
     assert recovered["status"] == "paused"
     assert recovered["shots"][0]["status"] == "failed"
+
+
+def test_manifest_plays_clip_sound_with_short_fades_at_cuts_and_dissolve_length_fades(tmp_path):
+    shots = []
+    for index, (transition, audio) in enumerate((("cut", True), ("dissolve", True), ("fade", False))):
+        path = tmp_path / f"clip-{index}.mp4"
+        path.write_bytes(b"test-only verified fixture")
+        shots.append({"id": f"shot-{index}", "position": index, "title": f"Shot {index}",
+            "prompt": "Reviewed prompt", "transition_after": transition,
+            "job": {"id": f"job-{index}", "status": "completed", "result_path": str(path), "payload": {"audio": audio},
+                "settings_match": True, "verification_metadata": {"verified_output": {
+                    "width": 448, "height": 768, "fps": 24, "frames": 49}}}})
+    clips = build_composition_manifest({"id": "sound", "revision": 1, "title": "Sound", "shots": shots}, tmp_path)["shots"]
+    assert [clip["has_audio"] for clip in clips] == [True, True, False]
+    assert (clips[0]["audio_fade_in_frames"], clips[0]["audio_fade_out_frames"]) == (0, 3)
+    assert (clips[1]["audio_fade_in_frames"], clips[1]["audio_fade_out_frames"]) == (3, 8)
+    assert (clips[2]["audio_fade_in_frames"], clips[2]["audio_fade_out_frames"]) == (8, 8)

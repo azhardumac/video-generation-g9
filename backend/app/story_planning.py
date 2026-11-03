@@ -57,6 +57,7 @@ class StoryShot(StrictModel):
     expected_character_count: int = Field(ge=1, le=20)
     reference_ids: list[str] = Field(default_factory=list, max_length=1)
     caption: str = Field(default="", max_length=1000)
+    sound: str = Field(default="", max_length=400)
     transition_after: Literal["cut", "dissolve", "fade"] = "cut"
 
 
@@ -222,6 +223,7 @@ class LocalStoryPlanner:
                 "Create a shot count within the supplied shot_budget and choose at most one image reference per shot.",
                 "LTX is independently image-conditioned per shot; references do not guarantee stable identity across shots.",
                 "Use the supplied model_capabilities as authoritative. Do not plan audio, video continuation, IC-LoRA, or multi-image identity conditioning when unavailable.",
+                "When model_capabilities.audio_generation is true, give each shot a short sound line naming the ambience and sound effects heard in it; otherwise leave sound empty.",
             ],
             "input": request,
             "json_schema": StoryPlan.model_json_schema(),

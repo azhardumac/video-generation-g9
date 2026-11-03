@@ -200,6 +200,7 @@ class CreateFilmRunRequest(BaseModel):
     reference_ids: list[str] = Field(default_factory=list, max_length=16)
     preset: str = "Short"
     quality: Quality = "better"
+    sound: bool = True
     budget: FilmRunBudget = Field(default_factory=FilmRunBudget)
     idempotency_key: str = Field(min_length=1, max_length=128)
     initial_confirmation: bool = False
@@ -1601,7 +1602,8 @@ def create_film_run(project_id: str, request: CreateFilmRunRequest):
             "media_uploaded": False} if request.planner_provider == "gemini" and request.remote_processing_consent else {}),
         "preset": request.preset,
         "budget": request.budget.model_dump(),
-        "generation_profile": {"frames": frames, "fps": fps, "width": 448, "height": 768, "quality": request.quality},
+        "generation_profile": {"frames": frames, "fps": fps, "width": 448, "height": 768, "quality": request.quality,
+                               "audio": request.sound},
         "authorization": ({"confirmed": True, "scope": ("Gemini story planning only; no LTX generation until separately authorized" if request.plan_only else "local LTX jobs within the declared shot/time/storage budget; Gemini planning explicitly opted in" if request.planner_provider == "gemini" else "local LTX jobs within the declared shot/time/storage budget")}
                           if request.initial_confirmation else {}),
     }
@@ -1981,7 +1983,8 @@ def _job_matches_shot(job: dict, shot: dict, storyboard: dict, batch_id: str) ->
         payload.get("film_batch_id") == batch_id and
         db.generation_settings_snapshot(payload) == db.generation_settings_snapshot(shot) and
         payload.get("reference_image") == expected_payload.get("reference_image") and
-        payload.get("frames") == expected_payload.get("frames") and payload.get("audio") is False
+        payload.get("frames") == expected_payload.get("frames") and
+        bool(payload.get("audio")) == bool(expected_payload.get("audio"))
     )
 
 
@@ -2194,8 +2197,6 @@ def generate_film(storyboard_id: str, request: GenerateFilmRequest):
     project = _project(story["project_id"])
     for shot in story["shots"]:
         payload = shot.get("generation_payload") or {}
-        if payload.get("audio"):
-            raise HTTPException(409, f"Shot '{shot['title']}' requests audio, but no audio capability is configured")
         if payload.get("prompt") != shot["prompt"]:
             raise HTTPException(409, f"Shot '{shot['title']}' saved prompt differs from its generation payload; save the shot plan again")
         reference_ids = shot.get("reference_ids") or []
@@ -2420,9 +2421,13 @@ def archive_storyboard(storyboard_id: str):
         raise HTTPException(409, str(exc)) from exc
 
 
-def _apply_film_run_quality(payload: dict, storyboard_id: str):
-    """A shot regenerated from a film run's storyboard keeps that run's sampler; its size is already on the shot."""
-    quality = db.film_run_quality(storyboard_id)
+def _apply_film_run_profile(payload: dict, storyboard_id: str):
+    """A shot regenerated from a film run's storyboard keeps that run's sampler and sound; its size is already on the shot."""
+    profile = db.film_run_profile(storyboard_id)
+    if profile is None:
+        return
+    payload["audio"] = bool(profile.get("audio"))
+    quality = profile.get("quality") or "draft"
     if quality not in QUALITY_LEVELS:
         return
     distilled = QUALITY_LEVELS[quality]["distilled_two_stage"]
@@ -2459,7 +2464,7 @@ def queue_storyboard_shot(storyboard_id: str, shot_id: str, request: ShotGenerat
                          "width": width, "height": height, "output_location": output_location,
                          "seed": shot["seed"], "reference_image": str(reference) if reference else None})
     payload = _generation_payload(config, project["id"], fps_override=fps)
-    _apply_film_run_quality(payload, storyboard_id)
+    _apply_film_run_profile(payload, storyboard_id)
     shot_settings = {"style_context": style_context, "style_bible_revision": story.get("style_bible_revision", 0),
                      "width": width, "height": height, "fps": fps, "output_location": payload["output_location"],
                      "framing": shot.get("framing", ""), "aspect_ratio": project.get("aspect_ratio")}

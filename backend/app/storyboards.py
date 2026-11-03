@@ -50,6 +50,9 @@ class StoryboardUpdate(BaseModel):
         return self
 
 
+AUDIO_CUT_FADE_FRAMES = 3
+
+
 def build_composition_manifest(storyboard: dict, public_root: Path, transition_frames: int = 8) -> dict:
     """Build a deterministic portrait timeline from completed, verified shot outputs."""
     public_root = public_root.resolve()
@@ -84,6 +87,7 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
             "frames": frames, "fps": fps, "caption": shot.get("caption", ""),
             "prompt": shot["prompt"], "job_id": job.get("id"),
             "transition_after": shot.get("transition_after", "dissolve"),
+            "has_audio": bool(job.get("payload", {}).get("audio")),
             "continues_previous": bool((job.get("verification_metadata") or {}).get("continued_from_previous_shot")),
             "settings_snapshot": job.get("settings_snapshot") or {
                 "prompt": job.get("payload", {}).get("prompt", ""),
@@ -117,6 +121,10 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
             clip["transition_out_frames"] = min(transition_frames, clip["frames"] // 4)
         else:
             clip["transition_out_frames"] = 0
+        # Audio follows a dissolve's overlap; on a hard cut both sides get a short fade so the join doesn't click.
+        cut_fade = min(AUDIO_CUT_FADE_FRAMES, clip["frames"] // 4)
+        clip["audio_fade_in_frames"] = clip["transition_in_frames"] or (cut_fade if index else 0)
+        clip["audio_fade_out_frames"] = clip["transition_out_frames"] or (cut_fade if index + 1 < len(clips) else 0)
     width, height, fps = canvas
     return {
         "schema_version": 1,
