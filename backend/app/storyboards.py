@@ -108,7 +108,11 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
         # A chained shot's first frame duplicates the previous clip's last frame; drop it on hard cuts.
         continues_previous = clip.pop("continues_previous")
         clip["trim_start_frames"] = 1 if index and continues_previous and previous_transition in ("cut", "none") else 0
-        clip["frames"] -= clip["trim_start_frames"]
+        # LTX audio ends ~30 ms before its video. Dropping the last frame before a hard cut keeps each clip's
+        # sound covering its whole slot, so cuts stay gapless without shifting sound off its picture.
+        cut_out = index + 1 < len(clips) and clip.get("transition_after", "dissolve") in ("cut", "none")
+        clip["trim_end_frames"] = 1 if clip["has_audio"] and cut_out else 0
+        clip["frames"] -= clip["trim_start_frames"] + clip["trim_end_frames"]
         overlap = min(transition_frames, previous_frames // 4, clip["frames"] // 4) if index and previous_transition not in ("cut", "none") else 0
         clip["transition_in_frames"] = overlap
         clip["start_frame"] = cursor - overlap
@@ -121,12 +125,9 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
             clip["transition_out_frames"] = min(transition_frames, clip["frames"] // 4)
         else:
             clip["transition_out_frames"] = 0
-        # LTX audio ends ~30 ms before its video, so on a hard cut the next shot's sound starts one frame early
-        # (in sync for chained shots, whose trimmed duplicate frame it covers) and both sides get a short fade.
         cut_in = bool(index) and not clip["transition_in_frames"]
         cut_out = index + 1 < len(clips) and not clip["transition_out_frames"]
         cut_fade = min(AUDIO_CUT_FADE_FRAMES, clip["frames"] // 4)
-        clip["audio_lead_frames"] = 1 if cut_in else 0
         clip["audio_fade_in_frames"] = cut_fade if cut_in else clip["transition_in_frames"]
         clip["audio_fade_out_frames"] = cut_fade if cut_out else clip["transition_out_frames"]
     width, height, fps = canvas

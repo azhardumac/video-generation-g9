@@ -20,7 +20,6 @@ type Shot = {
   transition_out_frames: number;
   trim_start_frames?: number;
   has_audio?: boolean;
-  audio_lead_frames?: number;
   audio_fade_in_frames?: number;
   audio_fade_out_frames?: number;
   caption: string;
@@ -57,14 +56,10 @@ const ramp = (f: number, length: number, fadeIn: number, fadeOut: number) => Mat
   fadeOut && f >= length - fadeOut ? (length - f) / (fadeOut + 1) : 1,
 );
 
-const ShotAudio: React.FC<{shot: Shot}> = ({shot}) => {
-  const lead = shot.audio_lead_frames ?? 0;
-  const length = shot.frames + lead;
-  return <Sequence from={shot.start_frame - lead} durationInFrames={length}>
-    <Audio src={staticFile(shot.src)} startFrom={Math.max(0, (shot.trim_start_frames ?? 0) - lead)}
-      volume={f => ramp(f, length, shot.audio_fade_in_frames ?? 0, shot.audio_fade_out_frames ?? 0)}/>
-  </Sequence>;
-};
+const ShotAudio: React.FC<{shot: Shot}> = ({shot}) => <Sequence from={shot.start_frame} durationInFrames={shot.frames}>
+  <Audio src={staticFile(shot.src)} startFrom={shot.trim_start_frames ?? 0}
+    volume={f => ramp(f, shot.frames, shot.audio_fade_in_frames ?? 0, shot.audio_fade_out_frames ?? 0)}/>
+</Sequence>;
 
 const StoryboardTimeline: React.FC<{manifest: Manifest}> = ({manifest}) => <AbsoluteFill style={{backgroundColor: '#05070b'}}>
   {manifest.shots.map((shot, index) => <Sequence key={shot.shot_id} from={shot.start_frame} durationInFrames={shot.frames}>
