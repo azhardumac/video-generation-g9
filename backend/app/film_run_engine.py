@@ -197,7 +197,7 @@ class FilmRunEngine:
         quality = self._quality(run, self.db.get_setting(f"generation:{run['project_id']}") or self.db.get_setting("generation") or {})
         benchmark = next((item for item in self.db.benchmarks()
                           if item["frames"] == frames and item["fps"] == fps and item.get("quality", "draft") == quality
-                          and item.get("elapsed_seconds") is not None), None)
+                          and bool(item.get("audio")) == self._sound(run) and item.get("elapsed_seconds") is not None), None)
         checkpoint["estimated_generation_seconds"] = round(float(benchmark["elapsed_seconds"]) * count) if benchmark else None
         if checkpoint["estimated_generation_seconds"] is not None and checkpoint["estimated_generation_seconds"] > run["budget"]["max_generation_seconds"]:
             raise FilmRunTransitionError("The measured local generation estimate exceeds this run's time budget")

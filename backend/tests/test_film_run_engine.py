@@ -377,3 +377,14 @@ def test_silent_film_run_drops_the_sound_line_and_mutes_ltx(tmp_path):
     payload = db.list_jobs(project_id=project["id"])[0]["payload"]
     assert payload["audio"] is False and "Sound:" not in payload["prompt"]
     assert "--no-audio" in build_ltx_command("ltx", payload, "/out/job.partial.mp4")
+
+
+def test_sound_run_time_estimate_ignores_silent_benchmarks(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    db.add_benchmark("Short", 49, 24, 2.04, elapsed_seconds=99999, quality="better", audio=False)
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan_data()), ltx_ready=lambda: True)
+    create_run(db, project, quality="better", sound=True)
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert payload["audio"] is True
+    assert db.benchmarks()[0]["audio"] == 0

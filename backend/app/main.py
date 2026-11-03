@@ -1187,7 +1187,7 @@ def preview_film_run(project_id: str, request: CreateFilmRunRequest):
     frames, fps = _preset_frames(request.preset)
     benchmark = next((row for row in db.benchmarks()
                       if row["frames"] == frames and row["fps"] == fps and row.get("quality", "draft") == request.quality
-                      and row["elapsed_seconds"] is not None), None)
+                      and bool(row.get("audio")) == request.sound and row["elapsed_seconds"] is not None), None)
     samples = []
     for job in db.list_jobs(project_id=project_id, limit=1000):
         payload = job.get("payload", {})
