@@ -421,7 +421,19 @@ def test_film_run_chains_only_shots_that_keep_the_framing_and_names_each_shots_c
     assert [p["continue_from_shot_id"] is not None for p in payloads] == [False, True, False]
     assert [p["reference_conditioning"] for p in payloads] == ["text-only", "previous-shot", "text-only"]
     assert payloads[1]["continue_from_shot_id"] == payloads[0]["shot_id"]
-    cast = "On screen: only one Mira; no other characters, duplicates or animals."
+    cast = "On screen: only one Mira; no additional characters or creatures, and no duplicates."
     assert cast in payloads[2]["continuation_prompt"] and cast in payloads[2]["prompt"]
     assert "one Noah" not in payloads[2]["prompt"]
     assert "Scene character layout" not in payloads[0]["prompt"]
+
+
+def test_film_run_cuts_instead_of_chaining_when_a_character_leaves_the_shot(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    plan = plan_data(second_shot=True)
+    second = plan["scenes"][0]["shots"][1]
+    second |= {"framing": "Wide shot from the same hill", "characters_present": ["keeper"], "expected_character_count": 1}
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    create_run(db, project)
+    _queue_single_shot(engine)
+    payloads = sorted((job["payload"] for job in db.list_jobs(project_id=project["id"])), key=lambda p: p["shot_order"])
+    assert [p["continue_from_shot_id"] for p in payloads] == [None, None]

@@ -304,11 +304,13 @@ class FilmRunEngine:
                                "transition_after": scene.shots[-1].transition_after})
             location = locations[scene.location_id]
             previous_shot_id = previous_framing = None
+            previous_cast: set[str] = set()
             for shot in scene.shots:
                 # A clip that starts on the previous clip's last frame keeps its composition, so only
-                # chain shots that keep the framing; a change of framing is a real cut.
+                # chain shots that keep the framing and everyone on screen; anything else is a real cut.
                 framing_class = _framing_class(shot.framing)
-                continue_from = previous_shot_id if framing_class == previous_framing else None
+                continue_from = (previous_shot_id if framing_class == previous_framing
+                                 and previous_cast <= set(shot.characters_present) else None)
                 reference_id = shot.reference_ids[0] if shot.reference_ids else None
                 ref_path = reference_paths.get(reference_id) if reference_id else None
                 shot_id = str(uuid5(UUID(run["id"]), f"shot:{shot.id}"))
@@ -321,7 +323,7 @@ class FilmRunEngine:
                                   for cid in shot.characters_present]
                 framing = "Shot framing: " + shot.framing + ". Shot character layout: " + shot.character_layout
                 cast = ("On screen: only " + ", ".join(f"one {characters[cid].name}" for cid in shot.characters_present)
-                        + "; no other characters, duplicates or animals.")
+                        + "; no additional characters or creatures, and no duplicates.")
                 # A shot the worker chains inherits identity and style from its first frame; a short
                 # action-led prompt keeps LTX from freezing on that frame.
                 continuation_prompt = "\n".join([
@@ -355,7 +357,7 @@ class FilmRunEngine:
                     "reference_anchors": anchors, "reference_as_frame": False, "continue_from_shot_id": continue_from,
                     "continuation_prompt": continuation_prompt,
                     "reference_id": reference_id, "preflight_warnings": []}
-                previous_shot_id, previous_framing = shot_id, framing_class
+                previous_shot_id, previous_framing, previous_cast = shot_id, framing_class, set(shot.characters_present)
                 rows.append({"id": shot_id, "scene_title": saved_scene_title, "title": shot.title,
                     "prompt": prompt, "visual_description": shot.beat, "reference_image": ref_path,
                     "reference_ids": [reference_id] if reference_id else [], "preset": request["preset"],
