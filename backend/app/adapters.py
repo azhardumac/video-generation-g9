@@ -123,7 +123,13 @@ async def measure_audio_mean_db(video: str, settings: Settings) -> float | None:
     process = await asyncio.create_subprocess_exec(
         ffmpeg, "-hide_banner", "-nostats", "-i", video, "-vn", "-af", "volumedetect", "-f", "null", "-",
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    _, stderr = await process.communicate()
+    try:
+        _, stderr = await process.communicate()
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
     match = re.search(r"mean_volume:\s*(-?[0-9.]+) dB", stderr.decode(errors="replace"))
     return float(match.group(1)) if process.returncode == 0 and match else None
 
