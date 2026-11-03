@@ -115,8 +115,8 @@ def _ffmpeg_executable(settings: Settings) -> str | None:
     return str(sibling) if sibling and sibling.is_file() else shutil.which("ffmpeg")
 
 
-async def measure_audio_mean_db(video: str, settings: Settings) -> float | None:
-    """Mean audio level in dBFS, used to even out background sound between stitched shots."""
+async def measure_audio_levels(video: str, settings: Settings) -> dict[str, float] | None:
+    """Mean and peak audio level in dBFS, used to even out background sound between stitched shots."""
     ffmpeg = _ffmpeg_executable(settings)
     if not ffmpeg:
         return None
@@ -130,8 +130,12 @@ async def measure_audio_mean_db(video: str, settings: Settings) -> float | None:
             process.kill()
             await process.wait()
         raise
-    match = re.search(r"mean_volume:\s*(-?[0-9.]+) dB", stderr.decode(errors="replace"))
-    return float(match.group(1)) if process.returncode == 0 and match else None
+    text = stderr.decode(errors="replace")
+    mean = re.search(r"mean_volume:\s*(-?[0-9.]+) dB", text)
+    peak = re.search(r"max_volume:\s*(-?[0-9.]+) dB", text)
+    if process.returncode or not mean or not peak:
+        return None
+    return {"mean_db": float(mean.group(1)), "peak_db": float(peak.group(1))}
 
 
 async def extract_last_frame(video: str, image: Path, settings: Settings) -> Path:
@@ -220,7 +224,7 @@ class LTXAdapter:
                 exc.partial_output = str(partial)
             raise
         if payload.get("audio"):
-            metadata["audio_mean_db"] = await measure_audio_mean_db(str(partial), self.settings)
+            metadata["audio_levels"] = await measure_audio_levels(str(partial), self.settings)
         os.replace(partial, output)
         await on_progress(95, "Verified expected dimensions, frame rate, and frame count")
         return {"output_path": str(output), "metadata": metadata, "exit_code": 0}

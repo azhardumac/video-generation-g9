@@ -251,7 +251,7 @@ def test_ffprobe_checks_resolution_rate_and_exact_frame_count(tmp_path, monkeypa
     asyncio.run(run())
 
 
-def test_measure_audio_mean_db_reads_volumedetect_and_tolerates_missing_audio(monkeypatch, tmp_path):
+def test_measure_audio_levels_reads_volumedetect_and_tolerates_missing_audio(monkeypatch, tmp_path):
     from app import adapters
 
     class FakeProcess:
@@ -261,7 +261,8 @@ def test_measure_audio_mean_db_reads_volumedetect_and_tolerates_missing_audio(mo
         async def communicate(self):
             return b"", self.stderr_text
 
-    outputs = iter([(b"[Parsed_volumedetect_0] mean_volume: -37.4 dB\n", 0), (b"Output file does not contain any stream\n", 1)])
+    outputs = iter([(b"[Parsed_volumedetect_0] mean_volume: -37.4 dB\n[Parsed_volumedetect_0] max_volume: -4.2 dB\n", 0),
+                    (b"Output file does not contain any stream\n", 1)])
 
     async def fake_create(*args, **kwargs):
         return FakeProcess(*next(outputs))
@@ -269,5 +270,5 @@ def test_measure_audio_mean_db_reads_volumedetect_and_tolerates_missing_audio(mo
     monkeypatch.setattr(adapters, "_ffmpeg_executable", lambda _settings: "ffmpeg")
     monkeypatch.setattr(adapters.asyncio, "create_subprocess_exec", fake_create)
     settings = Settings(_env_file=None, allowed_path_roots=str(tmp_path))
-    assert asyncio.run(adapters.measure_audio_mean_db("clip.mp4", settings)) == -37.4
-    assert asyncio.run(adapters.measure_audio_mean_db("clip.mp4", settings)) is None
+    assert asyncio.run(adapters.measure_audio_levels("clip.mp4", settings)) == {"mean_db": -37.4, "peak_db": -4.2}
+    assert asyncio.run(adapters.measure_audio_levels("clip.mp4", settings)) is None

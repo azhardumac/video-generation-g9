@@ -54,6 +54,7 @@ AUDIO_CUT_FADE_FRAMES = 2
 AUDIO_LEVEL_MATCH = 0.5
 AUDIO_MAX_GAIN_DB = 12.0
 AUDIO_SILENCE_DB = -70.0
+AUDIO_PEAK_CEILING_DB = -1.0
 
 
 def build_composition_manifest(storyboard: dict, public_root: Path, transition_frames: int = 8) -> dict:
@@ -91,7 +92,7 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
             "prompt": shot["prompt"], "job_id": job.get("id"),
             "transition_after": shot.get("transition_after", "dissolve"),
             "has_audio": bool(job.get("payload", {}).get("audio")),
-            "audio_mean_db": (job.get("verification_metadata") or {}).get("audio_mean_db"),
+            "audio_levels": (job.get("verification_metadata") or {}).get("audio_levels") or {},
             "continues_previous": bool((job.get("verification_metadata") or {}).get("continued_from_previous_shot")),
             "settings_snapshot": job.get("settings_snapshot") or {
                 "prompt": job.get("payload", {}).get("prompt", ""),
@@ -137,14 +138,19 @@ def build_composition_manifest(storyboard: dict, public_root: Path, transition_f
         clip["audio_fade_out_frames"] = cut_fade if cut_out else clip["transition_out_frames"]
     # Bring each shot's sound halfway to the film's median level: background stays even across cuts,
     # while deliberately loud or quiet moments keep some of their contrast.
+    measured = {}
     for clip in clips:
-        if clip["audio_mean_db"] is not None and clip["audio_mean_db"] < AUDIO_SILENCE_DB:
-            clip["audio_mean_db"] = None
-    levels = sorted(clip["audio_mean_db"] for clip in clips if clip["has_audio"] and clip["audio_mean_db"] is not None)
-    median = (levels[(len(levels) - 1) // 2] + levels[len(levels) // 2]) / 2 if levels else None
+        levels = clip.pop("audio_levels")
+        if clip["has_audio"] and levels.get("mean_db") is not None and levels["mean_db"] >= AUDIO_SILENCE_DB:
+            measured[clip["shot_id"]] = levels
+    means = sorted(levels["mean_db"] for levels in measured.values())
+    median = (means[(len(means) - 1) // 2] + means[len(means) // 2]) / 2 if means else None
     for clip in clips:
-        level = clip.pop("audio_mean_db")
-        gain = 0.0 if median is None or level is None or not clip["has_audio"] else (median - level) * AUDIO_LEVEL_MATCH
+        levels = measured.get(clip["shot_id"])
+        gain = 0.0 if median is None or levels is None else (median - levels["mean_db"]) * AUDIO_LEVEL_MATCH
+        # Never boost a clip's loudest moment above AUDIO_PEAK_CEILING_DB, so a quiet shot with a splash doesn't clip.
+        if levels and levels.get("peak_db") is not None:
+            gain = min(gain, AUDIO_PEAK_CEILING_DB - levels["peak_db"])
         clip["audio_gain_db"] = round(max(-AUDIO_MAX_GAIN_DB, min(AUDIO_MAX_GAIN_DB, gain)), 1)
     width, height, fps = canvas
     return {

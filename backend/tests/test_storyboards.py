@@ -435,16 +435,18 @@ def test_manifest_drops_the_last_frame_of_sound_clips_before_hard_cuts_so_sound_
 
 def test_manifest_brings_each_shots_sound_halfway_to_the_films_median_level(tmp_path):
     shots = []
-    for index, (audio, level) in enumerate(((True, -23.0), (True, -45.0), (True, -37.0), (False, None), (True, None),
-                                            (True, -91.0))):
+    for index, (audio, level, peak) in enumerate(((True, -23.0, -3.0), (True, -45.0, -20.0), (True, -37.0, -10.0),
+                                                  (False, None, None), (True, None, None), (True, -91.0, -91.0),
+                                                  (True, -45.0, -2.5))):
         path = tmp_path / f"clip-{index}.mp4"
         path.write_bytes(b"test-only verified fixture")
         shots.append({"id": f"shot-{index}", "position": index, "title": f"Shot {index}",
             "prompt": "Reviewed prompt", "transition_after": "cut",
             "job": {"id": f"job-{index}", "status": "completed", "result_path": str(path), "payload": {"audio": audio},
-                "settings_match": True, "verification_metadata": {"audio_mean_db": level,
+                "settings_match": True, "verification_metadata": {"audio_levels": {"mean_db": level, "peak_db": peak} if level is not None else None,
                     "verified_output": {"width": 576, "height": 1024, "fps": 24, "frames": 49}}}})
     clips = build_composition_manifest({"id": "sound", "revision": 1, "title": "Sound", "shots": shots}, tmp_path)["shots"]
-    # A silent clip (-91 dB) is left alone and does not pull the median down.
-    assert [clip["audio_gain_db"] for clip in clips] == [-7.0, 4.0, 0.0, 0.0, 0.0, 0.0]
-    assert all("audio_mean_db" not in clip for clip in clips)
+    # Median of -23, -45, -37, -45 is -41. A silent clip (-91 dB) is left alone and doesn't pull the median down;
+    # the last clip's +2 dB is capped so its -2.5 dB peak stays under -1 dB.
+    assert [clip["audio_gain_db"] for clip in clips] == [-9.0, 2.0, -2.0, 0.0, 0.0, 0.0, 1.5]
+    assert all("audio_levels" not in clip for clip in clips)
