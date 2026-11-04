@@ -53,6 +53,11 @@ def build_ltx_command(executable: str, payload: dict, output_path: str, referenc
     if payload.get("seed") is not None:
         args += ["--seed", str(payload["seed"])]
     args.append("--distilled" if payload.get("distilled_two_stage") else "--two-stage")
+    if payload.get("negative_prompt"):
+        args += ["--negative-prompt", payload["negative_prompt"]]
+        # The distilled path has no CFG pass; NAG applies the negative prompt inside its cross-attention instead.
+        if payload.get("distilled_two_stage"):
+            args.append("--nag")
     if payload.get("low_ram"):
         args.append("--low-ram")
     if not payload.get("audio"):

@@ -80,6 +80,7 @@ class StoryPlan(StrictModel):
     title: str = Field(min_length=1, max_length=160)
     logline: str = Field(min_length=12, max_length=1000)
     visual_style: str = Field(min_length=12, max_length=1200)
+    lighting: str = Field(default="", max_length=600)
     audio_requested: bool
     video_continuation_requested: bool
     ic_lora_requested: bool

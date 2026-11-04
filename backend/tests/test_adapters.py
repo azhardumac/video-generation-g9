@@ -292,3 +292,12 @@ def test_ltx_command_generates_the_reference_tail_and_trim_keeps_only_the_planne
     metadata = asyncio.run(verify_video(str(clip), settings, {"width": 64, "height": 64, "fps": 24, "frames": 9}))
     assert metadata["verified_output"]["frames"] == 9
     assert not (tmp_path / "clip.trim.mp4").exists()
+
+
+def test_negative_prompt_uses_nag_on_the_distilled_path_and_cfg_otherwise():
+    base = {"prompt": "p", "model": "m", "width": 64, "height": 64, "frames": 9, "fps": 24, "negative_prompt": "music"}
+    fast = build_ltx_command("ltx", base | {"distilled_two_stage": True}, "out.mp4")
+    assert fast[fast.index("--negative-prompt") + 1] == "music" and "--nag" in fast
+    best = build_ltx_command("ltx", base | {"distilled_two_stage": False}, "out.mp4")
+    assert "--negative-prompt" in best and "--nag" not in best
+    assert "--negative-prompt" not in build_ltx_command("ltx", base | {"negative_prompt": None}, "out.mp4")

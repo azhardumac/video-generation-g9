@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import re
 import shutil
 from statistics import median
 from uuid import UUID, uuid5, NAMESPACE_URL
@@ -27,14 +28,45 @@ CHARACTER_REFERENCE_STRENGTH = 0.3
 CHARACTER_REFERENCE_TAIL_FRAMES = 32
 
 
-def reference_anchor_plan(ref_path: str | None, category: str | None, frames: int) -> tuple[list[dict], int]:
-    """Return a hard-cut shot's image anchors and how many frames LTX should generate before trimming to `frames`."""
-    if not ref_path:
-        return [], frames
-    if category == "character":
-        generate = frames + CHARACTER_REFERENCE_TAIL_FRAMES
-        return [{"path": ref_path, "frame_index": generate - 1, "strength": CHARACTER_REFERENCE_STRENGTH, "binding": "guide"}], generate
-    return [{"path": ref_path, "frame_index": 0, "strength": REFERENCE_GUIDE_STRENGTH, "binding": "guide"}], frames
+def reference_anchor_plan(references: list[tuple[str, str | None]], frames: int) -> tuple[list[dict], int]:
+    """Return a hard-cut shot's image anchors and how many frames LTX should generate before trimming to `frames`.
+
+    `references` holds (path, category) pairs: every character in the shot, plus at most one other reference.
+    """
+    characters = [path for path, category in references if category == "character"]
+    others = [path for path, category in references if category != "character"]
+    anchors = [{"path": path, "frame_index": 0, "strength": REFERENCE_GUIDE_STRENGTH, "binding": "guide"} for path in others[:1]]
+    if not characters:
+        return anchors, frames
+    # Each extra character sheet sits one latent (8 frames) earlier, so the tail grows to keep them all cut off.
+    generate = frames + CHARACTER_REFERENCE_TAIL_FRAMES + 8 * (len(characters) - 1)
+    anchors += [{"path": path, "frame_index": generate - 1 - 8 * index, "strength": CHARACTER_REFERENCE_STRENGTH,
+                 "binding": "guide"} for index, path in enumerate(characters)]
+    return anchors, generate
+
+
+# LTX's own default negative prompt asks for speech ("silent or muted audio" is listed as a defect), so film
+# shots use their own: steer away from morphing, extra creatures and burned-in text, and from music and voices.
+FILM_NEGATIVE_PROMPT = ("morphing, melting, warping, deformed body, extra limbs, missing limbs, duplicate characters, "
+                        "extra animals, extra creatures, text, subtitles, captions, letters, watermark, logo, "
+                        "white studio background, blurry, flicker, sudden lighting change, CGI look")
+SOUND_NEGATIVE_PROMPT = ("music, musical score, soundtrack, orchestra, strings, piano, drums, singing, humming, "
+                         "speech, talking, voices, narration, dialogue, whispering")
+_QUOTED = re.compile(r'"[^"]*"|\u201c[^\u201d]*\u201d')
+
+
+def character_identity(character, linked: dict, reference_paths: dict) -> str:
+    """A character's identity line; the notes on its approved sheet win over the planner's guess, which never saw it."""
+    notes = next((linked[ref].get("notes", "").strip() for ref in character.reference_ids
+                  if ref in reference_paths and linked[ref].get("notes", "").strip()), "")
+    if notes:
+        return f"{character.name}: {notes}"
+    return f"{character.name}: {character.identity}; distinguishing traits: " + ", ".join(character.distinguishing_traits)
+
+
+def silent_action(prompt: str) -> str:
+    """Drop quoted lines from a shot prompt; captions carry the dialogue and LTX would otherwise voice it."""
+    return re.sub(r"\s{2,}", " ", _QUOTED.sub("", prompt)).strip()
 
 
 _FRAMING_CLASSES = (("extreme close", "extreme close-up"), ("medium close", "medium close-up"), ("close", "close-up"),
@@ -325,28 +357,35 @@ class FilmRunEngine:
                 framing_class = _framing_class(shot.framing)
                 continue_from = (previous_shot_id if framing_class == previous_framing
                                  and previous_cast <= set(shot.characters_present) else None)
-                reference_id = shot.reference_ids[0] if shot.reference_ids else None
+                # Every character on screen gets its approved sheet, not just the one the planner picked.
+                shot_refs = [ref for cid in shot.characters_present for ref in characters[cid].reference_ids[:1]
+                             if ref in reference_paths and linked[ref].get("category") == "character"]
+                shot_refs += [ref for ref in shot.reference_ids if ref in reference_paths and ref not in shot_refs
+                              and linked[ref].get("category") != "character"][:1]
+                reference_id = shot_refs[0] if shot_refs else None
                 ref_path = reference_paths.get(reference_id) if reference_id else None
                 shot_id = str(uuid5(UUID(run["id"]), f"shot:{shot.id}"))
                 # Chained shots start on the previous clip's last frame (swapped in by the worker) instead.
                 anchors, generate_frames = (([], frames) if continue_from else
-                    reference_anchor_plan(ref_path, linked[reference_id].get("category") if ref_path else None, frames))
+                    reference_anchor_plan([(reference_paths[ref], linked[ref].get("category")) for ref in shot_refs], frames))
                 conditioning = ("previous-shot" if continue_from else "character-tail-guide" if generate_frames > frames
                                 else "guide-image" if anchors else "text-only")
-                identity_lines = [f"{characters[cid].name}: {characters[cid].identity}; distinguishing traits: " + ", ".join(characters[cid].distinguishing_traits)
-                                  for cid in shot.characters_present]
+                identity_lines = [character_identity(characters[cid], linked, reference_paths) for cid in shot.characters_present]
                 framing = "Shot framing: " + shot.framing + ". Shot character layout: " + shot.character_layout
                 cast = ("On screen: only " + ", ".join(f"one {characters[cid].name}" for cid in shot.characters_present)
                         + "; no additional characters or creatures, and no duplicates.")
                 # A shot the worker chains inherits identity and style from its first frame; a short
                 # action-led prompt keeps LTX from freezing on that frame.
                 continuation_prompt = "\n".join([
-                    shot.prompt,
+                    silent_action(shot.prompt) if shot.caption.strip() else shot.prompt,
+                    *(["Characters communicate silently through gesture and expression; nobody speaks aloud."]
+                      if sound and shot.caption.strip() else []),
                     f"Visual style: {plan.visual_style}",
+                    *([f"Lighting and time of day, identical in every shot: {plan.lighting}"] if plan.lighting.strip() else []),
                     f"Location continuity: {location.name}. {location.description} Scale: {location.scale}",
                     framing,
                     cast,
-                    *([f"Sound: {shot.sound.strip()}"] if sound and shot.sound.strip() else []),
+                    *([f"Sound: natural sounds only, {shot.sound.strip()}; no music, no voices."] if sound and shot.sound.strip() else []),
                 ])
                 prompt = "\n".join([
                     continuation_prompt,
@@ -361,6 +400,7 @@ class FilmRunEngine:
                     "width": width, "height": height, "distilled_two_stage": distilled, "quality": quality,
                     "low_ram": profile.get("low_ram", True), "audio": sound,
                     "seed": film_seed, "reference_image": ref_path,
+                    "negative_prompt": FILM_NEGATIVE_PROMPT + (", " + SOUND_NEGATIVE_PROMPT if sound else ""),
                     "output_location": str(output), "preset": request["preset"],
                 })
                 payload = generation.model_dump() | {"frames": frames, "generate_frames": generate_frames, "fps": fps,
@@ -374,7 +414,7 @@ class FilmRunEngine:
                 previous_shot_id, previous_framing, previous_cast = shot_id, framing_class, set(shot.characters_present)
                 rows.append({"id": shot_id, "scene_title": saved_scene_title, "title": shot.title,
                     "prompt": prompt, "visual_description": shot.beat, "reference_image": ref_path,
-                    "reference_ids": [reference_id] if reference_id else [], "preset": request["preset"],
+                    "reference_ids": shot_refs, "preset": request["preset"],
                     "seed": generation.seed, "caption": shot.caption, "dialogue": shot.caption,
                     "characters": [characters[cid].name for cid in shot.characters_present],
                     "framing": shot.framing, "width": width, "height": height, "fps": fps,

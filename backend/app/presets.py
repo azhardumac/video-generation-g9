@@ -62,6 +62,7 @@ class GenerationSettings(BaseModel):
     audio: bool = False
     seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
     prompt: str = Field(default="", max_length=4000)
+    negative_prompt: str | None = Field(default=None, max_length=2000)
     reference_image: str | None = None
     output_location: str | None = None
     preset: str = "Standard"

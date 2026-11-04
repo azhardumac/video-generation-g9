@@ -360,8 +360,9 @@ def test_sound_film_run_generates_audio_and_puts_the_sound_line_in_both_prompts(
     _queue_single_shot(engine)
     payload = db.list_jobs(project_id=project["id"])[0]["payload"]
     assert payload["audio"] is True
-    assert "Sound: foghorn, waves against the rocks" in payload["prompt"]
-    assert "Sound: foghorn, waves against the rocks" in payload["continuation_prompt"]
+    assert "Sound: natural sounds only, foghorn, waves against the rocks; no music, no voices." in payload["prompt"]
+    assert "music" in payload["negative_prompt"] and "speech" in payload["negative_prompt"]
+    assert "Sound: natural sounds only, foghorn, waves against the rocks; no music, no voices." in payload["continuation_prompt"]
     assert "--no-audio" not in build_ltx_command("ltx", payload, "/out/job.partial.mp4")
 
 
@@ -442,9 +443,35 @@ def test_film_run_cuts_instead_of_chaining_when_a_character_leaves_the_shot(tmp_
 def test_character_references_are_keyed_past_the_kept_frames_and_other_references_guide_the_opening():
     from app.film_run_engine import CHARACTER_REFERENCE_TAIL_FRAMES, reference_anchor_plan
 
-    anchors, generate = reference_anchor_plan("/refs/frog.png", "character", 97)
+    anchors, generate = reference_anchor_plan([("/refs/frog.png", "character")], 97)
     assert generate == 97 + CHARACTER_REFERENCE_TAIL_FRAMES
     assert anchors == [{"path": "/refs/frog.png", "frame_index": generate - 1, "strength": 0.3, "binding": "guide"}]
-    assert reference_anchor_plan("/refs/river.png", "location", 97) == (
+    assert reference_anchor_plan([("/refs/river.png", "scene")], 97) == (
         [{"path": "/refs/river.png", "frame_index": 0, "strength": 0.35, "binding": "guide"}], 97)
-    assert reference_anchor_plan(None, None, 97) == ([], 97)
+    assert reference_anchor_plan([], 97) == ([], 97)
+
+
+def test_two_character_shots_key_both_sheets_inside_the_trimmed_tail():
+    from app.film_run_engine import CHARACTER_REFERENCE_TAIL_FRAMES, reference_anchor_plan
+
+    anchors, generate = reference_anchor_plan([("/refs/frog.png", "character"), ("/refs/scorpion.png", "character")], 97)
+    assert generate == 97 + CHARACTER_REFERENCE_TAIL_FRAMES + 8 and (generate - 1) % 8 == 0
+    assert [a["path"] for a in anchors] == ["/refs/frog.png", "/refs/scorpion.png"]
+    assert all(a["frame_index"] - 97 >= CHARACTER_REFERENCE_TAIL_FRAMES - 1 for a in anchors)
+
+
+def test_quoted_dialogue_is_removed_from_the_visual_prompt():
+    from app.film_run_engine import silent_action
+
+    assert silent_action('The scorpion asks "Will you carry me?" and points across.') == "The scorpion asks and points across."
+    assert silent_action("He says \u201cno\u201d firmly.") == "He says firmly."
+
+
+def test_reference_notes_replace_the_planners_guessed_identity():
+    from types import SimpleNamespace
+    from app.film_run_engine import character_identity
+
+    scorpion = SimpleNamespace(name="Scorpion", identity="A black scorpion", distinguishing_traits=["black"], reference_ids=["r1"])
+    linked = {"r1": {"notes": "Reddish-brown clay scorpion with amber tail"}}
+    assert character_identity(scorpion, linked, {"r1": "/refs/s.png"}) == "Scorpion: Reddish-brown clay scorpion with amber tail"
+    assert "A black scorpion" in character_identity(scorpion, {"r1": {"notes": ""}}, {"r1": "/refs/s.png"})

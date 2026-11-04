@@ -79,6 +79,8 @@ class _CreativeOutline(_CreativeOutlineModel):
     title: str = Field(min_length=1, max_length=160)
     logline: str = Field(min_length=12, max_length=1000)
     visual_style: str = Field(min_length=12, max_length=1200)
+    lighting: str = Field(default="", max_length=600,
+        description="One lighting and time-of-day description that holds for the whole film unless the story moves time on.")
     characters: list[_CreativeCharacter] = Field(min_length=1, max_length=20)
     locations: list[_CreativeLocation] = Field(min_length=1, max_length=20)
     scenes: list[_CreativeScene] = Field(min_length=1, max_length=40)
@@ -286,7 +288,7 @@ def gemini_story_schema(shot_budget: int = MAX_STORY_SCENES) -> dict[str, Any]:
                  "shots": array(shot, shots_per_scene_limit, 1)},
                 ["id", "sequence", "title", "story_beat", "location_id", "characters_present", "visual_description",
                  "framing", "character_layout", "continuity_requirements", "expected_character_count", "shots"])
-    return obj({"title": string(), "logline": string(), "visual_style": string(), "audio_requested": {"type": "boolean"},
+    return obj({"title": string(), "logline": string(), "visual_style": string(), "lighting": string(), "audio_requested": {"type": "boolean"},
                 "video_continuation_requested": {"type": "boolean"}, "ic_lora_requested": {"type": "boolean"},
                 "characters": array(character, 20, 1), "locations": array(location, location_limit, 1), "scenes": array(scene, scene_limit, 1)},
                ["title", "logline", "visual_style", "audio_requested", "video_continuation_requested", "ic_lora_requested",
@@ -309,7 +311,7 @@ def gemini_creative_schema(shot_budget: int = MAX_STORY_SCENES) -> dict[str, Any
 
 
 _KNOWN_OUTPUT_FIELDS = {
-    "title", "logline", "visual_style", "characters", "locations", "scenes", "audio_requested",
+    "title", "logline", "visual_style", "lighting", "characters", "locations", "scenes", "audio_requested",
     "video_continuation_requested", "ic_lora_requested", "id", "name", "identity", "distinguishing_traits",
     "reference_ids", "description", "scale", "continuity_requirements", "sequence", "story_beat",
     "location_id", "location_name", "characters_present", "visual_description", "framing", "character_layout",
@@ -441,6 +443,7 @@ def _compile_creative_outline(text: str, request: dict[str, Any]) -> StoryPlan:
             "expected_character_count": len(scene_character_ids), "shots": shots})
 
     compiled = {"title": outline.title, "logline": outline.logline, "visual_style": outline.visual_style,
+        "lighting": outline.lighting,
         "audio_requested": False, "video_continuation_requested": False, "ic_lora_requested": False,
         "characters": characters, "locations": locations, "scenes": scenes}
     try:
@@ -822,8 +825,10 @@ class GeminiStoryPlanner(StoryPlanner):
         prompt += ("causal chronology, location scale, visual continuity, camera framing, and exactly described character layout. "
                    "Use only supplied opaque reference IDs; the planner cannot see reference images, names, or paths. Leave references unassigned when their identity is ambiguous. "
                    "Do not invent approvals. Keep within the exact shot budget, preset, and local model capabilities. "
-                   "When model_capabilities.audio_generation is true, give each shot a short sound line naming the ambience and sound effects heard in it "
-                   "(for example 'rushing current, one frog croak'); otherwise leave sound empty. "
+                   "Give the film one lighting line (time of day, light direction, colour) and keep shot prompts consistent with it. "
+                   "When model_capabilities.audio_generation is true, give each shot a short sound line naming only natural, physical sounds heard in it "
+                   "(for example 'rushing current, one frog croak'); never music, score, mood words, voices, or speech; otherwise leave sound empty. "
+                   "Shot prompts describe only what is seen: never quote dialogue or say a character speaks, asks, or answers; show it through gesture and expression. "
                    "When a shot's beat contains spoken dialogue, put that line in caption prefixed with the speaker's name "
                    "(for example 'Scorpion: \"I could not help it.\"'); leave caption empty for shots without dialogue. "
                    "Return only the JSON object specified for this response mode.\nINPUT_JSON:\n" + input_json)
