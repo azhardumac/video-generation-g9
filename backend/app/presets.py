@@ -57,7 +57,7 @@ BUILTIN_PRESETS = [
 # shots use their own: steer away from morphing, extra creatures and burned-in text, and from music and voices.
 FILM_NEGATIVE_PROMPT = ("morphing, melting, warping, deformed body, extra limbs, missing limbs, duplicate characters, "
                         "extra animals, extra creatures, text, subtitles, captions, letters, watermark, logo, "
-                        "white studio background, blurry, flicker, sudden lighting change, CGI look")
+                        "white studio background, blurry, flicker, sudden lighting change, underexposed, too dark, CGI look")
 SOUND_NEGATIVE_PROMPT = ("music, musical score, soundtrack, orchestra, strings, piano, drums, singing, humming, "
                          "speech, talking, voices, narration, dialogue, whispering")
 def film_negative_prompt(sound: bool) -> str:
