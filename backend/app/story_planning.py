@@ -58,6 +58,7 @@ class StoryShot(StrictModel):
     reference_ids: list[str] = Field(default_factory=list, max_length=1)
     caption: str = Field(default="", max_length=1000)
     sound: str = Field(default="", max_length=400)
+    characters_leave: bool = False
     transition_after: Literal["cut", "dissolve", "fade"] = "cut"
 
 

@@ -361,14 +361,17 @@ class FilmRunEngine:
                 ref_path = reference_paths.get(reference_id) if reference_id else None
                 shot_id = str(uuid5(UUID(run["id"]), f"shot:{shot.id}"))
                 # Chained shots start on the previous clip's last frame (swapped in by the worker) instead.
-                anchors, generate_frames = (([], frames) if continue_from else
+                # A tail guide pulls the characters back into the final frames, so a shot they leave goes text-only.
+                anchors, generate_frames = (([], frames) if continue_from or shot.characters_leave else
                     reference_anchor_plan([(reference_paths[ref], linked[ref].get("category")) for ref in shot_refs], frames))
                 conditioning = ("previous-shot" if continue_from else "character-tail-guide" if generate_frames > frames
                                 else "guide-image" if anchors else "text-only")
                 identity_lines = [character_identity(characters[cid], linked, reference_paths) for cid in shot.characters_present]
                 framing = "Shot framing: " + shot.framing + ". Shot character layout: " + shot.character_layout
-                cast = ("On screen: only " + ", ".join(f"one {characters[cid].name}" for cid in shot.characters_present)
-                        + "; no additional characters or creatures, and no duplicates.")
+                cast = (("At the start, on screen: only " if shot.characters_leave else "On screen: only ")
+                        + ", ".join(f"one {characters[cid].name}" for cid in shot.characters_present)
+                        + "; no additional characters or creatures, and no duplicates."
+                        + (" By the end of the shot they are gone from view." if shot.characters_leave else ""))
                 # A shot the worker chains inherits identity and style from its first frame; a short
                 # action-led prompt keeps LTX from freezing on that frame.
                 continuation_prompt = "\n".join([
@@ -406,7 +409,8 @@ class FilmRunEngine:
                     "reference_anchors": anchors, "reference_as_frame": False, "continue_from_shot_id": continue_from,
                     "continuation_prompt": continuation_prompt,
                     "reference_id": reference_id, "reference_ids": shot_refs, "preflight_warnings": []}
-                previous_shot_id, previous_framing, previous_cast = shot_id, framing_class, set(shot.characters_present)
+                previous_shot_id, previous_cast = shot_id, set(shot.characters_present)
+                previous_framing = None if shot.characters_leave else framing_class
                 rows.append({"id": shot_id, "scene_title": saved_scene_title, "title": shot.title,
                     "prompt": prompt, "visual_description": shot.beat, "reference_image": ref_path,
                     "reference_ids": shot_refs, "preset": request["preset"],

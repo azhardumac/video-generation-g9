@@ -613,3 +613,15 @@ def test_provider_schema_omits_unsupported_max_lengths_but_local_storyplan_keeps
     too_long["title"] = "T" * 161
     with pytest.raises(ValueError):
         StoryPlan.model_validate(too_long)
+
+
+def test_shot_characters_leave_flag_reaches_the_story_plan():
+    request = fixture_request(shot_budget=1) | {"response_mode": "json_only",
+        "prompt": "A red fox kit follows a snowy creek and disappears into its den."}
+    outline = fox_creative_outline()
+    outline["scenes"][0]["shots"][0]["characters_leave"] = True
+    client = FakeClient([response(json.dumps(outline))])
+    result = make_planner(client).plan(request)
+    assert result.plan.scenes[0].shots[0].characters_leave is True
+    assert "set characters_leave true" in client.models.calls[0]["contents"]
+    assert fox_creative_outline()["scenes"][0]["shots"][0].get("characters_leave") is None
