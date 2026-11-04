@@ -830,6 +830,8 @@ class GeminiStoryPlanner(StoryPlanner):
                    "(for example 'rushing current, one frog croak'); only sounds made by the setting or by characters on screen, never unseen animals such as birds, "
                    "and never music, score, mood words, voices, or speech; otherwise leave sound empty. "
                    "Shot prompts describe only what is seen: never quote dialogue or say a character speaks, asks, or answers; show it through gesture and expression. "
+                   "When one character rides, carries, or touches another, state that physical contact in both the shot prompt and character_layout "
+                   "(for example 'the scorpion sits on top of the frog\'s back'), never just 'with' or 'beside'. "
                    "When a shot's beat contains spoken dialogue, put that line in caption prefixed with the speaker's name "
                    "(for example 'Scorpion: \"I could not help it.\"'); leave caption empty for shots without dialogue. "
                    "Return only the JSON object specified for this response mode.\nINPUT_JSON:\n" + input_json)
