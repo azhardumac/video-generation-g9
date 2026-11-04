@@ -30,7 +30,7 @@ from .gemini_planning import (GeminiPlanningError, GeminiStoryPlanner, STORY_PLA
                               _stored_model_is_text_eligible)
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
 from .paths import safe_local_path
-from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, Preset, Quality
+from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, Preset, Quality, film_negative_prompt
 from .projects import IMAGE_TYPES, VIDEO_TYPES, scan_project
 from .resources import ResourcePreflight, resource_snapshot
 from .storyboards import ShotInput, StoryboardUpdate, build_composition_manifest
@@ -2294,7 +2294,7 @@ def retry_film_batch(batch_id: str, request: RetryFilmRequest):
         if not shot:
             raise HTTPException(400, "Selected retry shot is not part of this storyboard")
         payload = shot.get("generation_payload") or {}
-        if shot.get("reference_ids") != [payload.get("reference_id")]:
+        if shot.get("reference_ids") != payload.get("reference_ids", [payload.get("reference_id")]):
             raise HTTPException(409, f"Shot '{shot['title']}' reference selection changed; review the shot and approve the plan again")
         try:
             _validate_project_reference(project, payload.get("reference_image"))
@@ -2429,6 +2429,7 @@ def _apply_film_run_profile(payload: dict, storyboard_id: str):
     if profile is None:
         return
     payload["audio"] = bool(profile.get("audio"))
+    payload["negative_prompt"] = film_negative_prompt(payload["audio"])
     quality = profile.get("quality") or "draft"
     if quality not in QUALITY_LEVELS:
         return

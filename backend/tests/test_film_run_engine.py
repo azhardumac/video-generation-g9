@@ -1,3 +1,4 @@
+from app.presets import film_negative_prompt
 import asyncio
 import pytest
 from pathlib import Path
@@ -341,7 +342,8 @@ def test_storyboard_regenerate_keeps_the_film_run_quality_and_sound(tmp_path, mo
     monkeypatch.setattr(main, "db", db)
     payload = {"quality": "draft", "distilled_two_stage": True, "audio": False}
     main._apply_film_run_profile(payload, storyboard_id)
-    assert payload == {"quality": quality, "distilled_two_stage": distilled, "audio": True}
+    assert payload == {"quality": quality, "distilled_two_stage": distilled, "audio": True,
+                       "negative_prompt": film_negative_prompt(True)}
     untouched = {"quality": "draft", "distilled_two_stage": True, "audio": False}
     main._apply_film_run_profile(untouched, "not-a-film-storyboard")
     assert untouched == {"quality": "draft", "distilled_two_stage": True, "audio": False}
@@ -475,3 +477,31 @@ def test_reference_notes_replace_the_planners_guessed_identity():
     linked = {"r1": {"notes": "Reddish-brown clay scorpion with amber tail"}}
     assert character_identity(scorpion, linked, {"r1": "/refs/s.png"}) == "Scorpion: Reddish-brown clay scorpion with amber tail"
     assert "A black scorpion" in character_identity(scorpion, {"r1": {"notes": ""}}, {"r1": "/refs/s.png"})
+
+
+def test_two_character_shot_uses_each_characters_sheet_and_the_one_the_shot_selected(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    refs = {}
+    for ref_id in ("keeper-a", "keeper-b", "sailor-a"):
+        path = tmp_path / f"{ref_id}.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        refs[ref_id] = db.add_project_reference({"id": ref_id, "project_id": project["id"], "name": ref_id,
+            "category": "character", "path": str(path), "source_kind": "linked", "mime_type": "image/png",
+            "size_bytes": path.stat().st_size, "content_hash": ref_id})
+    plan = plan_data()
+    plan["characters"][0]["reference_ids"] = ["keeper-a", "keeper-b"]
+    plan["characters"][1]["reference_ids"] = ["sailor-a"]
+    plan["scenes"][0]["shots"][0]["reference_ids"] = ["keeper-b"]
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    request = {"prompt": "A lighthouse keeper guides a lost boat home before a storm.",
+        "reference_ids": list(refs), "reference_categories": ["character"], "preset": "Short",
+        "budget": {"max_shots": 4, "max_retries_per_shot": 1, "max_generation_seconds": 3600, "max_output_bytes": 8 * 1024**3},
+        "generation_profile": {"frames": 49, "fps": 24, "width": 448, "height": 768},
+        "authorization": {"confirmed": True, "scope": "bounded local run"}}
+    FilmOrchestrator(db).create(project["id"], "test-key", request, authorized=True)
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert payload["reference_ids"] == ["keeper-b", "sailor-a"]
+    assert [a["path"] for a in payload["reference_anchors"]] == [refs["keeper-b"]["path"], refs["sailor-a"]["path"]]
+    shot = db.get_storyboard(db.list_storyboards(project["id"])[0]["id"])["shots"][0]
+    assert shot["reference_ids"] == payload["reference_ids"]

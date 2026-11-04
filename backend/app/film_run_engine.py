@@ -14,7 +14,7 @@ from .config import Settings
 from .film_orchestrator import FilmOrchestrator, FilmRunTransitionError, enforce_generation_budget
 from .integrations import detect_integrations
 from .paths import safe_local_path
-from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, quality_dimensions
+from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, film_negative_prompt, quality_dimensions
 from .story_planning import LocalStoryPlanner, PlannerOutputError, PlannerUnavailable, PlannerResult, StoryPlan, StoryPlanner
 from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner, STORY_PLAN_SCHEMA_VERSION
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
@@ -45,13 +45,6 @@ def reference_anchor_plan(references: list[tuple[str, str | None]], frames: int)
     return anchors, generate
 
 
-# LTX's own default negative prompt asks for speech ("silent or muted audio" is listed as a defect), so film
-# shots use their own: steer away from morphing, extra creatures and burned-in text, and from music and voices.
-FILM_NEGATIVE_PROMPT = ("morphing, melting, warping, deformed body, extra limbs, missing limbs, duplicate characters, "
-                        "extra animals, extra creatures, text, subtitles, captions, letters, watermark, logo, "
-                        "white studio background, blurry, flicker, sudden lighting change, CGI look")
-SOUND_NEGATIVE_PROMPT = ("music, musical score, soundtrack, orchestra, strings, piano, drums, singing, humming, "
-                         "speech, talking, voices, narration, dialogue, whispering")
 _QUOTED = re.compile(r'"[^"]*"|\u201c[^\u201d]*\u201d')
 
 
@@ -358,7 +351,9 @@ class FilmRunEngine:
                 continue_from = (previous_shot_id if framing_class == previous_framing
                                  and previous_cast <= set(shot.characters_present) else None)
                 # Every character on screen gets its approved sheet, not just the one the planner picked.
-                shot_refs = [ref for cid in shot.characters_present for ref in characters[cid].reference_ids[:1]
+                shot_refs = [ref for cid in shot.characters_present
+                             for ref in [next((r for r in shot.reference_ids if r in characters[cid].reference_ids), None)
+                                         or next(iter(characters[cid].reference_ids), None)]
                              if ref in reference_paths and linked[ref].get("category") == "character"]
                 shot_refs += [ref for ref in shot.reference_ids if ref in reference_paths and ref not in shot_refs
                               and linked[ref].get("category") != "character"][:1]
@@ -400,7 +395,7 @@ class FilmRunEngine:
                     "width": width, "height": height, "distilled_two_stage": distilled, "quality": quality,
                     "low_ram": profile.get("low_ram", True), "audio": sound,
                     "seed": film_seed, "reference_image": ref_path,
-                    "negative_prompt": FILM_NEGATIVE_PROMPT + (", " + SOUND_NEGATIVE_PROMPT if sound else ""),
+                    "negative_prompt": film_negative_prompt(sound),
                     "output_location": str(output), "preset": request["preset"],
                 })
                 payload = generation.model_dump() | {"frames": frames, "generate_frames": generate_frames, "fps": fps,
@@ -410,7 +405,7 @@ class FilmRunEngine:
                     "style_context": plan.visual_style, "reference_conditioning": conditioning,
                     "reference_anchors": anchors, "reference_as_frame": False, "continue_from_shot_id": continue_from,
                     "continuation_prompt": continuation_prompt,
-                    "reference_id": reference_id, "preflight_warnings": []}
+                    "reference_id": reference_id, "reference_ids": shot_refs, "preflight_warnings": []}
                 previous_shot_id, previous_framing, previous_cast = shot_id, framing_class, set(shot.characters_present)
                 rows.append({"id": shot_id, "scene_title": saved_scene_title, "title": shot.title,
                     "prompt": prompt, "visual_description": shot.beat, "reference_image": ref_path,
