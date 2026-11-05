@@ -53,10 +53,18 @@ def character_identity(character, linked: dict, reference_paths: dict, selected:
     return f"{character.name}: {character.identity}; distinguishing traits: " + ", ".join(character.distinguishing_traits)
 
 
-def _same_name(reference_name: str, character_name: str) -> bool:
-    words = re.sub(r"[^a-z0-9]+", " ", character_name.casefold()).split()
-    key = " ".join(re.sub(r"[^a-z0-9]+", " ", reference_name.casefold()).split())
-    return bool(key) and (key == " ".join(words) or key in words)
+def _name_words(name: str) -> frozenset[str]:
+    return frozenset(re.sub(r"[^a-z0-9]+", " ", name.casefold()).split())
+
+
+def sheet_owner(sheet_name: str, characters) -> str | None:
+    """The character a sheet is named after ("Mira portrait" -> Mira); None when no single best match."""
+    sheet = _name_words(sheet_name)
+    scored = [((words == sheet, len(words & sheet)), character.id) for character in characters
+              for words in [_name_words(character.name)] if words and sheet and (words <= sheet or sheet <= words)]
+    best = max((score for score, _ in scored), default=None)
+    owners = [cid for score, cid in scored if score == best]
+    return owners[0] if len(owners) == 1 else None
 
 
 def silent_action(prompt: str) -> str:
@@ -332,9 +340,10 @@ class FilmRunEngine:
         style_bible = project.get("style_bible", {})
         style_lines = [f"{key.replace('_', ' ').title()}: {value}" for key, value in style_bible.items() if isinstance(value, str) and value.strip()]
         # A planner can leave a character unlinked; then the selected character sheet named after it is its sheet.
+        owners = {ref: sheet_owner(linked[ref].get("name", ""), plan.characters)
+                  for ref in sorted(selected) if linked[ref].get("category") == "character"}
         characters = {item.id: item if item.reference_ids else item.model_copy(update={"reference_ids": [
-            ref for ref in sorted(selected) if linked[ref].get("category") == "character"
-            and _same_name(linked[ref].get("name", ""), item.name)]}) for item in plan.characters}
+            ref for ref, owner in owners.items() if owner == item.id]}) for item in plan.characters}
         locations = {item.id: item for item in plan.locations}
         seconds_per_shot = frames / fps
         # One seed for the whole film keeps lighting, palette and texture consistent between shots.

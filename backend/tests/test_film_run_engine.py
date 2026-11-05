@@ -504,6 +504,18 @@ def test_two_character_shot_uses_each_characters_sheet_and_the_one_the_shot_sele
     assert shot["reference_ids"] == payload["reference_ids"]
 
 
+def test_sheet_owner_picks_the_single_best_named_character():
+    from types import SimpleNamespace
+    from app.film_run_engine import sheet_owner
+
+    cast = [SimpleNamespace(id="a", name="Mira"), SimpleNamespace(id="b", name="Young Mira"), SimpleNamespace(id="c", name="Noah")]
+    assert sheet_owner("Mira portrait", cast[::2]) == "a"
+    assert sheet_owner("Mira", cast) == "a"
+    assert sheet_owner("young-mira", cast) == "b"
+    assert sheet_owner("harbor", cast) is None
+    assert sheet_owner("Mira", [cast[1], SimpleNamespace(id="d", name="Mira Jones")]) is None
+
+
 def test_unlinked_planner_characters_get_the_selected_sheet_with_their_name(tmp_path):
     db, project, settings = make_db(tmp_path)
     for ref_id, name, notes in (("mira-sheet", "mira", "Keeper in a teal raincoat"), ("noah-sheet", "Noah", "")):
