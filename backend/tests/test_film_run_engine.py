@@ -539,6 +539,9 @@ def test_unlinked_planner_characters_get_the_selected_sheet_with_their_name(tmp_
     payload = db.list_jobs(project_id=project["id"])[0]["payload"]
     assert payload["reference_ids"] == ["mira-sheet", "noah-sheet"]
     assert "Mira: Keeper in a teal raincoat" in payload["prompt"]
+    assert payload["reference_conditioning"] == "opening-frame"
+    assert [item["path"] for item in payload["keyframe"]["characters"]] == [str(tmp_path / "mira-sheet.png"), str(tmp_path / "noah-sheet.png")]
+    assert "No animals, creatures or characters" in payload["keyframe"]["plate_prompt"]
 
 
 def test_shot_the_characters_leave_says_so_and_breaks_the_chain(tmp_path):
@@ -567,4 +570,4 @@ def test_shot_the_characters_leave_says_so_and_breaks_the_chain(tmp_path):
     assert leaving["reference_ids"] == ["keeper-a", "sailor-a"]
     assert "At the start, on screen: only one Mira, one Noah" in leaving["prompt"]
     assert "By the end of the shot they are gone from view." in leaving["prompt"]
-    assert after["continue_from_shot_id"] is None and after["reference_conditioning"] == "text-only"
+    assert after["continue_from_shot_id"] is None and after["reference_conditioning"] == "opening-frame"

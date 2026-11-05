@@ -13,6 +13,7 @@ from uuid import UUID, uuid5, NAMESPACE_URL
 from .config import Settings
 from .film_orchestrator import FilmOrchestrator, FilmRunTransitionError, enforce_generation_budget
 from .integrations import detect_integrations
+from .keyframes import layout_placements
 from .paths import safe_local_path
 from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, film_negative_prompt, quality_dimensions
 from .story_planning import LocalStoryPlanner, PlannerOutputError, PlannerUnavailable, PlannerResult, StoryPlan, StoryPlanner
@@ -377,7 +378,22 @@ class FilmRunEngine:
                 # Chained shots start on the previous clip's last frame (swapped in by the worker) instead.
                 anchors, generate_frames = (([], frames) if continue_from else
                     reference_anchor_plan([(reference_paths[ref], linked[ref].get("category")) for ref in shot_refs], frames))
-                conditioning = "previous-shot" if continue_from else "guide-image" if anchors else "text-only"
+                # Every shot that can open on its characters' sheets does; a chained shot only falls back to it
+                # when the previous clip is missing.
+                sheets = [next((ref for ref in shot_refs if ref in characters[cid].reference_ids), None)
+                          for cid in shot.characters_present]
+                keyframe = None if None in sheets else {
+                    "plate_prompt": "\n".join([
+                        f"Stop-motion claymation {shot.framing} of the empty {location.name}, static camera, "
+                        "with open empty ground across the lower half of the frame.",
+                        f"Visual style: {plan.visual_style}",
+                        *([f"Lighting and time of day: {plan.lighting}"] if plan.lighting.strip() else []),
+                        f"Location: {location.description} Scale: {location.scale}",
+                        "No animals, creatures or characters anywhere."]),
+                    "characters": [placement | {"path": reference_paths[ref]} for ref, placement in zip(sheets, layout_placements(
+                        shot.character_layout, [characters[cid].name for cid in shot.characters_present], framing_class))]}
+                conditioning = ("previous-shot" if continue_from else "opening-frame" if keyframe
+                                else "guide-image" if anchors else "text-only")
                 identity_lines = [character_identity(characters[cid], linked, reference_paths, shot_refs)
                                   for cid in shot.characters_present]
                 framing = "Shot framing: " + shot.framing + ". Shot character layout: " + shot.character_layout
@@ -419,6 +435,7 @@ class FilmRunEngine:
                         "style_bible_revision": project.get("style_bible_revision", 0)},
                     "style_context": plan.visual_style, "reference_conditioning": conditioning,
                     "reference_anchors": anchors, "reference_as_frame": False, "continue_from_shot_id": continue_from,
+                    "keyframe": keyframe,
                     "continuation_prompt": continuation_prompt,
                     "reference_id": reference_id, "reference_ids": shot_refs, "preflight_warnings": []}
                 previous_shot_id, previous_cast = shot_id, set(shot.characters_present)
@@ -437,7 +454,7 @@ class FilmRunEngine:
                     "scene_count": len(plan.scenes), "shot_count": len(rows), "preset": request["preset"],
                     "frames_per_shot": frames, "fps": fps, "width": width, "height": height,
                     "approved_reference_ids": sorted(selected),
-                    "reference_limit_note": "Shots that keep the previous shot's framing and cast start on its last frame. Other shots describe each character with its reference notes; character sheets are not given to LTX, and other references guide shots weakly. Local conditioning does not guarantee identity consistency.",
+                    "reference_limit_note": "Shots that keep the previous shot's framing and cast start on its last frame. Other shots open on a frame built locally from an empty LTX plate of the location with the approved character sheets pasted where the layout puts them; shots whose characters lack a sheet use their reference notes only. Local conditioning does not guarantee identity consistency.",
                     "creative_quality_status": "pending_manual_review", "audio_available": sound,
                     "model_capabilities": {"text_to_video": True, "image_to_video": True,
                         "max_reference_images_per_shot": 1, "audio_generation": sound,

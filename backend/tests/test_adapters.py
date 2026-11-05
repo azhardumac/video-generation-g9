@@ -301,3 +301,95 @@ def test_negative_prompt_uses_nag_on_the_distilled_path_and_cfg_otherwise():
     best = build_ltx_command("ltx", base | {"distilled_two_stage": False}, "out.mp4")
     assert "--negative-prompt" in best and "--nag" not in best
     assert "--negative-prompt" not in build_ltx_command("ltx", base | {"negative_prompt": None}, "out.mp4")
+
+
+def test_keyframe_shot_opens_on_a_plate_with_the_sheets_pasted(tmp_path, monkeypatch):
+    from PIL import Image
+
+    async def run():
+        settings = _settings(tmp_path)
+        sheet = tmp_path / "frog.png"
+        image = Image.new("RGB", (200, 300), (250, 250, 250))
+        image.paste((60, 160, 40), (50, 60, 150, 260))
+        image.save(sheet)
+        payload = _payload(tmp_path) | {"keyframe": {"plate_prompt": "empty riverbank",
+            "characters": [{"path": str(sheet), "x": 0.5, "width": 0.45, "rider_of": None}]}}
+        calls = []
+
+        class Stream:
+            def __init__(self):
+                self.lines = [b""]
+            async def readline(self):
+                return self.lines.pop(0)
+
+        class Process:
+            returncode = 0
+            def __init__(self):
+                self.stdout = Stream()
+            async def wait(self):
+                return 0
+
+        async def fake_create(*args, **kwargs):
+            calls.append(list(args))
+            output = Path(args[args.index("--output") + 1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"clip")
+            return Process()
+
+        async def fake_first_frame(_video, image, _settings):
+            Image.new("RGB", (448, 768), (200, 150, 90)).save(image)
+            return image
+
+        async def fake_verify(_path, _settings, expected=None):
+            return {"verified_output": expected}
+
+        monkeypatch.setattr(adapters.asyncio, "create_subprocess_exec", fake_create)
+        monkeypatch.setattr(adapters, "extract_first_frame", fake_first_frame)
+        monkeypatch.setattr(adapters, "verify_video", fake_verify)
+        result = await LTXAdapter(settings).generate(payload, lambda *_: asyncio.sleep(0))
+        plate, shot = calls
+        assert plate[plate.index("--prompt") + 1] == "empty riverbank" and plate[plate.index("--frames") + 1] == "9"
+        assert "--image" not in plate and "--no-audio" in plate
+        opening = tmp_path / "out" / "job-123.opening.png"
+        assert shot[shot.index("--image") + 1:shot.index("--image") + 4] == [str(opening.resolve()), "0", "1.0"]
+        assert shot[shot.index("--prompt") + 1] == "moonlit riverbank"
+        assert opening.is_file() and not (tmp_path / "out" / "job-123.plate.mp4").exists()
+        assert result["output_path"].endswith("job-123.mp4")
+
+    asyncio.run(run())
+
+
+def test_chained_shot_ignores_its_keyframe(tmp_path, monkeypatch):
+    async def run():
+        settings = _settings(tmp_path)
+        frame = tmp_path / "prev.png"
+        frame.write_bytes(b"png")
+        payload = _payload(tmp_path) | {"continued_from_previous_shot": True, "keyframe": {"plate_prompt": "x", "characters": []},
+                                        "reference_anchors": [{"path": str(frame), "frame_index": 0, "strength": 1.0, "binding": "replace"}]}
+        calls = []
+
+        class Stream:
+            lines = [b""]
+            async def readline(self):
+                return self.lines.pop(0)
+
+        class Process:
+            stdout = Stream()
+            returncode = 0
+            async def wait(self):
+                return 0
+
+        async def fake_create(*args, **kwargs):
+            calls.append(list(args))
+            Path(args[args.index("--output") + 1]).write_bytes(b"clip")
+            return Process()
+
+        async def fake_verify(_path, _settings, expected=None):
+            return {}
+
+        monkeypatch.setattr(adapters.asyncio, "create_subprocess_exec", fake_create)
+        monkeypatch.setattr(adapters, "verify_video", fake_verify)
+        await LTXAdapter(settings).generate(payload, lambda *_: asyncio.sleep(0))
+        assert len(calls) == 1 and str(frame.resolve()) in calls[0]
+
+    asyncio.run(run())

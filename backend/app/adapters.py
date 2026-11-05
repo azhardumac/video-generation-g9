@@ -182,6 +182,20 @@ async def extract_last_frame(video: str, image: Path, settings: Settings) -> Pat
     return image
 
 
+async def extract_first_frame(video: str, image: Path, settings: Settings) -> Path:
+    """Write the first frame of a clip as a still."""
+    ffmpeg = _ffmpeg_executable(settings)
+    if not ffmpeg:
+        raise AdapterError("ffmpeg executable was not found")
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-v", "error", "-y", "-i", video, "-frames:v", "1", str(image),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, stderr = await process.communicate()
+    if process.returncode or not image.is_file():
+        raise AdapterError("Could not extract the plate's first frame: " + stderr.decode(errors="replace")[-500:])
+    return image
+
+
 class LTXAdapter:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -197,6 +211,12 @@ class LTXAdapter:
         job_id = payload["job_id"]
         output = safe_local_path(str(output_dir / (job_id + ".mp4")), self.settings)
         partial = safe_local_path(str(output_dir / (job_id + ".partial.mp4")), self.settings)
+        # A chained shot already opens on the previous clip's last frame.
+        if payload.get("keyframe") and not payload.get("continued_from_previous_shot"):
+            opening = await self._opening_frame(payload, output_dir, job_id, on_progress)
+            if opening:
+                payload = payload | {"generate_frames": payload["frames"],
+                                     "reference_anchors": [{"path": str(opening), "frame_index": 0, "strength": 1.0}]}
         reference = None
         if payload.get("reference_image"):
             reference = safe_local_path(payload["reference_image"], self.settings, must_exist=True)
@@ -261,6 +281,35 @@ class LTXAdapter:
         os.replace(partial, output)
         await on_progress(95, "Verified expected dimensions, frame rate, and frame count")
         return {"output_path": str(output), "metadata": metadata, "exit_code": 0}
+
+    async def _opening_frame(self, payload: dict, output_dir: Path, job_id: str, on_progress) -> Path | None:
+        """The shot's first frame: a short LTX plate of the empty location with the character sheets pasted on."""
+        keyframe = payload["keyframe"]
+
+        async def plate_progress(_value, message=None):
+            await on_progress(2, *([f"Opening frame: {message}"] if message else []))
+
+        plate_payload = {key: value for key, value in payload.items() if key != "keyframe"} | {
+            "job_id": job_id + ".plate", "prompt": keyframe["plate_prompt"], "frames": 9, "generate_frames": 9,
+            "audio": False, "reference_anchors": [], "reference_image": None, "distilled_two_stage": True}
+        clip = None
+        try:
+            clip = Path((await self.generate(plate_payload, plate_progress))["output_path"])
+            plate = await extract_first_frame(str(clip), safe_local_path(str(output_dir / (job_id + ".plate.png")), self.settings), self.settings)
+            sheets = [item | {"path": str(safe_local_path(item["path"], self.settings, must_exist=True))}
+                      for item in keyframe["characters"]]
+            opening = safe_local_path(str(output_dir / (job_id + ".opening.png")), self.settings)
+            from .keyframes import compose_opening_frame
+            if not await asyncio.to_thread(compose_opening_frame, str(plate), sheets, str(opening)):
+                raise ValueError("a character sheet has no plain light background to cut it from")
+        except (AdapterError, OSError, ValueError, ImportError) as exc:
+            await on_progress(3, f"Opening frame unavailable ({exc}); generating from the prompt alone")
+            return None
+        finally:
+            if clip:
+                clip.unlink(missing_ok=True)
+        await on_progress(4, "Opening frame built from the approved character sheets: " + str(opening))
+        return opening
 
 
 class RemotionAdapter:
