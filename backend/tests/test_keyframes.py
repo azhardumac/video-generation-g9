@@ -45,3 +45,15 @@ def test_sheet_without_a_plain_background_is_refused(tmp_path):
     photo = _sheet(tmp_path / "photo.png", (60, 160, 40), background=(30, 90, 140))
     assert not compose_opening_frame(str(tmp_path / "plate.png"), [{"path": photo, "x": 0.5, "width": 0.45, "rider_of": None}],
                                      str(tmp_path / "opening.png"))
+
+
+def test_pale_character_inside_its_outline_is_kept(tmp_path):
+    Image.new("RGB", (576, 1024), (200, 150, 90)).save(tmp_path / "plate.png")
+    sheet = Image.new("RGB", (200, 300), (250, 250, 250))
+    sheet.paste((40, 40, 40), (46, 56, 154, 264))
+    sheet.paste((232, 222, 205), (52, 62, 148, 258))
+    sheet.save(tmp_path / "rabbit.png")
+    out = tmp_path / "opening.png"
+    assert compose_opening_frame(str(tmp_path / "plate.png"), [{"path": str(tmp_path / "rabbit.png"), "x": 0.5, "width": 0.45, "rider_of": None}], str(out))
+    body = Image.open(out).convert("RGB").getpixel((288, 800))
+    assert body != (200, 150, 90) and min(body) > 150

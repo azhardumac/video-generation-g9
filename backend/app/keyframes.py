@@ -79,7 +79,7 @@ def layout_placements(layout: str, names: list[str], framing_class: str) -> list
 
 def _cutout(path: str):
     """The character on a near-white sheet as RGBA; None when the sheet has no plain light background."""
-    from PIL import Image, ImageFilter
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
     image = Image.open(path).convert("RGB")
     image.thumbnail((1024, 1024))
@@ -88,9 +88,16 @@ def _cutout(path: str):
     border += [image.getpixel((x, y)) for y in range(0, height, max(1, height // 40)) for x in (0, width - 1)]
     if sum(min(pixel) > 200 for pixel in border) < 0.8 * len(border):
         return None
-    dark = image.convert("L").point(lambda v: 255 if v < 150 else 0)
-    coloured = image.convert("HSV").getchannel("S").point(lambda v: 255 if v > 35 else 0)
-    mask = Image.composite(Image.new("L", image.size, 255), dark, coloured)
+    # The backdrop is the light, unsaturated region connected to the border; a pale body inside its outline stays.
+    light = ImageChops.multiply(image.convert("L").point(lambda v: 255 if v > 150 else 0),
+                                image.convert("HSV").getchannel("S").point(lambda v: 255 if v < 60 else 0))
+    for seed in [(x, y) for x in range(0, width, 4) for y in (0, height - 1)] + [(x, y) for y in range(0, height, 4) for x in (0, width - 1)]:
+        if light.getpixel(seed) == 255:
+            ImageDraw.floodfill(light, seed, 128)
+    # Backdrop trapped between legs or under a tail is the sheet's own white, which a pale body is not.
+    backdrop = [sorted(pixel[band] for pixel in border)[len(border) // 2] for band in range(3)]
+    trapped = ImageChops.difference(image, Image.new("RGB", image.size, tuple(backdrop))).convert("L").point(lambda v: 255 if v <= 8 else 0)
+    mask = ImageChops.subtract(light.point(lambda v: 0 if v == 128 else 255), trapped)
     mask = mask.filter(ImageFilter.MinFilter(5)).filter(ImageFilter.GaussianBlur(2))
     box = mask.getbbox()
     if not box or (box[2] - box[0]) * (box[3] - box[1]) > 0.95 * width * height:
@@ -134,8 +141,8 @@ def compose_opening_frame(plate_path: str, characters: list[dict], output: str) 
         left = int(frame_width * item["x"] - width / 2)
         left = min(max(left, 0), max(0, frame_width - width))
         carrier = boxes.get(item.get("rider_of")) if item.get("rider_of") is not None else None
-        # Riders sit on their carrier's back, a third of the way down its body.
-        bottom = carrier[1] + (carrier[3] - carrier[1]) // 3 if carrier else int(frame_height * 0.94)
+        # Riders sit on top of their carrier, overlapping only its top edge.
+        bottom = carrier[1] + (carrier[3] - carrier[1]) // 8 if carrier else int(frame_height * 0.94)
         top = max(0, bottom - height)
         plate.paste(cut, (left, top), cut)
         boxes[index] = (left, top, left + width, top + height)
