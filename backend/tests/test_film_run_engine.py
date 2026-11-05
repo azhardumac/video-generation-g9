@@ -442,24 +442,13 @@ def test_film_run_cuts_instead_of_chaining_when_a_character_leaves_the_shot(tmp_
     assert [p["continue_from_shot_id"] for p in payloads] == [None, None]
 
 
-def test_character_references_are_keyed_past_the_kept_frames_and_other_references_guide_the_opening():
-    from app.film_run_engine import CHARACTER_REFERENCE_TAIL_FRAMES, reference_anchor_plan
+def test_character_sheets_are_not_ltx_guides_and_other_references_guide_the_opening():
+    from app.film_run_engine import reference_anchor_plan
 
-    anchors, generate = reference_anchor_plan([("/refs/frog.png", "character")], 97)
-    assert generate == 97 + CHARACTER_REFERENCE_TAIL_FRAMES
-    assert anchors == [{"path": "/refs/frog.png", "frame_index": generate - 1, "strength": 0.3, "binding": "guide"}]
-    assert reference_anchor_plan([("/refs/river.png", "scene")], 97) == (
+    assert reference_anchor_plan([("/refs/frog.png", "character"), ("/refs/scorpion.png", "character")], 97) == ([], 97)
+    assert reference_anchor_plan([("/refs/frog.png", "character"), ("/refs/river.png", "scene")], 97) == (
         [{"path": "/refs/river.png", "frame_index": 0, "strength": 0.35, "binding": "guide"}], 97)
     assert reference_anchor_plan([], 97) == ([], 97)
-
-
-def test_two_character_shots_key_both_sheets_inside_the_trimmed_tail():
-    from app.film_run_engine import CHARACTER_REFERENCE_TAIL_FRAMES, reference_anchor_plan
-
-    anchors, generate = reference_anchor_plan([("/refs/frog.png", "character"), ("/refs/scorpion.png", "character")], 97)
-    assert generate == 97 + CHARACTER_REFERENCE_TAIL_FRAMES + 8 and (generate - 1) % 8 == 0
-    assert [a["path"] for a in anchors] == ["/refs/frog.png", "/refs/scorpion.png"]
-    assert all(a["frame_index"] - 97 >= CHARACTER_REFERENCE_TAIL_FRAMES - 1 for a in anchors)
 
 
 def test_quoted_dialogue_is_removed_from_the_visual_prompt():
@@ -502,12 +491,12 @@ def test_two_character_shot_uses_each_characters_sheet_and_the_one_the_shot_sele
     _queue_single_shot(engine)
     payload = db.list_jobs(project_id=project["id"])[0]["payload"]
     assert payload["reference_ids"] == ["keeper-b", "sailor-a"]
-    assert [a["path"] for a in payload["reference_anchors"]] == [refs["keeper-b"]["path"], refs["sailor-a"]["path"]]
+    assert payload["reference_anchors"] == [] and payload["generate_frames"] == payload["frames"]
     shot = db.get_storyboard(db.list_storyboards(project["id"])[0]["id"])["shots"][0]
     assert shot["reference_ids"] == payload["reference_ids"]
 
 
-def test_shot_the_characters_leave_skips_the_tail_guide_and_breaks_the_chain(tmp_path):
+def test_shot_the_characters_leave_says_so_and_breaks_the_chain(tmp_path):
     db, project, settings = make_db(tmp_path)
     for ref_id in ("keeper-a", "sailor-a"):
         path = tmp_path / f"{ref_id}.png"
@@ -533,4 +522,4 @@ def test_shot_the_characters_leave_skips_the_tail_guide_and_breaks_the_chain(tmp
     assert leaving["reference_ids"] == ["keeper-a", "sailor-a"]
     assert "At the start, on screen: only one Mira, one Noah" in leaving["prompt"]
     assert "By the end of the shot they are gone from view." in leaving["prompt"]
-    assert after["continue_from_shot_id"] is None and len(after["reference_anchors"]) == 2
+    assert after["continue_from_shot_id"] is None and after["reference_conditioning"] == "text-only"
