@@ -371,14 +371,13 @@ class FilmRunEngine:
                 # action-led prompt keeps LTX from freezing on that frame.
                 continuation_prompt = "\n".join([
                     silent_action(shot.prompt) if shot.caption.strip() else shot.prompt,
-                    *(["Characters communicate silently through gesture and expression; nobody speaks aloud."]
-                      if sound and shot.caption.strip() else []),
                     f"Visual style: {plan.visual_style}",
                     *([f"Lighting and time of day, identical in every shot: {plan.lighting}"] if plan.lighting.strip() else []),
                     f"Location continuity: {location.name}. {location.description} Scale: {location.scale}",
                     framing,
                     cast,
-                    *([f"Sound: natural sounds only, {shot.sound.strip()}; no music, no voices."] if sound and shot.sound.strip() else []),
+                    # Only what should be heard: naming speech or music here, even negated, made LTX voice the characters.
+                    *([f"Sound: only natural ambient sound, {shot.sound.strip()}."] if sound and shot.sound.strip() else []),
                 ])
                 prompt = "\n".join([
                     continuation_prompt,

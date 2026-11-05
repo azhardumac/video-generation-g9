@@ -356,15 +356,18 @@ def test_sound_film_run_generates_audio_and_puts_the_sound_line_in_both_prompts(
     plan = plan_data()
     plan["audio_requested"] = True
     plan["scenes"][0]["shots"][0]["sound"] = "foghorn, waves against the rocks"
+    plan["scenes"][0]["shots"][0]["caption"] = 'Keeper: "Storm coming."'
     planner = FakePlanner(plan)
     engine = FilmRunEngine(db, settings, planner=planner, ltx_ready=lambda: True)
     create_run(db, project, sound=True)
     _queue_single_shot(engine)
     payload = db.list_jobs(project_id=project["id"])[0]["payload"]
     assert payload["audio"] is True
-    assert "Sound: natural sounds only, foghorn, waves against the rocks; no music, no voices." in payload["prompt"]
+    assert "Sound: only natural ambient sound, foghorn, waves against the rocks." in payload["prompt"]
     assert "music" in payload["negative_prompt"] and "speech" in payload["negative_prompt"]
-    assert "Sound: natural sounds only, foghorn, waves against the rocks; no music, no voices." in payload["continuation_prompt"]
+    assert "Sound: only natural ambient sound, foghorn, waves against the rocks." in payload["continuation_prompt"]
+    for word in ("music", "voice", "speak", "speech", "dialogue"):
+        assert word not in payload["prompt"].lower()
     assert "--no-audio" not in build_ltx_command("ltx", payload, "/out/job.partial.mp4")
 
 
