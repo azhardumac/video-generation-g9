@@ -292,7 +292,7 @@ class LTXAdapter:
         plate_payload = {key: value for key, value in payload.items() if key != "keyframe"} | {
             "job_id": job_id + ".plate", "prompt": keyframe["plate_prompt"], "frames": 9, "generate_frames": 9,
             "audio": False, "reference_anchors": [], "reference_image": None, "distilled_two_stage": True}
-        clip = None
+        clip = plate = None
         try:
             clip = Path((await self.generate(plate_payload, plate_progress))["output_path"])
             plate = await extract_first_frame(str(clip), safe_local_path(str(output_dir / (job_id + ".plate.png")), self.settings), self.settings)
@@ -306,8 +306,10 @@ class LTXAdapter:
             await on_progress(3, f"Opening frame unavailable ({exc}); generating from the prompt alone")
             return None
         finally:
-            if clip:
-                clip.unlink(missing_ok=True)
+            # Only the opening frame is kept, beside the clip it starts, as the continue frames are.
+            for scratch in (clip, plate):
+                if scratch:
+                    scratch.unlink(missing_ok=True)
         await on_progress(4, "Opening frame built from the approved character sheets: " + str(opening))
         return opening
 
