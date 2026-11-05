@@ -504,6 +504,31 @@ def test_two_character_shot_uses_each_characters_sheet_and_the_one_the_shot_sele
     assert shot["reference_ids"] == payload["reference_ids"]
 
 
+def test_unlinked_planner_characters_get_the_selected_sheet_with_their_name(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    for ref_id, name, notes in (("mira-sheet", "mira", "Keeper in a teal raincoat"), ("noah-sheet", "Noah", "")):
+        path = tmp_path / f"{ref_id}.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        db.add_project_reference({"id": ref_id, "project_id": project["id"], "name": name, "notes": notes,
+            "category": "character", "path": str(path), "source_kind": "linked", "mime_type": "image/png",
+            "size_bytes": path.stat().st_size, "content_hash": ref_id})
+    plan = plan_data()
+    for character in plan["characters"]:
+        character["reference_ids"] = []
+    plan["scenes"][0]["shots"][0]["reference_ids"] = []
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    request = {"prompt": "A lighthouse keeper guides a lost boat home before a storm.",
+        "reference_ids": ["mira-sheet", "noah-sheet"], "reference_categories": ["character"], "preset": "Short",
+        "budget": {"max_shots": 4, "max_retries_per_shot": 1, "max_generation_seconds": 3600, "max_output_bytes": 8 * 1024**3},
+        "generation_profile": {"frames": 49, "fps": 24, "width": 448, "height": 768},
+        "authorization": {"confirmed": True, "scope": "bounded local run"}}
+    FilmOrchestrator(db).create(project["id"], "test-key", request, authorized=True)
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert payload["reference_ids"] == ["mira-sheet", "noah-sheet"]
+    assert "Mira: Keeper in a teal raincoat" in payload["prompt"]
+
+
 def test_shot_the_characters_leave_says_so_and_breaks_the_chain(tmp_path):
     db, project, settings = make_db(tmp_path)
     for ref_id in ("keeper-a", "sailor-a"):
