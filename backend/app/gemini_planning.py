@@ -58,7 +58,7 @@ class _CreativeShot(_CreativeOutlineModel):
     sound: str = Field(default="", max_length=400,
         description="Ambience and sound effects heard in this shot when audio_generation is available; otherwise ''.")
     characters_leave: bool = Field(default=False,
-        description="True when the characters on screen sink, exit, or disappear before the shot ends.")
+        description="True only when every character on screen sinks, exits, or disappears before the shot ends.")
     transition_after: str = Field(default="cut", pattern="^(cut|dissolve|fade)$")
 
 
@@ -836,8 +836,8 @@ class GeminiStoryPlanner(StoryPlanner):
                    "Shot prompts describe only what is seen: never quote dialogue or say a character speaks, asks, or answers; show it through gesture and expression. "
                    "When one character rides, carries, or touches another, state that physical contact in both the shot prompt and character_layout "
                    "(for example 'the scorpion sits on top of the frog\'s back'), never just 'with' or 'beside'. "
-                   "When characters sink, exit, or disappear during a shot, show them going in the prompt, keep them in characters_present, "
-                   "and set characters_leave true. "
+                   "When every character in a shot sinks, exits, or disappears during it, show them going in the prompt, keep them in characters_present, "
+                   "and set characters_leave true; leave it false when anyone stays on screen. "
                    "When a shot's beat contains spoken dialogue, put that line in caption prefixed with the speaker's name "
                    "(for example 'Scorpion: \"I could not help it.\"'); leave caption empty for shots without dialogue. "
                    "Return only the JSON object specified for this response mode.\nINPUT_JSON:\n" + input_json)
