@@ -466,6 +466,11 @@ def test_reference_notes_replace_the_planners_guessed_identity():
     linked = {"r1": {"notes": "Reddish-brown clay scorpion with amber tail"}}
     assert character_identity(scorpion, linked, {"r1": "/refs/s.png"}) == "Scorpion: Reddish-brown clay scorpion with amber tail"
     assert "A black scorpion" in character_identity(scorpion, {"r1": {"notes": ""}}, {"r1": "/refs/s.png"})
+    scorpion.reference_ids = ["r1", "r2"]
+    linked = {"r1": {"notes": "Reddish-brown scorpion"}, "r2": {"notes": "Scorpion in a straw hat"}}
+    paths = {"r1": "/refs/s.png", "r2": "/refs/s2.png"}
+    assert character_identity(scorpion, linked, paths, ["r2"]) == "Scorpion: Scorpion in a straw hat"
+    assert character_identity(scorpion, linked, paths) == "Scorpion: Reddish-brown scorpion"
 
 
 def test_two_character_shot_uses_each_characters_sheet_and_the_one_the_shot_selected(tmp_path):

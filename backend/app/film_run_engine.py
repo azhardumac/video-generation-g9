@@ -39,9 +39,14 @@ def reference_anchor_plan(references: list[tuple[str, str | None]], frames: int)
 _QUOTED = re.compile(r'"[^"]*"|\u201c[^\u201d]*\u201d')
 
 
-def character_identity(character, linked: dict, reference_paths: dict) -> str:
-    """A character's identity line; the notes on its approved sheet win over the planner's guess, which never saw it."""
-    notes = next((linked[ref].get("notes", "").strip() for ref in character.reference_ids
+def character_identity(character, linked: dict, reference_paths: dict, selected: list[str] | None = None) -> str:
+    """A character's identity line; the notes on its approved sheet win over the planner's guess, which never saw it.
+
+    A sheet in `selected` (the one the shot picked) is preferred over the character's other sheets.
+    """
+    ordered = [ref for ref in selected or [] if ref in character.reference_ids]
+    ordered += [ref for ref in character.reference_ids if ref not in ordered]
+    notes = next((linked[ref].get("notes", "").strip() for ref in ordered
                   if ref in reference_paths and linked[ref].get("notes", "").strip()), "")
     if notes:
         return f"{character.name}: {notes}"
@@ -355,7 +360,8 @@ class FilmRunEngine:
                 anchors, generate_frames = (([], frames) if continue_from else
                     reference_anchor_plan([(reference_paths[ref], linked[ref].get("category")) for ref in shot_refs], frames))
                 conditioning = "previous-shot" if continue_from else "guide-image" if anchors else "text-only"
-                identity_lines = [character_identity(characters[cid], linked, reference_paths) for cid in shot.characters_present]
+                identity_lines = [character_identity(characters[cid], linked, reference_paths, shot_refs)
+                                  for cid in shot.characters_present]
                 framing = "Shot framing: " + shot.framing + ". Shot character layout: " + shot.character_layout
                 cast = (("At the start, on screen: only " if shot.characters_leave else "On screen: only ")
                         + ", ".join(f"one {characters[cid].name}" for cid in shot.characters_present)
