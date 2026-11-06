@@ -54,6 +54,21 @@ def character_identity(character, linked: dict, reference_paths: dict, selected:
     return f"{character.name}: {character.identity}; distinguishing traits: " + ", ".join(character.distinguishing_traits)
 
 
+def short_identities(identity_lines: list[str]) -> list[str]:
+    """One short sentence per character, from the first clause of each identity line.
+
+    A long combined description made LTX blend two characters into hybrids and duplicates; on a shot that
+    opens on a picture of them, the picture carries their look and a short sentence keeps them apart.
+    """
+    sentences = []
+    for index, line in enumerate(identity_lines):
+        name, _, look = line.partition(": ")
+        look = re.sub(r"^(?:an?|the|one|single)\s+", "", re.split(r"[,;.]", look, maxsplit=1)[0].strip(), flags=re.I)
+        look = " ".join(look.split()[:14]) or "character"
+        sentences.append(f"{name} is {'a single' if index == 0 else 'a separate'} {look}.")
+    return sentences
+
+
 def _name_words(name: str) -> frozenset[str]:
     return frozenset(re.sub(r"[^a-z0-9]+", " ", name.casefold()).split())
 
@@ -415,7 +430,8 @@ class FilmRunEngine:
                 ])
                 prompt = "\n".join([
                     continuation_prompt,
-                    "Character identity continuity: " + " | ".join(identity_lines),
+                    *(short_identities(identity_lines) if continue_from or keyframe
+                      else ["Character identity continuity: " + " | ".join(identity_lines)]),
                     "Scene continuity: " + " | ".join(scene.continuity_requirements),
                     *[f"Project style bible: {line}" for line in style_lines],
                 ])
