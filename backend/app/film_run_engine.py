@@ -438,10 +438,10 @@ class FilmRunEngine:
                 if len(prompt) > 4000:
                     raise PlannerOutputError(f"The validated prompt for '{shot.title}' exceeds LTX's 4,000 character limit")
                 if keyframe:
-                    # Without its opening picture the shot needs the full look of each character back.
-                    fallback = prompt.replace("\n".join(short_identities(identity_lines)),
-                                              "Character identity continuity: " + " | ".join(identity_lines), 1)
-                    keyframe["fallback_prompt"] = fallback if len(fallback) <= 4000 else prompt
+                    # Without its opening picture the shot needs the full look of each character back; the
+                    # adapter swaps these into the prompt it is given, so an edited prompt keeps its edits.
+                    keyframe["identity_fallback"] = {"short": "\n".join(short_identities(identity_lines)),
+                        "full": "Character identity continuity: " + " | ".join(identity_lines)}
                 generation = GenerationSettings.model_validate(profile | {
                     "prompt": prompt, "model": profile.get("model", "dgrauet/ltx-2.3-mlx-q8"),
                     "width": width, "height": height, "distilled_two_stage": distilled, "quality": quality,

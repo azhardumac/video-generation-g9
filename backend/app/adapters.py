@@ -182,6 +182,17 @@ async def extract_last_frame(video: str, image: Path, settings: Settings) -> Pat
     return image
 
 
+def full_identity_prompt(payload: dict) -> str:
+    """The prompt with each character's full look in place of the short sentences meant for an opening frame."""
+    swap = payload["keyframe"].get("identity_fallback") or {}
+    prompt = payload["prompt"]
+    if swap.get("short") and swap.get("full") and swap["short"] in prompt:
+        restored = prompt.replace(swap["short"], swap["full"], 1)
+        if len(restored) <= 4000:
+            return restored
+    return prompt
+
+
 async def extract_first_frame(video: str, image: Path, settings: Settings) -> Path:
     """Write the first frame of a clip as a still."""
     ffmpeg = _ffmpeg_executable(settings)
@@ -216,7 +227,7 @@ class LTXAdapter:
             opening = await self._opening_frame(payload, output_dir, job_id, on_progress)
             payload = (payload | {"generate_frames": payload["frames"],
                                   "reference_anchors": [{"path": str(opening), "frame_index": 0, "strength": 1.0}]}
-                       if opening else payload | {"prompt": payload["keyframe"].get("fallback_prompt") or payload["prompt"]})
+                       if opening else payload | {"prompt": full_identity_prompt(payload)})
         reference = None
         if payload.get("reference_image"):
             reference = safe_local_path(payload["reference_image"], self.settings, must_exist=True)
