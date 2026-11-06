@@ -214,9 +214,9 @@ class LTXAdapter:
         # A chained shot already opens on the previous clip's last frame.
         if payload.get("keyframe") and not payload.get("continued_from_previous_shot"):
             opening = await self._opening_frame(payload, output_dir, job_id, on_progress)
-            if opening:
-                payload = payload | {"generate_frames": payload["frames"],
-                                     "reference_anchors": [{"path": str(opening), "frame_index": 0, "strength": 1.0}]}
+            payload = (payload | {"generate_frames": payload["frames"],
+                                  "reference_anchors": [{"path": str(opening), "frame_index": 0, "strength": 1.0}]}
+                       if opening else payload | {"prompt": payload["keyframe"].get("fallback_prompt") or payload["prompt"]})
         reference = None
         if payload.get("reference_image"):
             reference = safe_local_path(payload["reference_image"], self.settings, must_exist=True)

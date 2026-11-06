@@ -356,6 +356,14 @@ def test_keyframe_shot_opens_on_a_plate_with_the_sheets_pasted(tmp_path, monkeyp
         assert opening.is_file() and not (tmp_path / "out" / "job-123.plate.mp4").exists()
         assert result["output_path"].endswith("job-123.mp4")
 
+        # A sheet with no plain background to cut from falls back to the prompt with the full identities.
+        calls.clear()
+        Image.new("RGB", (200, 300), (60, 160, 40)).save(sheet)
+        payload["keyframe"]["fallback_prompt"] = "moonlit riverbank\nCharacter identity continuity: Frog: green"
+        await LTXAdapter(settings).generate(payload | {"job_id": "job-124"}, lambda *_: asyncio.sleep(0))
+        shot = calls[-1]
+        assert "--image" not in shot and shot[shot.index("--prompt") + 1].endswith("Frog: green")
+
     asyncio.run(run())
 
 
