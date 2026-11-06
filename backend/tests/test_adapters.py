@@ -362,11 +362,11 @@ def test_keyframe_shot_opens_on_a_plate_with_the_sheets_pasted(tmp_path, monkeyp
         payload["keyframe"]["identity_fallback"] = [
             {"short": "Frog is a single frog.", "full": "Character identity continuity: Frog: green"},
             {"short": "Newt is a separate newt.", "full": "Character identity continuity: Newt: orange"}]
-        await LTXAdapter(settings).generate(payload | {"job_id": "job-124", "prompt": "moonlit riverbank\nFrog is a single frog.\nNewt is an edited newt."},
+        await LTXAdapter(settings).generate(payload | {"job_id": "job-124", "prompt": "riverbank where Frog is a single frog.\nFrog is a single frog.\nNewt is an edited newt."},
                                             lambda *_: asyncio.sleep(0))
         shot = calls[-1]
         assert "--image" not in shot
-        assert shot[shot.index("--prompt") + 1] == "moonlit riverbank\nCharacter identity continuity: Frog: green\nNewt is an edited newt."
+        assert shot[shot.index("--prompt") + 1] == "riverbank where Frog is a single frog.\nCharacter identity continuity: Frog: green\nNewt is an edited newt."
         # A prompt edited after planning keeps its edits.
         await LTXAdapter(settings).generate(payload | {"job_id": "job-125", "prompt": "edited riverbank"},
                                             lambda *_: asyncio.sleep(0))

@@ -184,14 +184,15 @@ async def extract_last_frame(video: str, image: Path, settings: Settings) -> Pat
 
 def full_identity_prompt(payload: dict) -> str:
     """The prompt with each character's full look in place of the short sentences meant for an opening frame."""
-    prompt = payload["prompt"]
-    # Each character is swapped on its own, so editing one sentence keeps the others' full looks.
+    lines = payload["prompt"].split("\n")
+    # Each character's sentence is its own line, swapped on its own, so editing one keeps the others' full looks.
     for swap in payload["keyframe"].get("identity_fallback") or []:
-        if swap.get("short") and swap.get("full") and swap["short"] in prompt:
-            restored = prompt.replace(swap["short"], swap["full"], 1)
-            if len(restored) <= 4000:
-                prompt = restored
-    return prompt
+        if swap.get("short") and swap.get("full") and swap["short"] in lines:
+            index = lines.index(swap["short"])
+            restored = lines[:index] + [swap["full"]] + lines[index + 1:]
+            if len("\n".join(restored)) <= 4000:
+                lines = restored
+    return "\n".join(lines)
 
 
 async def extract_first_frame(video: str, image: Path, settings: Settings) -> Path:
