@@ -542,8 +542,9 @@ def test_unlinked_planner_characters_get_the_selected_sheet_with_their_name(tmp_
     # The opening picture carries the look; one short sentence each keeps LTX from blending them.
     assert "Mira is a single Keeper in a teal raincoat.\nNoah is a separate young sailor with a dark wool cap and a red scarf." in payload["prompt"]
     assert "Character identity continuity" not in payload["prompt"]
-    swap = payload["keyframe"]["identity_fallback"]
-    assert swap["short"] in payload["prompt"] and swap["full"].startswith("Character identity continuity: Mira: Keeper in a teal raincoat | Noah:")
+    mira, noah = payload["keyframe"]["identity_fallback"]
+    assert mira == {"short": "Mira is a single Keeper in a teal raincoat.", "full": "Character identity continuity: Mira: Keeper in a teal raincoat"}
+    assert noah["short"] in payload["prompt"] and noah["full"].startswith("Character identity continuity: Noah: A young sailor")
     assert [item["path"] for item in payload["keyframe"]["characters"]] == [str(tmp_path / "mira-sheet.png"), str(tmp_path / "noah-sheet.png")]
     assert "No animals, creatures or characters" in payload["keyframe"]["plate_prompt"]
 

@@ -440,8 +440,8 @@ class FilmRunEngine:
                 if keyframe:
                     # Without its opening picture the shot needs the full look of each character back; the
                     # adapter swaps these into the prompt it is given, so an edited prompt keeps its edits.
-                    keyframe["identity_fallback"] = {"short": "\n".join(short_identities(identity_lines)),
-                        "full": "Character identity continuity: " + " | ".join(identity_lines)}
+                    keyframe["identity_fallback"] = [{"short": short, "full": "Character identity continuity: " + line}
+                                                     for short, line in zip(short_identities(identity_lines), identity_lines)]
                 generation = GenerationSettings.model_validate(profile | {
                     "prompt": prompt, "model": profile.get("model", "dgrauet/ltx-2.3-mlx-q8"),
                     "width": width, "height": height, "distilled_two_stage": distilled, "quality": quality,
