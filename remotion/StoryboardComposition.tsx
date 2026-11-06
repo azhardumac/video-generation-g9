@@ -1,6 +1,7 @@
 import React from 'react';
 import {
   AbsoluteFill,
+  Audio,
   Composition,
   OffthreadVideo,
   Sequence,
@@ -18,6 +19,10 @@ type Shot = {
   transition_in_frames: number;
   transition_out_frames: number;
   trim_start_frames?: number;
+  has_audio?: boolean;
+  audio_fade_in_frames?: number;
+  audio_fade_out_frames?: number;
+  audio_gain_db?: number;
   caption: string;
 };
 type Manifest = {
@@ -46,10 +51,25 @@ const ShotClip: React.FC<{ shot: Shot; isLast: boolean }> = ({shot, isLast}) => 
   </AbsoluteFill>;
 };
 
+// Steps never reach zero, so a fade adds no silent frame at the join.
+const ramp = (f: number, length: number, fadeIn: number, fadeOut: number) => Math.min(
+  fadeIn && f < fadeIn ? (f + 1) / (fadeIn + 1) : 1,
+  fadeOut && f >= length - fadeOut ? (length - f) / (fadeOut + 1) : 1,
+);
+
+const ShotAudio: React.FC<{shot: Shot}> = ({shot}) => {
+  const gain = 10 ** ((shot.audio_gain_db ?? 0) / 20);
+  return <Sequence from={shot.start_frame} durationInFrames={shot.frames}>
+    <Audio src={staticFile(shot.src)} startFrom={shot.trim_start_frames ?? 0}
+      volume={f => gain * ramp(f, shot.frames, shot.audio_fade_in_frames ?? 0, shot.audio_fade_out_frames ?? 0)}/>
+  </Sequence>;
+};
+
 const StoryboardTimeline: React.FC<{manifest: Manifest}> = ({manifest}) => <AbsoluteFill style={{backgroundColor: '#05070b'}}>
   {manifest.shots.map((shot, index) => <Sequence key={shot.shot_id} from={shot.start_frame} durationInFrames={shot.frames}>
     <ShotClip shot={shot} isLast={index === manifest.shots.length - 1}/>
   </Sequence>)}
+  {manifest.shots.filter(shot => shot.has_audio).map(shot => <ShotAudio key={`${shot.shot_id}-audio`} shot={shot}/>)}
 </AbsoluteFill>;
 
 export const StoryboardComposition: React.FC<{manifest: Manifest}> = ({manifest}) => <StoryboardTimeline manifest={manifest}/>;

@@ -133,7 +133,7 @@ class LocalWorker:
                     self.db.add_benchmark(payload["preset"], payload["frames"], payload["fps"],
                                           round(payload["frames"] / payload["fps"], 2),
                                           elapsed_seconds=round(time.monotonic() - started, 2),
-                                          quality=payload.get("quality", "draft"))
+                                          quality=payload.get("quality", "draft"), audio=bool(payload.get("audio")))
                 except Exception as exc:
                     self.db.event(job_id, "warning", "Video completed, but benchmark history could not be updated: " + str(exc))
             self.db.event(job_id, "info", "Job completed; verified output: " + result_path)
@@ -200,6 +200,7 @@ class LocalWorker:
             return payload
         self.db.event(job["id"], "info", "Continuing from the last frame of the previous shot: " + clip)
         return payload | {"continued_from_previous_shot": True, "prompt": payload.get("continuation_prompt", payload["prompt"]),
+                          "generate_frames": payload.get("frames"),
                           "reference_anchors": [{"path": str(frame), "frame_index": 0, "strength": 1.0, "binding": "replace"}]}
 
     def _partial_path(self, job: dict) -> Path | None:

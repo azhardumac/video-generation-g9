@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import shutil
 import socket
 import signal
@@ -39,7 +40,7 @@ def build_ltx_command(executable: str, payload: dict, output_path: str, referenc
     args = [
         executable, "generate", "--prompt", payload["prompt"], "--model", payload["model"],
         "--width", str(payload["width"]), "--height", str(payload["height"]),
-        "--frames", str(payload["frames"]), "--frame-rate", str(payload["fps"]),
+        "--frames", str(payload.get("generate_frames") or payload["frames"]), "--frame-rate", str(payload["fps"]),
         "--output", output_path,
     ]
     anchors = payload.get("reference_anchors") or []
@@ -52,6 +53,11 @@ def build_ltx_command(executable: str, payload: dict, output_path: str, referenc
     if payload.get("seed") is not None:
         args += ["--seed", str(payload["seed"])]
     args.append("--distilled" if payload.get("distilled_two_stage") else "--two-stage")
+    if payload.get("negative_prompt"):
+        args += ["--negative-prompt", payload["negative_prompt"]]
+        # The distilled path has no CFG pass; NAG applies the negative prompt inside its cross-attention instead.
+        if payload.get("distilled_two_stage"):
+            args.append("--nag")
     if payload.get("low_ram"):
         args.append("--low-ram")
     if not payload.get("audio"):
@@ -108,11 +114,63 @@ async def terminate_process_group(process: asyncio.subprocess.Process, grace_sec
     await process.wait()
 
 
-async def extract_last_frame(video: str, image: Path, settings: Settings) -> Path:
-    """Write the final frame of a verified clip as a still for the next shot's first-frame anchor."""
+def _ffmpeg_executable(settings: Settings) -> str | None:
     ffprobe = shutil.which(settings.ffprobe_executable)
     sibling = Path(ffprobe).with_name("ffmpeg") if ffprobe else None
-    ffmpeg = str(sibling) if sibling and sibling.is_file() else shutil.which("ffmpeg")
+    return str(sibling) if sibling and sibling.is_file() else shutil.which("ffmpeg")
+
+
+async def measure_audio_levels(video: str, settings: Settings) -> dict[str, float] | None:
+    """Mean and peak audio level in dBFS, used to even out background sound between stitched shots."""
+    ffmpeg = _ffmpeg_executable(settings)
+    if not ffmpeg:
+        return None
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-hide_banner", "-nostats", "-i", video, "-vn", "-af", "volumedetect", "-f", "null", "-",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    try:
+        _, stderr = await process.communicate()
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+    text = stderr.decode(errors="replace")
+    mean = re.search(r"mean_volume:\s*(-?[0-9.]+) dB", text)
+    peak = re.search(r"max_volume:\s*(-?[0-9.]+) dB", text)
+    if process.returncode or not mean or not peak:
+        return None
+    return {"mean_db": float(mean.group(1)), "peak_db": float(peak.group(1))}
+
+
+async def trim_to_frames(video: Path, frames: int, fps: int, settings: Settings) -> None:
+    """Keep only the first `frames` frames (and matching audio) of a clip, in place."""
+    ffmpeg = _ffmpeg_executable(settings)
+    if not ffmpeg:
+        raise AdapterError("ffmpeg executable was not found")
+    trimmed = video.with_name(video.stem + ".trim.mp4")
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-v", "error", "-y", "-i", str(video), "-frames:v", str(frames), "-t", f"{frames / fps:.6f}",
+        "-c:v", "libx264", "-crf", "14", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", str(trimmed),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    try:
+        _, stderr = await process.communicate()
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        trimmed.unlink(missing_ok=True)
+        raise
+    if process.returncode or not trimmed.is_file():
+        trimmed.unlink(missing_ok=True)
+        raise AdapterError("Could not trim the clip to its planned length: " + stderr.decode(errors="replace")[-500:])
+    os.replace(trimmed, video)
+
+
+async def extract_last_frame(video: str, image: Path, settings: Settings) -> Path:
+    """Write the final frame of a verified clip as a still for the next shot's first-frame anchor."""
+    ffmpeg = _ffmpeg_executable(settings)
     if not ffmpeg:
         raise AdapterError("ffmpeg executable was not found")
     process = await asyncio.create_subprocess_exec(
@@ -121,6 +179,33 @@ async def extract_last_frame(video: str, image: Path, settings: Settings) -> Pat
     _, stderr = await process.communicate()
     if process.returncode or not image.is_file():
         raise AdapterError("Could not extract the previous shot's last frame: " + stderr.decode(errors="replace")[-500:])
+    return image
+
+
+def full_identity_prompt(payload: dict) -> str:
+    """The prompt with each character's full look in place of the short sentences meant for an opening frame."""
+    lines = payload["prompt"].split("\n")
+    # Each character's sentence is its own line, swapped on its own, so editing one keeps the others' full looks.
+    for swap in payload["keyframe"].get("identity_fallback") or []:
+        if swap.get("short") and swap.get("full") and swap["short"] in lines:
+            index = lines.index(swap["short"])
+            restored = lines[:index] + [swap["full"]] + lines[index + 1:]
+            if len("\n".join(restored)) <= 4000:
+                lines = restored
+    return "\n".join(lines)
+
+
+async def extract_first_frame(video: str, image: Path, settings: Settings) -> Path:
+    """Write the first frame of a clip as a still."""
+    ffmpeg = _ffmpeg_executable(settings)
+    if not ffmpeg:
+        raise AdapterError("ffmpeg executable was not found")
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-v", "error", "-y", "-i", video, "-frames:v", "1", str(image),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, stderr = await process.communicate()
+    if process.returncode or not image.is_file():
+        raise AdapterError("Could not extract the plate's first frame: " + stderr.decode(errors="replace")[-500:])
     return image
 
 
@@ -139,6 +224,12 @@ class LTXAdapter:
         job_id = payload["job_id"]
         output = safe_local_path(str(output_dir / (job_id + ".mp4")), self.settings)
         partial = safe_local_path(str(output_dir / (job_id + ".partial.mp4")), self.settings)
+        # A chained shot already opens on the previous clip's last frame.
+        if payload.get("keyframe") and not payload.get("continued_from_previous_shot"):
+            opening = await self._opening_frame(payload, output_dir, job_id, on_progress)
+            payload = (payload | {"generate_frames": payload["frames"],
+                                  "reference_anchors": [{"path": str(opening), "frame_index": 0, "strength": 1.0}]}
+                       if opening else payload | {"prompt": full_identity_prompt(payload)})
         reference = None
         if payload.get("reference_image"):
             reference = safe_local_path(payload["reference_image"], self.settings, must_exist=True)
@@ -186,6 +277,9 @@ class LTXAdapter:
                 partial_output=str(partial) if partial.exists() else None,
             )
         try:
+            if (payload.get("generate_frames") or payload["frames"]) > payload["frames"]:
+                await on_progress(92, "Trimming the reference-guided tail off the clip")
+                await trim_to_frames(partial, payload["frames"], payload["fps"], self.settings)
             metadata = await verify_video(
                 str(partial), self.settings,
                 expected={"width": payload["width"], "height": payload["height"],
@@ -195,9 +289,42 @@ class LTXAdapter:
             if partial.exists():
                 exc.partial_output = str(partial)
             raise
+        if payload.get("audio"):
+            metadata["audio_levels"] = await measure_audio_levels(str(partial), self.settings)
         os.replace(partial, output)
         await on_progress(95, "Verified expected dimensions, frame rate, and frame count")
         return {"output_path": str(output), "metadata": metadata, "exit_code": 0}
+
+    async def _opening_frame(self, payload: dict, output_dir: Path, job_id: str, on_progress) -> Path | None:
+        """The shot's first frame: a short LTX plate of the empty location with the character sheets pasted on."""
+        keyframe = payload["keyframe"]
+
+        async def plate_progress(_value, message=None):
+            await on_progress(2, *([f"Opening frame: {message}"] if message else []))
+
+        plate_payload = {key: value for key, value in payload.items() if key != "keyframe"} | {
+            "job_id": job_id + ".plate", "prompt": keyframe["plate_prompt"], "frames": 9, "generate_frames": 9,
+            "audio": False, "reference_anchors": [], "reference_image": None, "distilled_two_stage": True}
+        clip = plate = None
+        try:
+            clip = Path((await self.generate(plate_payload, plate_progress))["output_path"])
+            plate = await extract_first_frame(str(clip), safe_local_path(str(output_dir / (job_id + ".plate.png")), self.settings), self.settings)
+            sheets = [item | {"path": str(safe_local_path(item["path"], self.settings, must_exist=True))}
+                      for item in keyframe["characters"]]
+            opening = safe_local_path(str(output_dir / (job_id + ".opening.png")), self.settings)
+            from .keyframes import compose_opening_frame
+            if not await asyncio.to_thread(compose_opening_frame, str(plate), sheets, str(opening)):
+                raise ValueError("a character sheet has no plain light background to cut it from")
+        except (AdapterError, OSError, ValueError, ImportError) as exc:
+            await on_progress(3, f"Opening frame unavailable ({exc}); generating from the prompt alone")
+            return None
+        finally:
+            # Only the opening frame is kept, beside the clip it starts, as the continue frames are.
+            for scratch in (clip, plate):
+                if scratch:
+                    scratch.unlink(missing_ok=True)
+        await on_progress(4, "Opening frame built from the approved character sheets: " + str(opening))
+        return opening
 
 
 class RemotionAdapter:

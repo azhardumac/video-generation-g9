@@ -249,3 +249,163 @@ def test_ffprobe_checks_resolution_rate_and_exact_frame_count(tmp_path, monkeypa
             await verify_video(str(video), settings, {"width": 448, "height": 768, "fps": 24, "frames": 97})
 
     asyncio.run(run())
+
+
+def test_measure_audio_levels_reads_volumedetect_and_tolerates_missing_audio(monkeypatch, tmp_path):
+    from app import adapters
+
+    class FakeProcess:
+        def __init__(self, stderr, code):
+            self.stderr_text, self.returncode = stderr, code
+
+        async def communicate(self):
+            return b"", self.stderr_text
+
+    outputs = iter([(b"[Parsed_volumedetect_0] mean_volume: -37.4 dB\n[Parsed_volumedetect_0] max_volume: -4.2 dB\n", 0),
+                    (b"Output file does not contain any stream\n", 1)])
+
+    async def fake_create(*args, **kwargs):
+        return FakeProcess(*next(outputs))
+
+    monkeypatch.setattr(adapters, "_ffmpeg_executable", lambda _settings: "ffmpeg")
+    monkeypatch.setattr(adapters.asyncio, "create_subprocess_exec", fake_create)
+    settings = Settings(_env_file=None, allowed_path_roots=str(tmp_path))
+    assert asyncio.run(adapters.measure_audio_levels("clip.mp4", settings)) == {"mean_db": -37.4, "peak_db": -4.2}
+    assert asyncio.run(adapters.measure_audio_levels("clip.mp4", settings)) is None
+
+
+def test_ltx_command_generates_the_reference_tail_and_trim_keeps_only_the_planned_frames(tmp_path):
+    import shutil
+    import subprocess
+    from app import adapters
+
+    payload = {"prompt": "p", "model": "m", "width": 64, "height": 64, "frames": 9, "generate_frames": 41, "fps": 24}
+    args = build_ltx_command("ltx", payload, "out.mp4")
+    assert args[args.index("--frames") + 1] == "41"
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg is not installed")
+    clip = tmp_path / "clip.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=24", "-f", "lavfi",
+                    "-i", "sine=frequency=440", "-frames:v", "41", "-t", "1.708", "-pix_fmt", "yuv420p", str(clip)], check=True)
+    settings = Settings(_env_file=None, allowed_path_roots=str(tmp_path))
+    asyncio.run(adapters.trim_to_frames(clip, 9, 24, settings))
+    metadata = asyncio.run(verify_video(str(clip), settings, {"width": 64, "height": 64, "fps": 24, "frames": 9}))
+    assert metadata["verified_output"]["frames"] == 9
+    assert not (tmp_path / "clip.trim.mp4").exists()
+
+
+def test_negative_prompt_uses_nag_on_the_distilled_path_and_cfg_otherwise():
+    base = {"prompt": "p", "model": "m", "width": 64, "height": 64, "frames": 9, "fps": 24, "negative_prompt": "music"}
+    fast = build_ltx_command("ltx", base | {"distilled_two_stage": True}, "out.mp4")
+    assert fast[fast.index("--negative-prompt") + 1] == "music" and "--nag" in fast
+    best = build_ltx_command("ltx", base | {"distilled_two_stage": False}, "out.mp4")
+    assert "--negative-prompt" in best and "--nag" not in best
+    assert "--negative-prompt" not in build_ltx_command("ltx", base | {"negative_prompt": None}, "out.mp4")
+
+
+def test_keyframe_shot_opens_on_a_plate_with_the_sheets_pasted(tmp_path, monkeypatch):
+    from PIL import Image
+
+    async def run():
+        settings = _settings(tmp_path)
+        sheet = tmp_path / "frog.png"
+        image = Image.new("RGB", (200, 300), (250, 250, 250))
+        image.paste((60, 160, 40), (50, 60, 150, 260))
+        image.save(sheet)
+        payload = _payload(tmp_path) | {"keyframe": {"plate_prompt": "empty riverbank",
+            "characters": [{"path": str(sheet), "x": 0.5, "width": 0.45, "rider_of": None}]}}
+        calls = []
+
+        class Stream:
+            def __init__(self):
+                self.lines = [b""]
+            async def readline(self):
+                return self.lines.pop(0)
+
+        class Process:
+            returncode = 0
+            def __init__(self):
+                self.stdout = Stream()
+            async def wait(self):
+                return 0
+
+        async def fake_create(*args, **kwargs):
+            calls.append(list(args))
+            output = Path(args[args.index("--output") + 1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"clip")
+            return Process()
+
+        async def fake_first_frame(_video, image, _settings):
+            Image.new("RGB", (448, 768), (200, 150, 90)).save(image)
+            return image
+
+        async def fake_verify(_path, _settings, expected=None):
+            return {"verified_output": expected}
+
+        monkeypatch.setattr(adapters.asyncio, "create_subprocess_exec", fake_create)
+        monkeypatch.setattr(adapters, "extract_first_frame", fake_first_frame)
+        monkeypatch.setattr(adapters, "verify_video", fake_verify)
+        result = await LTXAdapter(settings).generate(payload, lambda *_: asyncio.sleep(0))
+        plate, shot = calls
+        assert plate[plate.index("--prompt") + 1] == "empty riverbank" and plate[plate.index("--frames") + 1] == "9"
+        assert "--image" not in plate and "--no-audio" in plate
+        opening = tmp_path / "out" / "job-123.opening.png"
+        assert shot[shot.index("--image") + 1:shot.index("--image") + 4] == [str(opening.resolve()), "0", "1.0"]
+        assert shot[shot.index("--prompt") + 1] == "moonlit riverbank"
+        assert opening.is_file() and not (tmp_path / "out" / "job-123.plate.mp4").exists()
+        assert result["output_path"].endswith("job-123.mp4")
+
+        # A sheet with no plain background to cut from falls back to the prompt with the full identities.
+        calls.clear()
+        Image.new("RGB", (200, 300), (60, 160, 40)).save(sheet)
+        payload["keyframe"]["identity_fallback"] = [
+            {"short": "Frog is a single frog.", "full": "Character identity continuity: Frog: green"},
+            {"short": "Newt is a separate newt.", "full": "Character identity continuity: Newt: orange"}]
+        await LTXAdapter(settings).generate(payload | {"job_id": "job-124", "prompt": "riverbank where Frog is a single frog.\nFrog is a single frog.\nNewt is an edited newt."},
+                                            lambda *_: asyncio.sleep(0))
+        shot = calls[-1]
+        assert "--image" not in shot
+        assert shot[shot.index("--prompt") + 1] == "riverbank where Frog is a single frog.\nCharacter identity continuity: Frog: green\nNewt is an edited newt."
+        # A prompt edited after planning keeps its edits.
+        await LTXAdapter(settings).generate(payload | {"job_id": "job-125", "prompt": "edited riverbank"},
+                                            lambda *_: asyncio.sleep(0))
+        assert calls[-1][calls[-1].index("--prompt") + 1] == "edited riverbank"
+
+    asyncio.run(run())
+
+
+def test_chained_shot_ignores_its_keyframe(tmp_path, monkeypatch):
+    async def run():
+        settings = _settings(tmp_path)
+        frame = tmp_path / "prev.png"
+        frame.write_bytes(b"png")
+        payload = _payload(tmp_path) | {"continued_from_previous_shot": True, "keyframe": {"plate_prompt": "x", "characters": []},
+                                        "reference_anchors": [{"path": str(frame), "frame_index": 0, "strength": 1.0, "binding": "replace"}]}
+        calls = []
+
+        class Stream:
+            lines = [b""]
+            async def readline(self):
+                return self.lines.pop(0)
+
+        class Process:
+            stdout = Stream()
+            returncode = 0
+            async def wait(self):
+                return 0
+
+        async def fake_create(*args, **kwargs):
+            calls.append(list(args))
+            Path(args[args.index("--output") + 1]).write_bytes(b"clip")
+            return Process()
+
+        async def fake_verify(_path, _settings, expected=None):
+            return {}
+
+        monkeypatch.setattr(adapters.asyncio, "create_subprocess_exec", fake_create)
+        monkeypatch.setattr(adapters, "verify_video", fake_verify)
+        await LTXAdapter(settings).generate(payload, lambda *_: asyncio.sleep(0))
+        assert len(calls) == 1 and str(frame.resolve()) in calls[0]
+
+    asyncio.run(run())

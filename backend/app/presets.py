@@ -53,6 +53,17 @@ BUILTIN_PRESETS = [
 ]
 
 
+# LTX's own default negative prompt asks for speech ("silent or muted audio" is listed as a defect), so film
+# shots use their own: steer away from morphing, extra creatures and burned-in text, and from music and voices.
+FILM_NEGATIVE_PROMPT = ("morphing, melting, warping, deformed body, extra limbs, missing limbs, duplicate characters, "
+                        "extra animals, extra creatures, text, subtitles, captions, letters, watermark, logo, "
+                        "white studio background, blurry, flicker, sudden lighting change, underexposed, too dark, CGI look")
+SOUND_NEGATIVE_PROMPT = ("music, musical score, soundtrack, orchestra, strings, piano, drums, singing, humming, "
+                         "speech, talking, voices, narration, dialogue, whispering")
+def film_negative_prompt(sound: bool) -> str:
+    return FILM_NEGATIVE_PROMPT + (", " + SOUND_NEGATIVE_PROMPT if sound else "")
+
+
 class GenerationSettings(BaseModel):
     model: str = "dgrauet/ltx-2.3-mlx-q8"
     width: int = Field(default=448, ge=64, le=2048)
@@ -62,6 +73,7 @@ class GenerationSettings(BaseModel):
     audio: bool = False
     seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
     prompt: str = Field(default="", max_length=4000)
+    negative_prompt: str | None = Field(default=None, max_length=2000)
     reference_image: str | None = None
     output_location: str | None = None
     preset: str = "Standard"

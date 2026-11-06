@@ -398,3 +398,55 @@ def test_film_batch_running_job_recovers_as_failed_after_database_restart(tmp_pa
     recovered = restarted.get_film_batch(batch["id"])
     assert recovered["status"] == "paused"
     assert recovered["shots"][0]["status"] == "failed"
+
+
+def test_manifest_plays_clip_sound_with_short_fades_at_cuts_and_dissolve_length_fades(tmp_path):
+    shots = []
+    for index, (transition, audio) in enumerate((("cut", True), ("dissolve", True), ("fade", False))):
+        path = tmp_path / f"clip-{index}.mp4"
+        path.write_bytes(b"test-only verified fixture")
+        shots.append({"id": f"shot-{index}", "position": index, "title": f"Shot {index}",
+            "prompt": "Reviewed prompt", "transition_after": transition,
+            "job": {"id": f"job-{index}", "status": "completed", "result_path": str(path), "payload": {"audio": audio},
+                "settings_match": True, "verification_metadata": {"verified_output": {
+                    "width": 448, "height": 768, "fps": 24, "frames": 49}}}})
+    clips = build_composition_manifest({"id": "sound", "revision": 1, "title": "Sound", "shots": shots}, tmp_path)["shots"]
+    assert [clip["has_audio"] for clip in clips] == [True, True, False]
+    assert [(clip["audio_fade_in_frames"], clip["audio_fade_out_frames"]) for clip in clips] == [(0, 2), (2, 8), (8, 8)]
+
+
+def test_manifest_drops_the_last_frame_of_sound_clips_before_hard_cuts_so_sound_covers_every_slot(tmp_path):
+    shots = []
+    for index, (transition, audio, chained) in enumerate((
+            ("cut", True, False), ("cut", True, True), ("cut", False, False), ("cut", True, True), ("fade", True, False))):
+        path = tmp_path / f"clip-{index}.mp4"
+        path.write_bytes(b"test-only verified fixture")
+        shots.append({"id": f"shot-{index}", "position": index, "title": f"Shot {index}",
+            "prompt": "Reviewed prompt", "transition_after": transition,
+            "job": {"id": f"job-{index}", "status": "completed", "result_path": str(path), "payload": {"audio": audio},
+                "settings_match": True, "verification_metadata": {"continued_from_previous_shot": chained,
+                    "verified_output": {"width": 576, "height": 1024, "fps": 24, "frames": 49}}}})
+    clips = build_composition_manifest({"id": "sound", "revision": 1, "title": "Sound", "shots": shots}, tmp_path)["shots"]
+    assert [(c["trim_start_frames"], c["trim_end_frames"], c["frames"], c["start_frame"]) for c in clips] == [
+        (0, 1, 48, 0), (0, 1, 48, 48), (0, 0, 49, 96), (1, 1, 47, 145), (0, 0, 49, 192)]
+    # LTX audio for a 49-frame clip lasts ~2.010 s; each sound slot, from the clip's trimmed start, must fit inside it.
+    assert all((c["trim_start_frames"] + c["frames"]) / 24 <= 2.010 for c in clips if c["has_audio"] and c["trim_end_frames"])
+
+
+def test_manifest_brings_each_shots_sound_halfway_to_the_films_median_level(tmp_path):
+    shots = []
+    for index, (audio, level, peak) in enumerate(((True, -23.0, -3.0), (True, -45.0, -20.0), (True, -37.0, -10.0),
+                                                  (False, None, None), (True, None, None), (True, -91.0, -91.0),
+                                                  (True, -45.0, -2.5))):
+        path = tmp_path / f"clip-{index}.mp4"
+        path.write_bytes(b"test-only verified fixture")
+        shots.append({"id": f"shot-{index}", "position": index, "title": f"Shot {index}",
+            "prompt": "Reviewed prompt", "transition_after": "cut",
+            "job": {"id": f"job-{index}", "status": "completed", "result_path": str(path), "payload": {"audio": audio},
+                "settings_match": True, "verification_metadata": {"audio_levels": {"mean_db": level, "peak_db": peak} if level is not None else None,
+                    "verified_output": {"width": 576, "height": 1024, "fps": 24, "frames": 49}}}})
+    clips = build_composition_manifest({"id": "sound", "revision": 1, "title": "Sound", "shots": shots}, tmp_path)["shots"]
+    # Median of -23, -45, -37, -45 is -41. A silent clip (-91 dB) is left alone and doesn't pull the median down;
+    # the last clip's +2 dB is capped so its -2.5 dB peak stays under -1 dB.
+    assert [clip["audio_gain_db"] for clip in clips] == [-9.0, 2.0, -2.0, 0.0, 0.0, 0.0, 1.5]
+    assert all("audio_levels" not in clip for clip in clips)

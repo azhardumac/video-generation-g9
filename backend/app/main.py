@@ -30,7 +30,7 @@ from .gemini_planning import (GeminiPlanningError, GeminiStoryPlanner, STORY_PLA
                               _stored_model_is_text_eligible)
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
 from .paths import safe_local_path
-from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, Preset, Quality
+from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, Preset, Quality, film_negative_prompt
 from .projects import IMAGE_TYPES, VIDEO_TYPES, scan_project
 from .resources import ResourcePreflight, resource_snapshot
 from .storyboards import ShotInput, StoryboardUpdate, build_composition_manifest
@@ -200,6 +200,7 @@ class CreateFilmRunRequest(BaseModel):
     reference_ids: list[str] = Field(default_factory=list, max_length=16)
     preset: str = "Short"
     quality: Quality = "better"
+    sound: bool = True
     budget: FilmRunBudget = Field(default_factory=FilmRunBudget)
     idempotency_key: str = Field(min_length=1, max_length=128)
     initial_confirmation: bool = False
@@ -1186,7 +1187,7 @@ def preview_film_run(project_id: str, request: CreateFilmRunRequest):
     frames, fps = _preset_frames(request.preset)
     benchmark = next((row for row in db.benchmarks()
                       if row["frames"] == frames and row["fps"] == fps and row.get("quality", "draft") == request.quality
-                      and row["elapsed_seconds"] is not None), None)
+                      and bool(row.get("audio")) == request.sound and row["elapsed_seconds"] is not None), None)
     samples = []
     for job in db.list_jobs(project_id=project_id, limit=1000):
         payload = job.get("payload", {})
@@ -1601,7 +1602,8 @@ def create_film_run(project_id: str, request: CreateFilmRunRequest):
             "media_uploaded": False} if request.planner_provider == "gemini" and request.remote_processing_consent else {}),
         "preset": request.preset,
         "budget": request.budget.model_dump(),
-        "generation_profile": {"frames": frames, "fps": fps, "width": 448, "height": 768, "quality": request.quality},
+        "generation_profile": {"frames": frames, "fps": fps, "width": 448, "height": 768, "quality": request.quality,
+                               "audio": request.sound},
         "authorization": ({"confirmed": True, "scope": ("Gemini story planning only; no LTX generation until separately authorized" if request.plan_only else "local LTX jobs within the declared shot/time/storage budget; Gemini planning explicitly opted in" if request.planner_provider == "gemini" else "local LTX jobs within the declared shot/time/storage budget")}
                           if request.initial_confirmation else {}),
     }
@@ -1779,6 +1781,8 @@ def authorize_film_run(run_id: str, request: FilmRunAuthorizationRequest):
             saved = run["request"]
             preview_request = CreateFilmRunRequest(prompt=run["prompt"], reference_ids=run["reference_ids"],
                 preset=run["preset"], budget=FilmRunBudget.model_validate(run["budget"]),
+                quality=saved.get("generation_profile", {}).get("quality") or "draft",
+                sound=bool(saved.get("generation_profile", {}).get("audio")),
                 idempotency_key="plan-only-generation-authorization", initial_confirmation=True,
                 planner_provider=saved.get("planner_provider", "local"), planner_model=saved.get("planner_model"),
                 planner_response_mode=saved.get("planner_response_mode", "schema"), plan_only=True,
@@ -1981,7 +1985,8 @@ def _job_matches_shot(job: dict, shot: dict, storyboard: dict, batch_id: str) ->
         payload.get("film_batch_id") == batch_id and
         db.generation_settings_snapshot(payload) == db.generation_settings_snapshot(shot) and
         payload.get("reference_image") == expected_payload.get("reference_image") and
-        payload.get("frames") == expected_payload.get("frames") and payload.get("audio") is False
+        payload.get("frames") == expected_payload.get("frames") and
+        bool(payload.get("audio")) == bool(expected_payload.get("audio"))
     )
 
 
@@ -2194,8 +2199,6 @@ def generate_film(storyboard_id: str, request: GenerateFilmRequest):
     project = _project(story["project_id"])
     for shot in story["shots"]:
         payload = shot.get("generation_payload") or {}
-        if payload.get("audio"):
-            raise HTTPException(409, f"Shot '{shot['title']}' requests audio, but no audio capability is configured")
         if payload.get("prompt") != shot["prompt"]:
             raise HTTPException(409, f"Shot '{shot['title']}' saved prompt differs from its generation payload; save the shot plan again")
         reference_ids = shot.get("reference_ids") or []
@@ -2291,7 +2294,7 @@ def retry_film_batch(batch_id: str, request: RetryFilmRequest):
         if not shot:
             raise HTTPException(400, "Selected retry shot is not part of this storyboard")
         payload = shot.get("generation_payload") or {}
-        if shot.get("reference_ids") != [payload.get("reference_id")]:
+        if shot.get("reference_ids") != payload.get("reference_ids", [payload.get("reference_id")]):
             raise HTTPException(409, f"Shot '{shot['title']}' reference selection changed; review the shot and approve the plan again")
         try:
             _validate_project_reference(project, payload.get("reference_image"))
@@ -2420,9 +2423,14 @@ def archive_storyboard(storyboard_id: str):
         raise HTTPException(409, str(exc)) from exc
 
 
-def _apply_film_run_quality(payload: dict, storyboard_id: str):
-    """A shot regenerated from a film run's storyboard keeps that run's sampler; its size is already on the shot."""
-    quality = db.film_run_quality(storyboard_id)
+def _apply_film_run_profile(payload: dict, storyboard_id: str):
+    """A shot regenerated from a film run's storyboard keeps that run's sampler and sound; its size is already on the shot."""
+    profile = db.film_run_profile(storyboard_id)
+    if profile is None:
+        return
+    payload["audio"] = bool(profile.get("audio"))
+    payload["negative_prompt"] = film_negative_prompt(payload["audio"])
+    quality = profile.get("quality") or "draft"
     if quality not in QUALITY_LEVELS:
         return
     distilled = QUALITY_LEVELS[quality]["distilled_two_stage"]
@@ -2459,7 +2467,7 @@ def queue_storyboard_shot(storyboard_id: str, shot_id: str, request: ShotGenerat
                          "width": width, "height": height, "output_location": output_location,
                          "seed": shot["seed"], "reference_image": str(reference) if reference else None})
     payload = _generation_payload(config, project["id"], fps_override=fps)
-    _apply_film_run_quality(payload, storyboard_id)
+    _apply_film_run_profile(payload, storyboard_id)
     shot_settings = {"style_context": style_context, "style_bible_revision": story.get("style_bible_revision", 0),
                      "width": width, "height": height, "fps": fps, "output_location": payload["output_location"],
                      "framing": shot.get("framing", ""), "aspect_ratio": project.get("aspect_ratio")}

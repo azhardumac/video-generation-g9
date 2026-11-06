@@ -1,3 +1,4 @@
+from app.presets import film_negative_prompt
 import asyncio
 import pytest
 from pathlib import Path
@@ -64,13 +65,14 @@ class FakePlanner:
         return self.value
 
 
-def create_run(db, project, max_shots=4, max_seconds=3600, max_output_bytes=8 * 1024**3, quality=None):
+def create_run(db, project, max_shots=4, max_seconds=3600, max_output_bytes=8 * 1024**3, quality=None, sound=None):
     request = {"prompt": "A lighthouse keeper guides a lost boat home before a storm.",
         "reference_ids": [], "reference_categories": [], "preset": "Short",
         "budget": {"max_shots": max_shots, "max_retries_per_shot": 1,
                    "max_generation_seconds": max_seconds, "max_output_bytes": max_output_bytes},
         "generation_profile": {"frames": 49, "fps": 24, "width": 448, "height": 768,
-                               **({"quality": quality} if quality else {})},
+                               **({"quality": quality} if quality else {}),
+                               **({"audio": sound} if sound is not None else {})},
         "authorization": {"confirmed": True, "scope": "bounded local run"}}
     return FilmOrchestrator(db).create(project["id"], "test-key", request, authorized=True)
 
@@ -329,18 +331,248 @@ def test_direct_jobs_are_benchmarked_as_draft_even_with_a_saved_quality(tmp_path
 
 
 @pytest.mark.parametrize(("quality", "distilled"), [("best", False), ("better", True), ("draft", True)])
-def test_storyboard_regenerate_keeps_the_film_run_quality(tmp_path, monkeypatch, quality, distilled):
+def test_storyboard_regenerate_keeps_the_film_run_quality_and_sound(tmp_path, monkeypatch, quality, distilled):
     from app import main
 
     db, project, settings = make_db(tmp_path)
     engine = FilmRunEngine(db, settings, planner=FakePlanner(plan_data()), ltx_ready=lambda: True)
-    run = create_run(db, project, quality=quality)
+    run = create_run(db, project, quality=quality, sound=True)
     _queue_single_shot(engine)
     storyboard_id = db.get_film_run(run["id"])["storyboard_id"]
     monkeypatch.setattr(main, "db", db)
-    payload = {"quality": "draft", "distilled_two_stage": True}
-    main._apply_film_run_quality(payload, storyboard_id)
-    assert payload == {"quality": quality, "distilled_two_stage": distilled}
-    untouched = {"quality": "draft", "distilled_two_stage": True}
-    main._apply_film_run_quality(untouched, "not-a-film-storyboard")
-    assert untouched == {"quality": "draft", "distilled_two_stage": True}
+    payload = {"quality": "draft", "distilled_two_stage": True, "audio": False}
+    main._apply_film_run_profile(payload, storyboard_id)
+    assert payload == {"quality": quality, "distilled_two_stage": distilled, "audio": True,
+                       "negative_prompt": film_negative_prompt(True)}
+    untouched = {"quality": "draft", "distilled_two_stage": True, "audio": False}
+    main._apply_film_run_profile(untouched, "not-a-film-storyboard")
+    assert untouched == {"quality": "draft", "distilled_two_stage": True, "audio": False}
+
+
+def test_sound_film_run_generates_audio_and_puts_the_sound_line_in_both_prompts(tmp_path):
+    from app.adapters import build_ltx_command
+
+    db, project, settings = make_db(tmp_path)
+    plan = plan_data()
+    plan["audio_requested"] = True
+    plan["scenes"][0]["shots"][0]["sound"] = "foghorn, waves against the rocks"
+    plan["scenes"][0]["shots"][0]["caption"] = 'Keeper: "Storm coming."'
+    planner = FakePlanner(plan)
+    engine = FilmRunEngine(db, settings, planner=planner, ltx_ready=lambda: True)
+    create_run(db, project, sound=True)
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert payload["audio"] is True
+    assert "Sound: only natural ambient sound, foghorn, waves against the rocks." in payload["prompt"]
+    assert "music" in payload["negative_prompt"] and "speech" in payload["negative_prompt"]
+    assert "Sound: only natural ambient sound, foghorn, waves against the rocks." in payload["continuation_prompt"]
+    for word in ("music", "voice", "speak", "speech", "dialogue"):
+        assert word not in payload["prompt"].lower()
+    assert "--no-audio" not in build_ltx_command("ltx", payload, "/out/job.partial.mp4")
+
+
+def test_silent_film_run_drops_the_sound_line_and_mutes_ltx(tmp_path):
+    from app.adapters import build_ltx_command
+
+    db, project, settings = make_db(tmp_path)
+    plan = plan_data()
+    plan["scenes"][0]["shots"][0]["sound"] = "foghorn"
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    create_run(db, project, sound=False)
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert payload["audio"] is False and "Sound:" not in payload["prompt"]
+    assert "--no-audio" in build_ltx_command("ltx", payload, "/out/job.partial.mp4")
+
+
+def test_sound_run_time_estimate_ignores_silent_benchmarks(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    db.add_benchmark("Short", 49, 24, 2.04, elapsed_seconds=99999, quality="better", audio=False)
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan_data()), ltx_ready=lambda: True)
+    create_run(db, project, quality="better", sound=True)
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert payload["audio"] is True
+    assert db.benchmarks()[0]["audio"] == 0
+
+
+def test_plan_only_authorization_checks_the_time_cap_with_the_runs_quality_and_sound(monkeypatch):
+    from app import main
+
+    run = {"id": "run", "project_id": "project", "status": "awaiting_authorization", "stage": "define_visual_bible",
+           "prompt": "A frog", "reference_ids": [], "preset": "Short", "budget": {"max_shots": 1, "max_output_bytes": 2**30},
+           "checkpoint": {"understand_story": {"title": "Frog"}},
+           "request": {"plan_only": True, "generation_profile": {"quality": "best", "audio": False}}}
+    seen = []
+    monkeypatch.setattr(main.film_orchestrator, "get", lambda run_id: run)
+    monkeypatch.setattr(main.film_orchestrator, "authorize", lambda *args: {"authorized": True})
+    monkeypatch.setattr(main, "preview_film_run", lambda project_id, request: seen.append(request) or {
+        "available_output_bytes": 10**12, "estimated_output_within_cap": True, "generation_time_within_cap": True})
+    main.authorize_film_run("run", main.FilmRunAuthorizationRequest(confirmed=True, budget_acknowledged=True, expected_revision=1))
+    assert (seen[0].quality, seen[0].sound) == ("best", False)
+
+
+def test_film_run_chains_only_shots_that_keep_the_framing_and_names_each_shots_cast(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    plan = plan_data(second_shot=True)
+    first, second = plan["scenes"][0]["shots"]
+    second["framing"] = "Wide shot from the same hill"
+    close = second | {"id": "keeper-close-up", "sequence": 2, "title": "Mira waves",
+                      "framing": "Close-up", "characters_present": ["keeper"], "expected_character_count": 1}
+    plan["scenes"][0]["shots"].append(close)
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    create_run(db, project)
+    _queue_single_shot(engine)
+    payloads = sorted((job["payload"] for job in db.list_jobs(project_id=project["id"])), key=lambda p: p["shot_order"])
+    assert [p["continue_from_shot_id"] is not None for p in payloads] == [False, True, False]
+    assert [p["reference_conditioning"] for p in payloads] == ["text-only", "previous-shot", "text-only"]
+    assert payloads[1]["continue_from_shot_id"] == payloads[0]["shot_id"]
+    cast = "On screen: only one Mira; no additional characters or creatures, and no duplicates."
+    assert cast in payloads[2]["continuation_prompt"] and cast in payloads[2]["prompt"]
+    assert "one Noah" not in payloads[2]["prompt"]
+    assert "Scene character layout" not in payloads[0]["prompt"]
+
+
+def test_film_run_cuts_instead_of_chaining_when_a_character_leaves_the_shot(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    plan = plan_data(second_shot=True)
+    second = plan["scenes"][0]["shots"][1]
+    second |= {"framing": "Wide shot from the same hill", "characters_present": ["keeper"], "expected_character_count": 1}
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    create_run(db, project)
+    _queue_single_shot(engine)
+    payloads = sorted((job["payload"] for job in db.list_jobs(project_id=project["id"])), key=lambda p: p["shot_order"])
+    assert [p["continue_from_shot_id"] for p in payloads] == [None, None]
+
+
+def test_character_sheets_are_not_ltx_guides_and_other_references_guide_the_opening():
+    from app.film_run_engine import reference_anchor_plan
+
+    assert reference_anchor_plan([("/refs/frog.png", "character"), ("/refs/scorpion.png", "character")], 97) == ([], 97)
+    assert reference_anchor_plan([("/refs/frog.png", "character"), ("/refs/river.png", "scene")], 97) == (
+        [{"path": "/refs/river.png", "frame_index": 0, "strength": 0.35, "binding": "guide"}], 97)
+    assert reference_anchor_plan([], 97) == ([], 97)
+
+
+def test_quoted_dialogue_is_removed_from_the_visual_prompt():
+    from app.film_run_engine import silent_action
+
+    assert silent_action('The scorpion asks "Will you carry me?" and points across.') == "The scorpion asks and points across."
+    assert silent_action("He says \u201cno\u201d firmly.") == "He says firmly."
+
+
+def test_reference_notes_replace_the_planners_guessed_identity():
+    from types import SimpleNamespace
+    from app.film_run_engine import character_identity
+
+    scorpion = SimpleNamespace(name="Scorpion", identity="A black scorpion", distinguishing_traits=["black"], reference_ids=["r1"])
+    linked = {"r1": {"notes": "Reddish-brown clay scorpion with amber tail"}}
+    assert character_identity(scorpion, linked, {"r1": "/refs/s.png"}) == "Scorpion: Reddish-brown clay scorpion with amber tail"
+    assert "A black scorpion" in character_identity(scorpion, {"r1": {"notes": ""}}, {"r1": "/refs/s.png"})
+    scorpion.reference_ids = ["r1", "r2"]
+    linked = {"r1": {"notes": "Reddish-brown scorpion"}, "r2": {"notes": "Scorpion in a straw hat"}}
+    paths = {"r1": "/refs/s.png", "r2": "/refs/s2.png"}
+    assert character_identity(scorpion, linked, paths, ["r2"]) == "Scorpion: Scorpion in a straw hat"
+    assert character_identity(scorpion, linked, paths) == "Scorpion: Reddish-brown scorpion"
+
+
+def test_two_character_shot_uses_each_characters_sheet_and_the_one_the_shot_selected(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    refs = {}
+    for ref_id in ("keeper-a", "keeper-b", "sailor-a"):
+        path = tmp_path / f"{ref_id}.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        refs[ref_id] = db.add_project_reference({"id": ref_id, "project_id": project["id"], "name": ref_id,
+            "category": "character", "path": str(path), "source_kind": "linked", "mime_type": "image/png",
+            "size_bytes": path.stat().st_size, "content_hash": ref_id})
+    plan = plan_data()
+    plan["characters"][0]["reference_ids"] = ["keeper-a", "keeper-b"]
+    plan["characters"][1]["reference_ids"] = ["sailor-a"]
+    plan["scenes"][0]["shots"][0]["reference_ids"] = ["keeper-b"]
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    request = {"prompt": "A lighthouse keeper guides a lost boat home before a storm.",
+        "reference_ids": list(refs), "reference_categories": ["character"], "preset": "Short",
+        "budget": {"max_shots": 4, "max_retries_per_shot": 1, "max_generation_seconds": 3600, "max_output_bytes": 8 * 1024**3},
+        "generation_profile": {"frames": 49, "fps": 24, "width": 448, "height": 768},
+        "authorization": {"confirmed": True, "scope": "bounded local run"}}
+    FilmOrchestrator(db).create(project["id"], "test-key", request, authorized=True)
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert payload["reference_ids"] == ["keeper-b", "sailor-a"]
+    assert payload["reference_anchors"] == [] and payload["generate_frames"] == payload["frames"]
+    shot = db.get_storyboard(db.list_storyboards(project["id"])[0]["id"])["shots"][0]
+    assert shot["reference_ids"] == payload["reference_ids"]
+
+
+def test_sheet_owner_picks_the_single_best_named_character():
+    from types import SimpleNamespace
+    from app.film_run_engine import sheet_owner
+
+    cast = [SimpleNamespace(id="a", name="Mira"), SimpleNamespace(id="b", name="Young Mira"), SimpleNamespace(id="c", name="Noah")]
+    assert sheet_owner("Mira portrait", cast[::2]) == "a"
+    assert sheet_owner("Mira", cast) == "a"
+    assert sheet_owner("young-mira", cast) == "b"
+    assert sheet_owner("harbor", cast) is None
+    assert sheet_owner("Mira", [cast[1], SimpleNamespace(id="d", name="Mira Jones")]) is None
+
+
+def test_unlinked_planner_characters_get_the_selected_sheet_with_their_name(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    for ref_id, name, notes in (("mira-sheet", "mira", "Keeper in a teal raincoat"), ("noah-sheet", "Noah", "")):
+        path = tmp_path / f"{ref_id}.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        db.add_project_reference({"id": ref_id, "project_id": project["id"], "name": name, "notes": notes,
+            "category": "character", "path": str(path), "source_kind": "linked", "mime_type": "image/png",
+            "size_bytes": path.stat().st_size, "content_hash": ref_id})
+    plan = plan_data()
+    for character in plan["characters"]:
+        character["reference_ids"] = []
+    plan["scenes"][0]["shots"][0]["reference_ids"] = []
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    request = {"prompt": "A lighthouse keeper guides a lost boat home before a storm.",
+        "reference_ids": ["mira-sheet", "noah-sheet"], "reference_categories": ["character"], "preset": "Short",
+        "budget": {"max_shots": 4, "max_retries_per_shot": 1, "max_generation_seconds": 3600, "max_output_bytes": 8 * 1024**3},
+        "generation_profile": {"frames": 49, "fps": 24, "width": 448, "height": 768},
+        "authorization": {"confirmed": True, "scope": "bounded local run"}}
+    FilmOrchestrator(db).create(project["id"], "test-key", request, authorized=True)
+    _queue_single_shot(engine)
+    payload = db.list_jobs(project_id=project["id"])[0]["payload"]
+    assert payload["reference_ids"] == ["mira-sheet", "noah-sheet"]
+    assert payload["reference_conditioning"] == "opening-frame"
+    # The opening picture carries the look; one short sentence each keeps LTX from blending them.
+    assert "Mira is a single Keeper in a teal raincoat.\nNoah is a separate young sailor with a dark wool cap and a red scarf." in payload["prompt"]
+    assert "Character identity continuity" not in payload["prompt"]
+    mira, noah = payload["keyframe"]["identity_fallback"]
+    assert mira == {"short": "Mira is a single Keeper in a teal raincoat.", "full": "Character identity continuity: Mira: Keeper in a teal raincoat"}
+    assert noah["short"] in payload["prompt"] and noah["full"].startswith("Character identity continuity: Noah: A young sailor")
+    assert [item["path"] for item in payload["keyframe"]["characters"]] == [str(tmp_path / "mira-sheet.png"), str(tmp_path / "noah-sheet.png")]
+    assert "No animals, creatures or characters" in payload["keyframe"]["plate_prompt"]
+
+
+def test_shot_the_characters_leave_says_so_and_breaks_the_chain(tmp_path):
+    db, project, settings = make_db(tmp_path)
+    for ref_id in ("keeper-a", "sailor-a"):
+        path = tmp_path / f"{ref_id}.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        db.add_project_reference({"id": ref_id, "project_id": project["id"], "name": ref_id,
+            "category": "character", "path": str(path), "source_kind": "linked", "mime_type": "image/png",
+            "size_bytes": path.stat().st_size, "content_hash": ref_id})
+    plan = plan_data(second_shot=True)
+    plan["characters"][0]["reference_ids"] = ["keeper-a"]
+    plan["characters"][1]["reference_ids"] = ["sailor-a"]
+    plan["scenes"][0]["shots"][0]["characters_leave"] = True
+    plan["scenes"][0]["shots"][1]["framing"] = plan["scenes"][0]["shots"][0]["framing"]
+    engine = FilmRunEngine(db, settings, planner=FakePlanner(plan), ltx_ready=lambda: True)
+    request = {"prompt": "A lighthouse keeper guides a lost boat home before a storm.",
+        "reference_ids": ["keeper-a", "sailor-a"], "reference_categories": ["character"], "preset": "Short",
+        "budget": {"max_shots": 4, "max_retries_per_shot": 1, "max_generation_seconds": 3600, "max_output_bytes": 8 * 1024**3},
+        "generation_profile": {"frames": 49, "fps": 24, "width": 448, "height": 768},
+        "authorization": {"confirmed": True, "scope": "bounded local run"}}
+    FilmOrchestrator(db).create(project["id"], "test-key", request, authorized=True)
+    _queue_single_shot(engine)
+    leaving, after = (shot["generation_payload"] for shot in db.get_storyboard(db.list_storyboards(project["id"])[0]["id"])["shots"])
+    assert leaving["reference_anchors"] == [] and leaving["generate_frames"] == leaving["frames"] == 49
+    assert leaving["reference_ids"] == ["keeper-a", "sailor-a"]
+    assert "At the start, on screen: only one Mira, one Noah" in leaving["prompt"]
+    assert "By the end of the shot they are gone from view." in leaving["prompt"]
+    assert after["continue_from_shot_id"] is None and after["reference_conditioning"] == "opening-frame"

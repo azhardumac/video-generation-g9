@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import re
 import shutil
 from statistics import median
 from uuid import UUID, uuid5, NAMESPACE_URL
@@ -12,8 +13,9 @@ from uuid import UUID, uuid5, NAMESPACE_URL
 from .config import Settings
 from .film_orchestrator import FilmOrchestrator, FilmRunTransitionError, enforce_generation_budget
 from .integrations import detect_integrations
+from .keyframes import layout_placements
 from .paths import safe_local_path
-from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, quality_dimensions
+from .presets import BUILTIN_PRESETS, QUALITY_LEVELS, GenerationSettings, film_negative_prompt, quality_dimensions
 from .story_planning import LocalStoryPlanner, PlannerOutputError, PlannerUnavailable, PlannerResult, StoryPlan, StoryPlanner
 from .gemini_planning import GeminiPlanningError, GeminiStoryPlanner, STORY_PLAN_SCHEMA_VERSION
 from .gemini_secrets import GeminiSecretStore, SecretStoreError
@@ -21,6 +23,81 @@ from .gemini_secrets import GeminiSecretStore, SecretStoreError
 
 # Low enough that a reference sheet steers identity without its backdrop becoming the opening frame.
 REFERENCE_GUIDE_STRENGTH = 0.35
+
+
+def reference_anchor_plan(references: list[tuple[str, str | None]], frames: int) -> tuple[list[dict], int]:
+    """Return a hard-cut shot's image anchors and how many frames LTX should generate before trimming to `frames`.
+
+    `references` holds (path, category) pairs: every character in the shot, plus at most one other reference.
+    Character sheets are not given to LTX: as guides keyed past the kept frames they darkened whole clips
+    (mean brightness ~35 against ~105 for the same seed and prompt) and doubled generation time, so their
+    notes carry identity in the prompt instead.
+    """
+    others = [path for path, category in references if category != "character"]
+    return [{"path": path, "frame_index": 0, "strength": REFERENCE_GUIDE_STRENGTH, "binding": "guide"} for path in others[:1]], frames
+
+
+_QUOTED = re.compile(r'"[^"]*"|\u201c[^\u201d]*\u201d')
+
+
+def character_identity(character, linked: dict, reference_paths: dict, selected: list[str] | None = None) -> str:
+    """A character's identity line; the notes on its approved sheet win over the planner's guess, which never saw it.
+
+    A sheet in `selected` (the one the shot picked) is preferred over the character's other sheets.
+    """
+    ordered = [ref for ref in selected or [] if ref in character.reference_ids]
+    ordered += [ref for ref in character.reference_ids if ref not in ordered]
+    notes = next((linked[ref].get("notes", "").strip() for ref in ordered
+                  if ref in reference_paths and linked[ref].get("notes", "").strip()), "")
+    if notes:
+        return f"{character.name}: {notes}"
+    return f"{character.name}: {character.identity}; distinguishing traits: " + ", ".join(character.distinguishing_traits)
+
+
+def short_identities(identity_lines: list[str]) -> list[str]:
+    """One short sentence per character, from the first clause of each identity line.
+
+    A long combined description made LTX blend two characters into hybrids and duplicates; on a shot that
+    opens on a picture of them, the picture carries their look and a short sentence keeps them apart.
+    """
+    sentences = []
+    for index, line in enumerate(identity_lines):
+        name, _, look = line.partition(": ")
+        look = re.sub(r"^(?:an?|the|one|single)\s+", "", re.split(r"[,;.]", look, maxsplit=1)[0].strip(), flags=re.I)
+        look = " ".join(look.split()[:14]) or "character"
+        sentences.append(f"{name} is {'a single' if index == 0 else 'a separate'} {look}.")
+    return sentences
+
+
+def _name_words(name: str) -> frozenset[str]:
+    return frozenset(re.sub(r"[^a-z0-9]+", " ", name.casefold()).split())
+
+
+def sheet_owner(sheet_name: str, characters) -> str | None:
+    """The character a sheet is named after ("Mira portrait" -> Mira); None when no single best match."""
+    sheet = _name_words(sheet_name)
+    scored = [((words == sheet, len(words & sheet)), character.id) for character in characters
+              for words in [_name_words(character.name)] if words and sheet and (words <= sheet or sheet <= words)]
+    best = max((score for score, _ in scored), default=None)
+    owners = [cid for score, cid in scored if score == best]
+    return owners[0] if len(owners) == 1 else None
+
+
+def silent_action(prompt: str) -> str:
+    """Drop quoted lines from a shot prompt; captions carry the dialogue and LTX would otherwise voice it."""
+    return re.sub(r"\s{2,}", " ", _QUOTED.sub("", prompt)).strip()
+
+
+_FRAMING_CLASSES = (("extreme close", "extreme close-up"), ("medium close", "medium close-up"), ("close", "close-up"),
+                    ("medium wide", "medium wide"), ("medium-wide", "medium wide"), ("medium long", "medium wide"),
+                    ("medium", "medium"), ("extreme wide", "wide"), ("establishing", "wide"),
+                    ("wide", "wide"), ("long shot", "wide"))
+
+
+def _framing_class(framing: str) -> str:
+    text = framing.lower()
+    return next((label for key, label in _FRAMING_CLASSES if key in text), text.strip())
+
 
 class FilmRunEngine:
     """Advance one durable stage per call; LTX jobs remain on LocalWorker's queue."""
@@ -99,7 +176,7 @@ class FilmRunEngine:
             "allowed_reference_ids": sorted(selected_ids),
             "shot_budget": budget["max_shots"], "preset": request["preset"],
             "model_capabilities": {"text_to_video": True, "image_to_video": True,
-                "max_reference_images_per_shot": 1, "audio_generation": False,
+                "max_reference_images_per_shot": 1, "audio_generation": self._sound(run),
                 "video_continuation": False, "ic_lora": False,
                 "frames": request.get("generation_profile", {}).get("frames"),
                 "fps": request.get("generation_profile", {}).get("fps")},
@@ -182,8 +259,9 @@ class FilmRunEngine:
 
     def _understand(self, run: dict):
         plan = self._plan(run)
-        if plan.audio_requested or plan.video_continuation_requested or plan.ic_lora_requested:
-            unsupported = [name for name, requested in (("audio", plan.audio_requested),
+        audio_requested = plan.audio_requested and not self._sound(run)
+        if audio_requested or plan.video_continuation_requested or plan.ic_lora_requested:
+            unsupported = [name for name, requested in (("audio", audio_requested),
                 ("video continuation", plan.video_continuation_requested), ("IC-LoRA", plan.ic_lora_requested)) if requested]
             raise PlannerOutputError("The validated plan requires unsupported local capability: " + ", ".join(unsupported) + ". No shot jobs were queued.")
         count = len(plan.ordered_shots)
@@ -196,7 +274,7 @@ class FilmRunEngine:
         quality = self._quality(run, self.db.get_setting(f"generation:{run['project_id']}") or self.db.get_setting("generation") or {})
         benchmark = next((item for item in self.db.benchmarks()
                           if item["frames"] == frames and item["fps"] == fps and item.get("quality", "draft") == quality
-                          and item.get("elapsed_seconds") is not None), None)
+                          and bool(item.get("audio")) == self._sound(run) and item.get("elapsed_seconds") is not None), None)
         checkpoint["estimated_generation_seconds"] = round(float(benchmark["elapsed_seconds"]) * count) if benchmark else None
         if checkpoint["estimated_generation_seconds"] is not None and checkpoint["estimated_generation_seconds"] > run["budget"]["max_generation_seconds"]:
             raise FilmRunTransitionError("The measured local generation estimate exceeds this run's time budget")
@@ -241,6 +319,10 @@ class FilmRunEngine:
                                            message=f"Saved validated plan '{storyboard['title']}' with {len(scenes)} scenes; generation is still queued nowhere.")
 
     @staticmethod
+    def _sound(run: dict) -> bool:
+        return bool(run["request"].get("generation_profile", {}).get("audio"))
+
+    @staticmethod
     def _quality(run: dict, profile: dict) -> str:
         quality = run["request"].get("generation_profile", {}).get("quality") or profile.get("quality") or "draft"
         return quality if quality in QUALITY_LEVELS else "draft"
@@ -270,9 +352,14 @@ class FilmRunEngine:
         distilled = QUALITY_LEVELS[quality]["distilled_two_stage"]
         if distilled is None:
             distilled = profile.get("distilled_two_stage", True)
+        sound = self._sound(run)
         style_bible = project.get("style_bible", {})
         style_lines = [f"{key.replace('_', ' ').title()}: {value}" for key, value in style_bible.items() if isinstance(value, str) and value.strip()]
-        characters = {item.id: item for item in plan.characters}
+        # A planner can leave a character unlinked; then the selected character sheet named after it is its sheet.
+        owners = {ref: sheet_owner(linked[ref].get("name", ""), plan.characters)
+                  for ref in sorted(selected) if linked[ref].get("category") == "character"}
+        characters = {item.id: item if item.reference_ids else item.model_copy(update={"reference_ids": [
+            ref for ref, owner in owners.items() if owner == item.id]}) for item in plan.characters}
         locations = {item.id: item for item in plan.locations}
         seconds_per_shot = frames / fps
         # One seed for the whole film keeps lighting, palette and texture consistent between shots.
@@ -285,55 +372,98 @@ class FilmRunEngine:
                                "estimated_seconds": round(seconds_per_shot * len(scene.shots), 2),
                                "transition_after": scene.shots[-1].transition_after})
             location = locations[scene.location_id]
-            previous_shot_id = None
+            previous_shot_id = previous_framing = None
+            previous_cast: set[str] = set()
             for shot in scene.shots:
-                reference_id = shot.reference_ids[0] if shot.reference_ids else None
+                # A clip that starts on the previous clip's last frame keeps its composition, so only
+                # chain shots that keep the framing and everyone on screen; anything else is a real cut.
+                framing_class = _framing_class(shot.framing)
+                continue_from = (previous_shot_id if framing_class == previous_framing
+                                 and previous_cast <= set(shot.characters_present) else None)
+                # Every character on screen gets its approved sheet, not just the one the planner picked.
+                shot_refs = [ref for cid in shot.characters_present
+                             for ref in [next((r for r in shot.reference_ids if r in characters[cid].reference_ids), None)
+                                         or next(iter(characters[cid].reference_ids), None)]
+                             if ref in reference_paths and linked[ref].get("category") == "character"]
+                shot_refs += [ref for ref in shot.reference_ids if ref in reference_paths and ref not in shot_refs
+                              and linked[ref].get("category") != "character"][:1]
+                reference_id = shot_refs[0] if shot_refs else None
                 ref_path = reference_paths.get(reference_id) if reference_id else None
                 shot_id = str(uuid5(UUID(run["id"]), f"shot:{shot.id}"))
-                # Later shots in a scene start on the previous clip's last frame (swapped in by the worker).
-                # Character sheets are never used as frames: even a weak anchor makes the clip open on their studio backdrop.
-                anchors = ([{"path": ref_path, "frame_index": 0, "strength": REFERENCE_GUIDE_STRENGTH, "binding": "guide"}]
-                           if ref_path and linked[reference_id].get("category") != "character" else [])
-                conditioning = "previous-shot" if previous_shot_id else "guide-image" if anchors else "text-only"
-                identity_lines = [f"{characters[cid].name}: {characters[cid].identity}; distinguishing traits: " + ", ".join(characters[cid].distinguishing_traits)
+                # Chained shots start on the previous clip's last frame (swapped in by the worker) instead.
+                anchors, generate_frames = (([], frames) if continue_from else
+                    reference_anchor_plan([(reference_paths[ref], linked[ref].get("category")) for ref in shot_refs], frames))
+                # Every shot that can open on its characters' sheets does; a chained shot only falls back to it
+                # when the previous clip is missing.
+                sheets = [next((ref for ref in shot_refs if ref in characters[cid].reference_ids), None)
+                          for cid in shot.characters_present]
+                keyframe = None if None in sheets else {
+                    "plate_prompt": "\n".join([
+                        f"Stop-motion claymation {shot.framing} of the empty {location.name}, static camera, "
+                        "with open empty ground across the lower half of the frame.",
+                        f"Visual style: {plan.visual_style}",
+                        *([f"Lighting and time of day: {plan.lighting}"] if plan.lighting.strip() else []),
+                        f"Location: {location.description} Scale: {location.scale}",
+                        "No animals, creatures or characters anywhere."]),
+                    "characters": [placement | {"path": reference_paths[ref]} for ref, placement in zip(sheets, layout_placements(
+                        shot.character_layout, [characters[cid].name for cid in shot.characters_present], framing_class))]}
+                conditioning = ("previous-shot" if continue_from else "opening-frame" if keyframe
+                                else "guide-image" if anchors else "text-only")
+                identity_lines = [character_identity(characters[cid], linked, reference_paths, shot_refs)
                                   for cid in shot.characters_present]
                 framing = "Shot framing: " + shot.framing + ". Shot character layout: " + shot.character_layout
+                cast = (("At the start, on screen: only " if shot.characters_leave else "On screen: only ")
+                        + ", ".join(f"one {characters[cid].name}" for cid in shot.characters_present)
+                        + "; no additional characters or creatures, and no duplicates."
+                        + (" By the end of the shot they are gone from view." if shot.characters_leave else ""))
                 # A shot the worker chains inherits identity and style from its first frame; a short
                 # action-led prompt keeps LTX from freezing on that frame.
                 continuation_prompt = "\n".join([
-                    shot.prompt,
+                    silent_action(shot.prompt) if shot.caption.strip() else shot.prompt,
                     f"Visual style: {plan.visual_style}",
+                    *([f"Lighting and time of day, identical in every shot: {plan.lighting}"] if plan.lighting.strip() else []),
                     f"Location continuity: {location.name}. {location.description} Scale: {location.scale}",
                     framing,
+                    cast,
+                    # Only what should be heard: naming speech or music here, even negated, made LTX voice the characters.
+                    *([f"Sound: only natural ambient sound, {shot.sound.strip()}."] if sound and shot.sound.strip() else []),
                 ])
                 prompt = "\n".join([
                     continuation_prompt,
-                    "Character identity continuity: " + " | ".join(identity_lines),
-                    "Scene character layout: " + scene.character_layout,
+                    *(short_identities(identity_lines) if continue_from or keyframe
+                      else ["Character identity continuity: " + " | ".join(identity_lines)]),
                     "Scene continuity: " + " | ".join(scene.continuity_requirements),
                     *[f"Project style bible: {line}" for line in style_lines],
                 ])
                 if len(prompt) > 4000:
                     raise PlannerOutputError(f"The validated prompt for '{shot.title}' exceeds LTX's 4,000 character limit")
+                if keyframe:
+                    # Without its opening picture the shot needs the full look of each character back; the
+                    # adapter swaps these into the prompt it is given, so an edited prompt keeps its edits.
+                    keyframe["identity_fallback"] = [{"short": short, "full": "Character identity continuity: " + line}
+                                                     for short, line in zip(short_identities(identity_lines), identity_lines)]
                 generation = GenerationSettings.model_validate(profile | {
                     "prompt": prompt, "model": profile.get("model", "dgrauet/ltx-2.3-mlx-q8"),
                     "width": width, "height": height, "distilled_two_stage": distilled, "quality": quality,
-                    "low_ram": profile.get("low_ram", True), "audio": False,
+                    "low_ram": profile.get("low_ram", True), "audio": sound,
                     "seed": film_seed, "reference_image": ref_path,
+                    "negative_prompt": film_negative_prompt(sound),
                     "output_location": str(output), "preset": request["preset"],
                 })
-                payload = generation.model_dump() | {"frames": frames, "fps": fps,
+                payload = generation.model_dump() | {"frames": frames, "generate_frames": generate_frames, "fps": fps,
                     "shot_prompt": prompt, "shot_settings": {"width": width, "height": height, "fps": fps,
                         "output_location": str(output), "framing": shot.framing,
                         "style_bible_revision": project.get("style_bible_revision", 0)},
                     "style_context": plan.visual_style, "reference_conditioning": conditioning,
-                    "reference_anchors": anchors, "reference_as_frame": False, "continue_from_shot_id": previous_shot_id,
+                    "reference_anchors": anchors, "reference_as_frame": False, "continue_from_shot_id": continue_from,
+                    "keyframe": keyframe,
                     "continuation_prompt": continuation_prompt,
-                    "reference_id": reference_id, "preflight_warnings": []}
-                previous_shot_id = shot_id
+                    "reference_id": reference_id, "reference_ids": shot_refs, "preflight_warnings": []}
+                previous_shot_id, previous_cast = shot_id, set(shot.characters_present)
+                previous_framing = None if shot.characters_leave else framing_class
                 rows.append({"id": shot_id, "scene_title": saved_scene_title, "title": shot.title,
                     "prompt": prompt, "visual_description": shot.beat, "reference_image": ref_path,
-                    "reference_ids": [reference_id] if reference_id else [], "preset": request["preset"],
+                    "reference_ids": shot_refs, "preset": request["preset"],
                     "seed": generation.seed, "caption": shot.caption, "dialogue": shot.caption,
                     "characters": [characters[cid].name for cid in shot.characters_present],
                     "framing": shot.framing, "width": width, "height": height, "fps": fps,
@@ -345,10 +475,10 @@ class FilmRunEngine:
                     "scene_count": len(plan.scenes), "shot_count": len(rows), "preset": request["preset"],
                     "frames_per_shot": frames, "fps": fps, "width": width, "height": height,
                     "approved_reference_ids": sorted(selected),
-                    "reference_limit_note": "Shots after the first in each scene start on the previous shot's last frame. Character references are described in prompts but never used as video frames; other references guide shots weakly. Local conditioning does not guarantee identity consistency.",
-                    "creative_quality_status": "pending_manual_review", "audio_available": False,
+                    "reference_limit_note": "Shots that keep the previous shot's framing and cast start on its last frame. Other shots open on a frame built locally from an empty LTX plate of the location with the approved character sheets pasted where the layout puts them; shots whose characters lack a sheet use their reference notes only. Local conditioning does not guarantee identity consistency.",
+                    "creative_quality_status": "pending_manual_review", "audio_available": sound,
                     "model_capabilities": {"text_to_video": True, "image_to_video": True,
-                        "max_reference_images_per_shot": 1, "audio_generation": False,
+                        "max_reference_images_per_shot": 1, "audio_generation": sound,
                         "video_continuation": False, "ic_lora": False},
                     "style_bible_revision": project.get("style_bible_revision", 0), "style_bible_snapshot": style_bible}
         return rows, scene_rows, metadata

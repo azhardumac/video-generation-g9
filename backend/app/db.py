@@ -24,7 +24,7 @@ class Database:
         self.path = safe_local_path(settings.database_path, settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
-        self._backup_before_migration(target_version=13)
+        self._backup_before_migration(target_version=14)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             self._execute_schema_script(db, """
@@ -47,7 +47,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, preset TEXT NOT NULL,
                     frames INTEGER NOT NULL, fps INTEGER NOT NULL, duration REAL NOT NULL,
                     elapsed_seconds REAL, created_at TEXT NOT NULL,
-                    quality TEXT NOT NULL DEFAULT 'draft'
+                    quality TEXT NOT NULL DEFAULT 'draft', audio INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS projects (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL,
@@ -262,6 +262,8 @@ class Database:
                     db.execute(f"ALTER TABLE storyboard_scenes ADD COLUMN {column} {declaration}")
             if "quality" not in {row[1] for row in db.execute("PRAGMA table_info(benchmark_history)")}:
                 db.execute("ALTER TABLE benchmark_history ADD COLUMN quality TEXT NOT NULL DEFAULT 'draft'")
+            if "audio" not in {row[1] for row in db.execute("PRAGMA table_info(benchmark_history)")}:
+                db.execute("ALTER TABLE benchmark_history ADD COLUMN audio INTEGER NOT NULL DEFAULT 0")
             existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             for column, declaration in (
                 ("exit_code", "INTEGER"),
@@ -333,6 +335,7 @@ class Database:
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(11,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(12,?)", (now_iso(),))
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(13,?)", (now_iso(),))
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(14,?)", (now_iso(),))
             for run in db.execute("SELECT id,revision,stage FROM film_runs WHERE status='running'"):
                 message = "Application restarted during orchestration; the run was paused at its last durable checkpoint."
                 db.execute("UPDATE film_runs SET status='paused',error=?,revision=revision+1,updated_at=? WHERE id=? AND status='running'",
@@ -550,10 +553,10 @@ class Database:
                        (key, json.dumps(value), now_iso()))
 
     def add_benchmark(self, preset: str, frames: int, fps: int, duration: float, elapsed_seconds: float | None = None,
-                      quality: str = "draft"):
+                      quality: str = "draft", audio: bool = False):
         with self.lock, self.connect() as db:
-            db.execute("INSERT INTO benchmark_history(preset,frames,fps,duration,elapsed_seconds,created_at,quality) VALUES(?,?,?,?,?,?,?)",
-                       (preset, frames, fps, duration, elapsed_seconds, now_iso(), quality))
+            db.execute("INSERT INTO benchmark_history(preset,frames,fps,duration,elapsed_seconds,created_at,quality,audio) VALUES(?,?,?,?,?,?,?,?)",
+                       (preset, frames, fps, duration, elapsed_seconds, now_iso(), quality, int(audio)))
 
     def benchmarks(self):
         with self.connect() as db:
@@ -909,13 +912,13 @@ class Database:
         result["deduplicated"] = False
         return result
 
-    def film_run_quality(self, storyboard_id: str) -> str | None:
+    def film_run_profile(self, storyboard_id: str) -> dict | None:
         with self.connect() as db:
             row = db.execute("SELECT request_json FROM film_runs WHERE storyboard_id=? ORDER BY created_at DESC LIMIT 1",
                              (storyboard_id,)).fetchone()
         if row is None:
             return None
-        return (json.loads(row["request_json"] or "{}").get("generation_profile") or {}).get("quality") or "draft"
+        return json.loads(row["request_json"] or "{}").get("generation_profile") or {}
 
     def get_film_run(self, run_id: str):
         with self.connect() as db:
